@@ -1,0 +1,4 @@
+name: soullink
+version: 0.1.0
+description: SoulLink/PCLTM local long-term memory provider backed by SoulLink var/pcltm-prod.db and var/memfs.
+kind: exclusive

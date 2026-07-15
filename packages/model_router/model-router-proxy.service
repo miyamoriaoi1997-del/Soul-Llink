@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes Model Router Proxy (Soul-Link dev unit template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<soul-link-root>/packages/model_router
+ExecStart=<hermes-root>/venv/bin/python <soul-link-root>/packages/model_router/app.py --config <soul-link-root>/config/model-router.example.yaml
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

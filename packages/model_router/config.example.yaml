@@ -1,0 +1,20 @@
+# Example configuration for model-router-proxy.
+# Copy to config.yaml and edit locally. Do not commit real credentials or private endpoints.
+listen:
+  host: 127.0.0.1
+  port: 18080
+upstream:
+  hermes_config_path: ~/.hermes/config.yaml
+  base_url: https://your-openai-compatible-endpoint.example/v1
+  timeout_seconds: 180
+routing:
+  virtual_models:
+  - persona-auto
+  - persona-auto-technical
+  - persona-auto-sex
+  default_model: gpt-5.5
+  work_model: gpt-5.5
+  enabled: true
+  sex_model: glm-5-turbo
+audit:
+  path: ./logs/audit.jsonl

@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soullink-public-2-0"
+version = "2.0.0"
+description = "Open public reference runtime for persona, memory/context governance, and model routing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "SoulLink Public 2.0 contributors" },
+]
+keywords = [
+    "agent-runtime",
+    "context-governance",
+    "memory-governance",
+    "model-routing",
+    "persona-runtime",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "openai>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+soullink = "pcltm.cli:main"
+pcltm = "pcltm.cli:main"
+soullink-continuity-gate = "pcltm.continuity_gate:main"
+soullink-host-adapt = "soul_link.host_adaptation:main"
+
+[project.urls]
+Homepage = "https://github.com/soullink-public/soullink-public-2.0"
+Repository = "https://github.com/soullink-public/soullink-public-2.0"
+Issues = "https://github.com/soullink-public/soullink-public-2.0/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+]
+ml = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+]
+
+[tool.setuptools]
+include-package-data = false
+packages = [
+    "soul_link",
+    "soul_link.integration",
+    "pcltm",
+    "pcltm.dac",
+    "pcltm.injection",
+    "pcltm.memory",
+    "pcltm.monitoring",
+    "pcltm.monitoring.static",
+    "pcltm.persona",
+    "pcltm.procedural",
+    "pcltm.session",
+    "pcltm.state",
+    "persona_engine",
+    "persona_engine.persona_orchestrator",
+    "persona_engine.persona_orchestrator.context_router",
+    "persona_engine.scripts",
+    "model_router",
+]
+
+[tool.setuptools.package-dir]
+soul_link = "soul_link"
+"soul_link.integration" = "soul_link/integration"
+pcltm = "packages/pcltm"
+"pcltm.dac" = "packages/pcltm/dac"
+"pcltm.injection" = "packages/pcltm/injection"
+"pcltm.memory" = "packages/pcltm/memory"
+"pcltm.monitoring" = "packages/pcltm/monitoring"
+"pcltm.monitoring.static" = "packages/pcltm/monitoring/static"
+"pcltm.persona" = "packages/pcltm/persona"
+"pcltm.procedural" = "packages/pcltm/procedural"
+"pcltm.session" = "packages/pcltm/session"
+"pcltm.state" = "packages/pcltm/state"
+persona_engine = "packages/persona_engine"
+"persona_engine.persona_orchestrator" = "packages/persona_engine/persona_orchestrator"
+"persona_engine.persona_orchestrator.context_router" = "packages/persona_engine/persona_orchestrator/context_router"
+"persona_engine.scripts" = "packages/persona_engine/scripts"
+model_router = "packages/model_router"
+
+[tool.setuptools.package-data]
+"pcltm.monitoring.static" = ["*.html", "*.js", "*.css"]
+persona_engine = [
+    "config/*.yaml",
+    "soul_layers/*.md",
+    "*.template.md",
+]
+model_router = [
+    "*.yaml",
+    "*.service",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["packages", "adapters"]

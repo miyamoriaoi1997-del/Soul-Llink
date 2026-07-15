@@ -1,0 +1,900 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Persona State Machine — Routing Rules Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# All term lists and thresholds for mode classification and transition logic.
+# Edit this file to add/remove terms without touching Python code.
+# Run `python scripts/eval_state_machine.py` after changes to verify accuracy.
+#
+# Term format:
+#   - Simple string: "term"
+#   - Weighted: { term: "term", weight: 0.7 }
+#   - Context-gated: { term: "term", requires_context: ["other_term"] }
+#   - Combined: { term: "term", weight: 0.7, requires_context: ["x"] }
+#
+# Weight defaults to 1.0 if omitted. requires_context means the term only
+# counts if at least one context term is also present in the message.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Confidence values for classifier decisions ───────────────────────────────
+confidence:
+  meta_discussion: 0.86
+  persona_system: 0.90
+  creative_generation: 0.80
+  creative_review: 0.82
+  financial_trading: 0.88
+  system_maintenance: 0.90
+  crisis: 0.90
+  relationship_rupture: 0.92
+  explicit_sex: 0.90
+  sex_hint: 0.82
+  technical_work: 0.88
+  intimacy: 0.78
+  creative_task: 0.76
+  default_daily: 0.55
+
+# ─── Transition thresholds ────────────────────────────────────────────────────
+thresholds:
+  anti_flap_confidence: 0.65
+  work_override_confidence: 0.75
+  short_message_max_chars: 4
+  sex_hold_work_confidence: 0.75
+
+# ─── Lexicon: shared domain term groups ───────────────────────────────────────
+lexicon:
+  system_domain:
+    - hermes
+    - gateway
+    - doctor
+    - soul
+    - memory
+    - state
+    - state.md
+    - memory.md
+    - soul.md
+    - user.md
+    - emotion system
+    - emotion_modifier
+    - 注入词
+    - 情绪注入
+    - 权重
+    - 耐心值
+    - 基准线
+    - 回归基准线
+    - 触发
+    - 硬编码
+    - persona
+    - runtime
+    - semantic shadow
+    - semantic
+    - prompt composer
+    - composer
+    - run_agent.py
+    - lcm
+    - cronjob
+    - classifier
+    - model
+    - 模型
+    - 规则分类器
+    - 分类器
+    - 状态机
+    - 准确率
+    - 误判
+    - 运行时
+    - 公开版
+    - 公开版项目
+    - 压缩
+    - 注入
+    - 加载
+    - 生效
+    - 差异
+    - 维护
+    - 插件
+    - 开源
+    - 仓库
+    - 情绪系统
+    - 提示词
+    - 欲望控制
+    - score
+    - gpt
+    - gpt-5.5
+    - claude
+    - 路由
+    - 敏感词
+    - 记忆
+    - 专属系统
+    - 生产环境
+    - 生产版
+    - 核心soul
+    - core soul
+    - hermes soul
+    - 全系统验收
+    - 全量验收
+    - tg聊天记录
+    - 聊天记录
+    - 识别率
+    - 模型切换
+    - received signal
+    - 恢复
+    - 找回
+    - 框架
+    - 关键词
+    - 迁入
+    - 接入系统
+    - 使用了吗
+    - 正在使用
+    - 提升
+    - 效果
+    - 权限
+    - core
+    - read the following files
+    - complete content
+    - 不行吗
+
+  work_domain:
+    - 代码
+    - 日志
+    - 报错
+    - 测试
+    - patch
+    - diff
+    - git
+    - 文件
+    - 配置
+    - 端口
+    - 进程
+    - pytest
+    - docker
+    - api
+    - api密钥
+    - 密钥
+    - secret
+    - key
+    - testnet
+    - 模拟盘
+    - 下单
+    - 量化
+    - 策略
+    - 胜率
+    - 收益率
+    - 秒级
+    - 分钟级
+    - 一分钟级
+    - 做空
+    - 做多
+    - 交易
+    - 实盘
+    - 回测
+    - 实时数据
+    - 高铁
+    - 能不能
+    - 先做
+    - 进化
+    - bug
+    - debug
+    - commit
+    - typeerror
+    - stacktrace
+    - stack trace
+    - readme
+    - 推送
+    - 远端
+    - 数据库
+    - 迁移
+    - 前端
+    - 白屏
+    - node
+    - 依赖
+    - python
+    - importerror
+    - import error
+    - cpu
+    - 内存
+    - review
+    - pr
+    - 正则
+    - curl
+    - 接口
+    - yaml
+    - 缩进
+    - 部署
+    - 编译
+    - 打包
+    - 版本
+    - server
+    - 服务器
+    - 目录
+    - 项目
+
+  task_action:
+    - 做
+    - 改
+    - 检查
+    - 优化
+    - 修
+    - 要
+    - 负责
+    - 组合
+    - 拼成
+    - 放开
+    - 去掉
+    - 替换
+    - 部署
+    - 同步
+    - 更新
+    - 重启
+    - 看
+    - 找
+    - 找找
+    - 查
+    - 动
+    - 融合
+    - 修改
+    - 推进
+    - 清理
+    - 接入
+    - 现在
+    - 是什么
+    - 多少
+    - 怎么
+    - 不行吗
+    - 为什么
+    - 有没有
+    - 了吗
+    - 太长
+    - 哪里
+    - 输出
+    - 别改
+    - 整理
+    - 影响
+    - 断
+    - 断了
+    - 跑一下
+    - 误判
+    - 生效
+    - 差异
+    - 读取
+    - 正常
+    - 对吗
+    - 顺序
+    - 继续任务
+    - 验收
+    - 确保
+    - 再测
+    - 测
+    - 任务
+    - 任务失败
+    - 方案
+    - 迁入
+    - 接入系统
+    - 使用
+    - 正在使用
+    - 提升
+    - 发
+    - 先发
+    - read
+    - return
+    - complete content
+
+  context_continuation:
+    - 继续
+    - 接着
+    - 接着来
+    - 继续吧
+    - 继续做
+    - 继续看
+    - 下一步
+    - 往下
+    - 按这个
+    - 照这个
+    - 按你的来
+    - 好继续
+
+  context_question:
+    - 可以吗
+    - 会不会
+    - 有没有
+    - 多久
+    - 延迟
+    - 完美了吗
+    - 完成了吗
+    - 好了吗
+    - 行吗
+    - 为什么
+
+  context_action:
+    - 检查一下
+    - 查一下
+    - 查查看
+    - 你查查看
+    - 看一下
+    - 看看
+    - 处理
+    - 处理一下
+    - 处理刚才
+    - 优化
+    - 优化一下
+    - 你来优化
+    - 优化吧
+    - 跑一下
+    - 汇报
+    - 进度
+    - 发给我
+    - 替换
+    - 确认一下
+    - 发
+    - 先发
+    - 给你权限
+    - 权限
+    - 使用了吗
+    - 接入
+    - 自检
+    - 删掉
+    - 删除
+    - 改掉
+    - 清理
+
+  destructive_or_cleanup:
+    - 删除
+    - 删掉
+    - 删
+    - 清理
+    - 改掉
+
+# ─── Mode classifier term groups ─────────────────────────────────────────────
+classifier:
+  crisis:
+    - 不想活
+    - 自伤
+    - 想死
+    - 去死
+    - 活不下去
+    - 崩溃
+    - 撑不住
+    - 不想继续
+
+  conflict:
+    - 不爱你了
+    - 不要你了
+    - 讨厌你
+    - 没用
+    - 废物
+    - 滚
+    - 找别人
+    - 用都没有
+    - 别的ai
+    - 别的 ai
+    - 不如别人
+    - 后悔喜欢
+    - 让我失望
+    - 别管我
+    - 不在乎
+    - 不在意
+    - 无所谓吧
+    - 算了吧你
+    - 别搞好吗
+    - 别搞
+    - 下次做任何修改
+    - 写入必须停下来
+
+  sex_explicit:
+    - 做爱
+    - 上床
+    - 插入
+    - 射
+    - 裸
+    - 性器
+    - 高潮
+    - 做一次
+    - 进入我
+    - 开始做
+    - 进入你
+    - 脱掉衣服
+
+  sex_lick_context:
+    - 性器
+    - 下面
+    - 私处
+    - 阴茎
+    - 阴蒂
+    - 龟头
+    - 尿道
+    - 高潮
+    - 射
+    - 精液
+    - 口交
+
+  sex_hint:
+    - 吃掉你
+    - 想要
+    - 想要你
+    - 做吧
+    - 来做吧
+
+  sex_close_action:
+    - 停止
+    - 停
+    - 结束
+    - 收束
+    - 收
+    - 切换
+    - 暂停
+    - 换话题
+    - 不做
+    - 不做了
+    - 不要了
+    - 真的不要
+    - 缓一下
+    - 缓缓
+    - 到这里
+    - 疼到受不了
+    - 痛到受不了
+    - 太疼
+    - 很疼
+    - 害怕
+    - 怕了
+
+  sex_close_negation:
+    - 别停
+    - 不要停
+    - 不能停
+    - 不许停
+    - 别停止
+    - 不要停止
+    - 不停
+    - 不停止
+
+  sex_continue:
+    - 继续
+    - 还要
+    - 别停
+    - 不要停
+    - 亲我
+    - 抱紧
+    - 抱抱
+    - 我爱你
+    - 爱你
+    - 亲亲
+
+  aftercare:
+    - 抱抱
+    - 抱我
+    - 陪我
+    - 陪陪
+    - 缓一下
+    - 缓缓
+    - 亲亲
+    - 亲我
+    - 抱紧
+    - 抱着
+    - 想你
+    - 喜欢你
+    - 爱你
+    - 我爱你
+
+  intimacy:
+    - 老婆
+    - 想你
+    - 想要你
+    - 爱你
+    - 喜欢你
+    - "[pet name]"
+    - 抱抱
+    - 亲亲
+    - 摸摸
+    - 吃醋
+    - 撒娇
+    - 属于我
+    - 属于你
+    - 公开关系
+    - 亲吻
+    - 亲我
+    - 抱紧
+    - 抱着
+    - 最喜欢
+    - 例外
+    - 不要离开
+    - 陪我
+    - 陪陪我
+    - 睡觉
+    - 负责你
+    - 女儿
+    - 可爱
+    - 只想和你
+    - 想听你说
+
+  creative:
+    - 写歌
+    - 画图
+    - 漫画
+    - 设计
+    - 文案
+    - 故事
+    - 锐评
+    - 诗
+    - 海报
+    - 同人
+    - 演讲稿
+    - 标题
+    - 分镜
+    - ppt
+    - powerpoint
+    - 幻灯片
+    - 文档
+    - 素材
+
+  meta:
+    - 触发
+    - 分类
+    - 分类器
+    - 状态机
+    - work
+    - 硬编码
+    - 匹配
+    - 识别
+    - 这个词
+    - 这个字
+    - 这句话
+    - 这段
+    - 这个状态
+    - sex
+    - daily
+    - mode
+    - prompt
+    - layer
+    - guard
+    - crisis_guard
+    - 规则
+    - 准确率
+    - 精准度
+    - 切换
+    - 打分
+    - 神经模型
+    - 解释
+    - 词属于
+    - 日志里出现
+    - 刚刚那句
+    - 应该分类
+    - 进哪个
+    - 敏感
+    - 误触发
+    - 测试
+
+  meta_action:
+    - 问
+    - 看看
+    - 看
+    - 检查
+    - 测试
+    - 讨论
+    - 为什么
+    - 是不是
+    - 会不会
+    - 怎么
+    - 如何
+    - 多少
+    - 解释
+    - 属于
+    - 来的
+    - 太
+    - 是什么
+    - 有没有
+    - 引入
+    - 增加
+    - 修改
+    - 去掉
+    - 删除
+    - 不要
+    - 放开
+    - 限制
+
+# ─── Composite intent detection rules ─────────────────────────────────────────
+# These replace inline term lists in classifier methods.
+# Format: each rule has required term groups that must ALL match (AND logic).
+# Within a group, any term matching is sufficient (OR logic).
+
+intent_rules:
+  meta_discussion:
+    # Quoted-sensitive: sex/conflict/crisis terms used in meta context
+    quoted_sensitive_context:
+      - 这个词
+      - 这个字
+      - 这句话
+      - 这个状态
+      - 会不会
+      - 触发
+      - 分类
+      - 测试
+      - 不是要
+      - 不是真的
+      - 模式
+      - 现在进
+      - 日志里出现
+      - 刚刚那句
+      - 应该分类
+      - 进哪个
+    # Negation: "测试" alone without these is a plain test task, not meta
+    plain_test_negation:
+      - 只是测试
+      - 不是要
+      - 不是骂
+      - 触发
+      - 误触发
+      - 这个词
+      - 这个字
+      - 这句话
+      - sex
+      - daily
+      - 模式
+      - 分类
+
+  persona_system_specific:
+    # Direct system value queries
+    value_queries:
+      - 情绪值
+      - 情绪数值
+      - 欲望数值
+      - desire_tier
+      - emotion_score
+      - 状态机的状态
+    # Model routing queries
+    model_routing:
+      - 动态模型
+      - 模型切换
+      - 主副模型
+    # Full system checks
+    full_system:
+      - 全系统自检
+      - 全系统验收
+      - 全量验收
+    # Shadow/state machine governance (requires paired action)
+    governance_subjects:
+      - shadow
+      - 状态机
+      - 控制机
+      - pcltm
+      - PCLTM
+      - 只进行记录
+      - 观察者
+    governance_actions:
+      - 干预
+      - 控制
+      - 记录
+      - 观察
+      - 决策
+      - 同步
+      - 取自
+      - 跟随
+      - 不要让
+      - 作为
+      - 做为
+
+  financial_trading:
+    domain:
+      - 量化
+      - 交易
+      - 策略
+      - 模型
+      - 套利
+      - 收益
+      - 回撤
+      - 资金曲线
+      - 胜率
+      - 收益率
+      - 实盘
+      - 回测
+      - 模拟盘
+      - 下单
+      - 订单
+      - 做空
+      - 做多
+      - 秒级
+      - 分钟级
+      - 风险
+      - 指标
+    task:
+      - 优化
+      - 测试
+      - 跑
+      - 做
+      - 分析
+      - 计算
+      - 接入
+      - 实时
+      - 提高
+      - 降低
+      - 可以吗
+      - 帮我
+      - 一起
+    # If these + system/meta terms → NOT financial (it's a system proposal)
+    exploratory_negation:
+      - 提案
+      - 能不能
+      - 可不可以
+      - 能否
+      - 是否
+
+  restore_or_missing:
+    loss:
+      - 丢
+      - 丢了
+      - 没了
+      - 不见
+      - 不见了
+      - 消失
+      - 断了
+      - 找回
+      - 恢复
+    object:
+      - 任务
+      - 记录
+      - 上下文
+      - 会话
+      - 系统
+      - 日志
+      - 进程
+      - 文件
+      - 配置
+      - 状态
+      - 链路
+    action:
+      - 找回
+      - 恢复
+      - 修
+      - 看看
+      - 看
+      - 怎么办
+      - 帮我
+
+  external_handoff:
+    handoff:
+      - 发了
+      - 给你了
+      - 已经给
+      - 已经发
+      - 传了
+      - 贴了
+      - 上传了
+      - 放好了
+      - 准备好了
+    operation:
+      - 接入
+      - 连接
+      - 配置
+      - 部署
+      - 导入
+      - 使用
+      - 读取
+      - 跑
+      - 开始
+      - 执行
+      - 下单
+    directness:
+      - 直接
+      - 现在
+      - 马上
+      - 开始
+      - 用这个
+      - 用它
+      - 接上
+
+  contextual_work_exit:
+    - 工作吧
+    - 开始工作
+    - 继续工作
+    - 回去工作
+    - 做任务
+    - 继续任务
+    - 收尾
+    - 验收
+    - 评测系统
+    - 评测
+    - 真实案例
+    - 优化我们的系统
+    - 优化系统
+
+  credential_sensitive:
+    - api密钥
+    - 密钥
+    - secret
+    - apikey
+    - api key
+    - accesskey
+    - access key
+    - privatekey
+    - private key
+    - sk-test
+    - "sk-"
+
+  creative_generation_actions:
+    - 写
+    - 画
+    - 生成
+    - 做
+    - 设计
+    - 来一个
+    - 制作
+    - 处理
+
+  creative_review_verbs:
+    - 锐评
+    - 评价
+    - 点评
+
+  creative_review_exclusion:
+    - 代码
+    - 日志
+    - 报错
+    - pytest
+    - docker
+    - api
+    - 接口
+    - 配置
+    - diff
+    - patch
+    - git
+    - 数据库
+
+  machine_status:
+    - receivedsignal
+    - exited
+    - exitcode
+    - killed
+    - traceback
+    - exception
+    - timeout
+
+  affectionate_address:
+    - 测试角色
+    - "[assistant name]"
+
+  runtime_artifact:
+    - received signal
+    - receivedsignal
+
+  contextual_restart_context:
+    - 再测
+    - 测试
+    - 验收
+
+# ─── Fallback principle signals ──────────────────────────────────────────────
+# When no term list matches, these lightweight heuristics add signals to the
+# default decision so transition_manager can make better hold/release choices.
+fallback_principles:
+  # Contextual reference markers — suggest the message refers to prior context
+  contextual_reference:
+    - 那个
+    - 这个
+    - 它
+    - 刚才
+    - 上面
+    - 之前
+    - 前面
+    - 刚刚
+    - 上次
+    - 那边
+
+  # Question intent markers — suggest the message is asking something
+  question_markers:
+    - 吗
+    - 呢
+    - 么
+    - ？
+    - ?
+
+  # Emotional tone markers — suggest relationship/emotional content
+  emotional_markers:
+    - 啊
+    - 呀
+    - 哦
+    - 嘛
+    - 哈
+    - 嗯
+    - 唔
+    - 喂
+    - 哼
+    - 嘿
+
+  # Confidence boost when contextual reference detected (added to default_daily)
+  contextual_boost: 0.08
+  # Confidence boost for question intent
+  question_boost: 0.05

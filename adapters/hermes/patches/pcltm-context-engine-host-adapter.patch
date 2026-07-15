@@ -1,0 +1,759 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 180e1d971..a16db7e11 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1582,6 +1582,11 @@ def init_agent(
+ 
+     if _selected_engine is not None:
+         agent.context_compressor = _selected_engine
++        if hasattr(agent.context_compressor, "configure"):
++            # A selected engine's budget/safety configuration is authoritative.
++            # Continuing with defaults would silently violate the user's stated
++            # context contract, so configuration failures must abort startup.
++            agent.context_compressor.configure(_ctx_cfg)
+         # Resolve context_length for plugin engines — mirrors switch_model() path
+         from agent.model_metadata import get_model_context_length
+         _plugin_ctx_len = get_model_context_length(
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+index 79c31fb48..ef9b705a9 100644
+--- a/agent/context_engine.py
++++ b/agent/context_engine.py
+@@ -26,7 +26,7 @@ Lifecycle:
+ """
+ 
+ from abc import ABC, abstractmethod
+-from typing import Any, Dict, List
++from typing import Any, Dict, List, Optional
+ 
+ 
+ class ContextEngine(ABC):
+@@ -89,6 +89,8 @@ class ContextEngine(ABC):
+         messages: List[Dict[str, Any]],
+         current_tokens: int = None,
+         focus_topic: str = None,
++        force: bool = False,
++        request_budget: Optional[Dict[str, int]] = None,
+     ) -> List[Dict[str, Any]]:
+         """Compact the message list and return the new message list.
+ 
+@@ -101,8 +103,10 @@ class ContextEngine(ABC):
+         Args:
+             focus_topic: Optional topic string from manual ``/compress <focus>``.
+                 Engines that support guided compression should prioritise
+-                preserving information related to this topic.  Engines that
++                preserving information related to this topic. Engines that
+                 don't support it may simply ignore this argument.
++            force: Whether manual compression should bypass normal thresholds.
++            request_budget: Optional host-accounted total request budget.
+         """
+ 
+     # -- Optional: pre-flight check ----------------------------------------
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 70d997631..bda2b0b9d 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -28,6 +28,7 @@ these paths see no behavioural change.
+ 
+ from __future__ import annotations
+ 
++import inspect
+ import logging
+ import os
+ import tempfile
+@@ -38,6 +39,65 @@ from typing import Any, Optional, Tuple
+ 
+ from agent.model_metadata import estimate_request_tokens_rough
+ 
++
++def build_context_request_budget(agent: Any, system_prompt: str = "") -> dict[str, int]:
++    """Account for the actual stable request buckets under one total budget."""
++    engine = getattr(agent, "context_compressor", None)
++    budget = int(getattr(engine, "_configured_budget_tokens", 0) or 0)
++    if budget <= 0:
++        return {}
++    safety_margin = int(getattr(engine, "_request_budget_safety_margin_tokens", 512) or 0)
++    # Compression normally runs after the session prompt was built. Prefer that
++    # exact cached prompt; only build it when no stable prompt exists yet.
++    actual_system_prompt = getattr(agent, "_cached_system_prompt", None)
++    if not actual_system_prompt:
++        builder = getattr(agent, "_build_system_prompt", None)
++        actual_system_prompt = (
++            builder(system_prompt or "")
++            if callable(builder)
++            else (system_prompt or "")
++        )
++    system_budget = (len(actual_system_prompt or "") + 3) // 4
++    tools = getattr(agent, "tools", None) or []
++    tool_schema_budget = estimate_request_tokens_rough([], tools=tools)
++    configured_response = getattr(agent, "max_tokens", None)
++    response_budget = int(configured_response) if configured_response else max(1024, int(budget * 0.05))
++    fixed = safety_margin + response_budget + system_budget + tool_schema_budget
++    if fixed + 256 > budget:
++        raise ValueError(
++            "context.budget_tokens cannot fit the system prompt, tool schemas, "
++            "response max_tokens, safety margin, and minimum message budget"
++        )
++    active_frame_budget = budget - fixed
++    return {
++        "total_budget_tokens": budget,
++        "message_budget_tokens": active_frame_budget,
++        "system_prompt_budget_tokens": system_budget,
++        "tool_schema_budget_tokens": tool_schema_budget,
++        # Memory/persona injection is already part of the exact system prompt.
++        "memory_prompt_budget_tokens": 0,
++        "response_budget_tokens": response_budget,
++    }
++
++
++def _compress_kwargs(compressor: Any, **candidates: Any) -> dict[str, Any]:
++    """Select supported kwargs without executing the compressor as a probe."""
++    try:
++        signature = inspect.signature(compressor.compress)
++    except (TypeError, ValueError):
++        # Unknown callables get only the long-standing required token argument.
++        return {"current_tokens": candidates["current_tokens"]}
++    parameters = signature.parameters
++    accepts_extra = any(
++        parameter.kind is inspect.Parameter.VAR_KEYWORD
++        for parameter in parameters.values()
++    )
++    return {
++        name: value
++        for name, value in candidates.items()
++        if accepts_extra or name in parameters
++    }
++
+ logger = logging.getLogger(__name__)
+ 
+ # Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
+@@ -460,12 +520,16 @@ def compress_context(
+         except Exception:
+             pass
+ 
++    request_budget = build_context_request_budget(agent, system_message)
++    compress_kwargs = _compress_kwargs(
++        agent.context_compressor,
++        current_tokens=approx_tokens,
++        focus_topic=focus_topic,
++        force=force,
++        request_budget=request_budget or None,
++    )
+     try:
+-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+-    except TypeError:
+-        # Plugin context engine with strict signature that doesn't accept
+-        # focus_topic / force — fall back to calling without them.
+-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
++        compressed = agent.context_compressor.compress(messages, **compress_kwargs)
+     except BaseException:
+         # ANY exception during compress() must release the lock so the
+         # session isn't permanently blocked from future compression.
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index 0a5aa8c0f..df9262ccc 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -925,16 +925,34 @@ def _discover_all_plugins() -> list:
+     return list(seen.values())
+ 
+ 
+-def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str:
+-    """Return the user-facing activation state for a plugin name or key."""
++def _plugin_status(
++    name: str,
++    enabled: set,
++    disabled: set,
++    key: str = "",
++    *,
++    memory_provider: str = "",
++    context_engine: str = "",
++) -> str:
++    """Return the effective user-facing activation state for a plugin."""
+     if name in disabled or key in disabled:
+         return "disabled"
+     if name in enabled or key in enabled:
+         return "enabled"
++    if name in {memory_provider, context_engine} or key in {memory_provider, context_engine}:
++        return "active provider"
+     return "not enabled"
+ 
+ 
+-def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set) -> list:
++def _filter_plugin_entries(
++    entries: list,
++    args: Any,
++    enabled: set,
++    disabled: set,
++    *,
++    memory_provider: str = "",
++    context_engine: str = "",
++) -> list:
+     """Apply ``hermes plugins list`` CLI filters."""
+     filtered = entries
+     if getattr(args, "no_bundled", False) or getattr(args, "user", False):
+@@ -942,7 +960,11 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
+     if getattr(args, "enabled", False):
+         filtered = [
+             entry for entry in filtered
+-            if _plugin_status(entry[0], enabled, disabled, key=entry[5]) == "enabled"
++            if _plugin_status(
++                entry[0], enabled, disabled, key=entry[5],
++                memory_provider=memory_provider,
++                context_engine=context_engine,
++            ) in {"enabled", "active provider"}
+         ]
+     return filtered
+ 
+@@ -961,13 +983,32 @@ def cmd_list(args: Any | None = None) -> None:
+ 
+     enabled = _get_enabled_set()
+     disabled = _get_disabled_set()
+-    entries = _filter_plugin_entries(entries, args, enabled, disabled)
++    memory_provider = _get_current_memory_provider()
++    context_engine = _get_current_context_engine()
++    entries = _filter_plugin_entries(
++        entries,
++        args,
++        enabled,
++        disabled,
++        memory_provider=memory_provider,
++        context_engine=context_engine,
++    )
++
++    def effective_status(name: str, key: str) -> str:
++        return _plugin_status(
++            name,
++            enabled,
++            disabled,
++            key=key,
++            memory_provider=memory_provider,
++            context_engine=context_engine,
++        )
+ 
+     if getattr(args, "json", False):
+         payload = [
+             {
+                 "name": name,
+-                "status": _plugin_status(name, enabled, disabled, key=key),
++                "status": effective_status(name, key),
+                 "version": str(version),
+                 "description": description,
+                 "source": source,
+@@ -979,8 +1020,8 @@ def cmd_list(args: Any | None = None) -> None:
+ 
+     if getattr(args, "plain", False):
+         for name, version, _description, source, _dir, key in entries:
+-            status = _plugin_status(name, enabled, disabled, key=key)
+-            print(f"{status:12} {source:8} {str(version):8} {name}")
++            status = effective_status(name, key)
++            print(f"{status:16} {source:8} {str(version):8} {name}")
+         return
+ 
+     if not entries:
+@@ -995,11 +1036,11 @@ def cmd_list(args: Any | None = None) -> None:
+     table.add_column("Source", style="dim")
+ 
+     for name, version, description, source, _dir, key in entries:
+-        status_name = _plugin_status(name, enabled, disabled, key=key)
++        status_name = effective_status(name, key)
+         if status_name == "disabled":
+             status = "[red]disabled[/red]"
+-        elif status_name == "enabled":
+-            status = "[green]enabled[/green]"
++        elif status_name in {"enabled", "active provider"}:
++            status = f"[green]{status_name}[/green]"
+         else:
+             status = "[yellow]not enabled[/yellow]"
+         table.add_row(name, status, str(version), description, source)
+diff --git a/plugins/context_engine/pcltm-context/__init__.py b/plugins/context_engine/pcltm-context/__init__.py
+index e844a3671..68629de49 100644
+--- a/plugins/context_engine/pcltm-context/__init__.py
++++ b/plugins/context_engine/pcltm-context/__init__.py
+@@ -299,6 +299,9 @@ class PCLTMContextCompressionEngine(ContextEngine):
+         self.target_ratio = target_ratio
+         self.quiet_mode = quiet_mode
+         self.context_length = get_model_context_length(self.model or "unknown")
++        self._configured_budget_tokens = 0
++        self._configured_message_budget_tokens = 0
++        self._request_budget_safety_margin_tokens = 512
+         self.threshold_tokens = int(self.context_length * self.threshold_percent)
+         self.last_prompt_tokens = 0
+         self.last_completion_tokens = 0
+@@ -324,8 +327,6 @@ class PCLTMContextCompressionEngine(ContextEngine):
+         self._last_budget_limit_tokens = 0
+         self._last_fail_closed_reason = ""
+         self.strict_fail_closed = True
+-        self._configured_message_budget_tokens = 0
+-        self._request_budget_safety_margin_tokens = 512
+         self._evidence_capsules_written: set[str] = set()
+         self.governance = ActiveFrameGovernanceSettings()
+         self._last_archival_capsules_written = 0
+@@ -351,15 +352,52 @@ class PCLTMContextCompressionEngine(ContextEngine):
+         # ``protect_first_n`` / ``protect_last_n`` for the native compressor;
+         # this engine intentionally ignores them so archival/recall memory, not
+         # raw transcript pinning, is the source of older context.
+-        budget = config.get("message_budget_tokens") or config.get("hot_path_budget_tokens")
++        unified_budget = _positive_int(
++            config.get("budget_tokens")
++            or config.get("total_budget_tokens")
++            or config.get("context_budget_tokens"),
++            0,
++        )
++        self._configured_budget_tokens = unified_budget
++
+         self.governance = ActiveFrameGovernanceSettings.from_mapping(config, self.governance)
+-        if self.governance.active_frame_budget > 0:
+-            budget = self.governance.active_frame_budget
++        derived_active_frame_budget = 0
++        if unified_budget > 0:
++            derived_active_frame_budget = max(256, int(unified_budget * 0.70))
++            derived_continuity_budget = max(256, int(unified_budget * 0.05))
++            derived_tool_evidence_budget = max(256, int(unified_budget * 0.05))
++            derived_recall_budget = max(256, int(unified_budget * 0.08))
++            self.governance = ActiveFrameGovernanceSettings(
++                active_frame_budget=self.governance.active_frame_budget or derived_active_frame_budget,
++                core_budget=self.governance.core_budget,
++                pinned_budget=self.governance.pinned_budget,
++                episodic_budget=self.governance.episodic_budget,
++                current_task_budget=self.governance.current_task_budget,
++                continuity_budget=self.governance.continuity_budget or derived_continuity_budget,
++                continuity_turns=self.governance.continuity_turns,
++                continuity_min_dialogue_turns=self.governance.continuity_min_dialogue_turns,
++                continuity_max_dialogue_turns=self.governance.continuity_max_dialogue_turns,
++                tool_evidence_budget=self.governance.tool_evidence_budget or derived_tool_evidence_budget,
++                tool_result_capsule_threshold_chars=self.governance.tool_result_capsule_threshold_chars,
++                recall_budget=self.governance.recall_budget or derived_recall_budget,
++                partial_evict_percentage=self.governance.partial_evict_percentage,
++                eviction_policy=self.governance.eviction_policy,
++                max_archival_capsule_tokens=self.governance.max_archival_capsule_tokens,
++            )
++
++        budget = (
++            config.get("message_budget_tokens")
++            or config.get("hot_path_budget_tokens")
++            or self.governance.active_frame_budget
++            or derived_active_frame_budget
++        )
+         if budget is not None:
+             try:
+                 self._configured_message_budget_tokens = max(256, int(budget))
+             except (TypeError, ValueError):
+                 self._configured_message_budget_tokens = 0
++        if unified_budget > 0:
++            self.threshold_tokens = unified_budget
+         if "strict_fail_closed" in config:
+             self.strict_fail_closed = _coerce_bool(config.get("strict_fail_closed"), default=True)
+         if "request_budget_safety_margin_tokens" in config:
+@@ -370,6 +408,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
+                 )
+             except (TypeError, ValueError):
+                 self._request_budget_safety_margin_tokens = 512
++        elif unified_budget > 0:
++            self._request_budget_safety_margin_tokens = min(8192, max(1024, int(unified_budget * 0.03)))
+ 
+     def is_available(self) -> bool:
+         return _IMPORT_ERROR is None
+@@ -388,7 +428,10 @@ class PCLTMContextCompressionEngine(ContextEngine):
+             self.context_length = context_length
+         else:
+             self.context_length = get_model_context_length(self.model or "unknown")
+-        self.threshold_tokens = int(self.context_length * self.threshold_percent)
++        if self._configured_budget_tokens > 0:
++            self.threshold_tokens = self._configured_budget_tokens
++        else:
++            self.threshold_tokens = int(self.context_length * self.threshold_percent)
+ 
+     def update_from_response(self, usage: Dict[str, Any]) -> None:
+         self.last_prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+@@ -852,6 +895,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
+                 "last_budget_breakdown": dict(self._last_budget_breakdown),
+                 "last_budget_total_tokens": self._last_budget_total_tokens,
+                 "last_budget_limit_tokens": self._last_budget_limit_tokens,
++                "configured_budget_tokens": self._configured_budget_tokens,
++                "request_budget_safety_margin_tokens": self._request_budget_safety_margin_tokens,
+                 "last_fail_closed_reason": self._last_fail_closed_reason,
+                 "strict_fail_closed": self.strict_fail_closed,
+                 "governance": self.governance.as_dict(),
+@@ -917,11 +962,14 @@ class PCLTMContextCompressionEngine(ContextEngine):
+             except Exception:
+                 explicit_message_budget = 0
+         configured_budget = int(getattr(self, "_configured_message_budget_tokens", 0) or 0)
+-        threshold = int(getattr(self, "_compression_threshold", 0) or 0)
++        threshold = int(getattr(self, "threshold_tokens", 0) or 0)
+         if explicit_message_budget > 0:
+             base = explicit_message_budget
+         elif configured_budget > 0:
+             base = max(256, configured_budget)
++        elif self._configured_budget_tokens > 0:
++            safety_margin = int(getattr(self, "_request_budget_safety_margin_tokens", 512) or 0)
++            base = max(256, self._configured_budget_tokens - max(0, safety_margin))
+         else:
+             base = int(threshold * 0.50)
+             if current_tokens and current_tokens < threshold:
+diff --git a/tests/agent/test_context_request_budget.py b/tests/agent/test_context_request_budget.py
+new file mode 100644
+index 000000000..4909a95f8
+--- /dev/null
++++ b/tests/agent/test_context_request_budget.py
+@@ -0,0 +1,103 @@
++"""Tests for host-accounted context request budgets and capability negotiation."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from agent.conversation_compression import _compress_kwargs, build_context_request_budget
++
++
++def test_context_budget_uses_cached_prompt_and_actual_max_tokens():
++    agent = SimpleNamespace(
++        context_compressor=SimpleNamespace(
++            _configured_budget_tokens=128_000,
++            _request_budget_safety_margin_tokens=4_096,
++        ),
++        tools=[{"type": "function", "function": {"name": "demo", "description": "x" * 400}}],
++        _cached_system_prompt="cached" * 1000,
++        max_tokens=12_345,
++    )
++
++    budget = build_context_request_budget(agent, system_prompt="wrong")
++
++    assert budget["total_budget_tokens"] == 128_000
++    assert budget["system_prompt_budget_tokens"] == len(agent._cached_system_prompt) // 4
++    assert budget["memory_prompt_budget_tokens"] == 0
++    assert budget["response_budget_tokens"] == 12_345
++    assert budget["tool_schema_budget_tokens"] > 0
++    assert sum(
++        budget[key]
++        for key in (
++            "message_budget_tokens",
++            "system_prompt_budget_tokens",
++            "tool_schema_budget_tokens",
++            "memory_prompt_budget_tokens",
++            "response_budget_tokens",
++        )
++    ) == budget["total_budget_tokens"] - 4_096
++
++
++def test_context_budget_builds_full_prompt_when_cache_is_empty():
++    agent = SimpleNamespace(
++        context_compressor=SimpleNamespace(
++            _configured_budget_tokens=10_000,
++            _request_budget_safety_margin_tokens=512,
++        ),
++        tools=[],
++        _cached_system_prompt=None,
++        _build_system_prompt=lambda extra: "identity-memory-skills:" + extra,
++        max_tokens=1_024,
++    )
++    budget = build_context_request_budget(agent, system_prompt="extra")
++    assert budget["system_prompt_budget_tokens"] == (
++        len("identity-memory-skills:extra") + 3
++    ) // 4
++
++
++def test_context_budget_rejects_impossible_fixed_buckets():
++    agent = SimpleNamespace(
++        context_compressor=SimpleNamespace(
++            _configured_budget_tokens=2_000,
++            _request_budget_safety_margin_tokens=512,
++        ),
++        tools=[],
++        _cached_system_prompt="x" * 4_000,
++        max_tokens=1_024,
++    )
++    with pytest.raises(ValueError, match="cannot fit"):
++        build_context_request_budget(agent)
++
++
++def test_context_request_budget_empty_without_single_budget():
++    agent = SimpleNamespace(context_compressor=SimpleNamespace(_configured_budget_tokens=0), tools=[])
++    assert build_context_request_budget(agent, system_prompt="system") == {}
++
++
++def test_compress_kwargs_preserves_supported_legacy_parameters():
++    class LegacyEngine:
++        def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
++            return messages
++
++    kwargs = _compress_kwargs(
++        LegacyEngine(), current_tokens=10, focus_topic="topic", force=True,
++        request_budget={"total_budget_tokens": 100},
++    )
++    assert kwargs == {"current_tokens": 10, "focus_topic": "topic", "force": True}
++
++
++def test_internal_type_error_is_not_used_as_signature_probe():
++    calls = []
++
++    class Engine:
++        def compress(self, messages, current_tokens=None, **kwargs):
++            calls.append(1)
++            raise TypeError("implementation bug")
++
++    engine = Engine()
++    kwargs = _compress_kwargs(
++        engine, current_tokens=10, focus_topic="topic", force=True,
++        request_budget={"total_budget_tokens": 100},
++    )
++    with pytest.raises(TypeError, match="implementation bug"):
++        engine.compress([], **kwargs)
++    assert calls == [1]
+diff --git a/tests/agent/test_pcltm_context_budget.py b/tests/agent/test_pcltm_context_budget.py
+new file mode 100644
+index 000000000..8a2989529
+--- /dev/null
++++ b/tests/agent/test_pcltm_context_budget.py
+@@ -0,0 +1,60 @@
++"""Tests for PCLTM context-engine single budget governance."""
++
++from importlib import import_module
++
++
++def _engine_class():
++    module = import_module("plugins.context_engine.pcltm-context")
++    return module.PCLTMContextCompressionEngine
++
++
++def test_pcltm_budget_tokens_sets_trigger_and_derived_buckets():
++    engine = _engine_class()()
++
++    engine.configure({"budget_tokens": 128_000})
++    engine.update_model(model="test-model", context_length=300_000)
++
++    assert engine.threshold_tokens == 128_000
++    assert engine.should_compress(127_999) is False
++    assert engine.should_compress(128_000) is True
++    assert engine._configured_budget_tokens == 128_000
++    assert engine._configured_message_budget_tokens == 89_600
++    assert engine._message_budget_tokens(current_tokens=140_000) == 89_600
++    assert engine.governance.active_frame_budget == 89_600
++    assert engine.governance.continuity_budget == 6_400
++    assert engine.governance.tool_evidence_budget == 6_400
++    assert engine.governance.recall_budget == 10_240
++    assert engine._request_budget_safety_margin_tokens == 3_840
++
++
++def test_pcltm_explicit_sub_budgets_override_budget_tokens_derivation():
++    engine = _engine_class()()
++
++    engine.configure(
++        {
++            "budget_tokens": 128_000,
++            "active_frame_budget_tokens": 64_000,
++            "continuity_budget_tokens": 4_000,
++            "tool_evidence_budget_tokens": 2_000,
++            "recall_budget_tokens": 3_000,
++            "request_budget_safety_margin_tokens": 8_000,
++        }
++    )
++    engine.update_model(model="test-model", context_length=300_000)
++
++    assert engine.threshold_tokens == 128_000
++    assert engine._configured_message_budget_tokens == 64_000
++    assert engine._message_budget_tokens(current_tokens=140_000) == 64_000
++    assert engine.governance.active_frame_budget == 64_000
++    assert engine.governance.continuity_budget == 4_000
++    assert engine.governance.tool_evidence_budget == 2_000
++    assert engine.governance.recall_budget == 3_000
++    assert engine._request_budget_safety_margin_tokens == 8_000
++
++
++def test_pcltm_legacy_default_message_budget_remains_capped():
++    engine = _engine_class()()
++    engine.update_model(model="test-model", context_length=300_000)
++
++    assert engine.threshold_tokens == 150_000
++    assert engine._message_budget_tokens(current_tokens=160_000) == 32_000
+diff --git a/tests/hermes_cli/test_plugins_cmd.py b/tests/hermes_cli/test_plugins_cmd.py
+index 8353324e9..aa257c857 100644
+--- a/tests/hermes_cli/test_plugins_cmd.py
++++ b/tests/hermes_cli/test_plugins_cmd.py
+@@ -536,6 +536,37 @@ class TestCmdRemove:
+ class TestCmdList:
+     """Test the list command."""
+ 
++    def test_provider_selected_in_config_is_reported_active(self, monkeypatch, capsys):
++        from argparse import Namespace
++        from hermes_cli.plugins_cmd import cmd_list
++
++        entries = [("soullink", "0.1.0", "memory", "user", MagicMock(), "soullink")]
++        monkeypatch.setattr("hermes_cli.plugins_cmd._discover_all_plugins", lambda: entries)
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_enabled_set", lambda: set())
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_disabled_set", lambda: set())
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_current_memory_provider", lambda: "soullink")
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_current_context_engine", lambda: "pcltm-context")
++
++        cmd_list(Namespace(json=False, plain=True, no_bundled=False, user=False, enabled=False))
++
++        assert "active provider" in capsys.readouterr().out
++
++    def test_list_enabled_includes_active_provider(self, monkeypatch, capsys):
++        from argparse import Namespace
++        from hermes_cli.plugins_cmd import cmd_list
++
++        entries = [("soullink", "0.1.0", "memory", "user", MagicMock(), "soullink")]
++        monkeypatch.setattr("hermes_cli.plugins_cmd._discover_all_plugins", lambda: entries)
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_enabled_set", lambda: set())
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_disabled_set", lambda: set())
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_current_memory_provider", lambda: "soullink")
++        monkeypatch.setattr("hermes_cli.plugins_cmd._get_current_context_engine", lambda: "")
++
++        cmd_list(Namespace(json=False, plain=True, no_bundled=False, user=False, enabled=True))
++        output = capsys.readouterr().out
++        assert "soullink" in output
++        assert "active provider" in output
++
+     @patch("hermes_cli.plugins_cmd._plugins_dir")
+     def test_list_empty_plugins_dir(self, mock_plugins_dir):
+         from hermes_cli.plugins_cmd import cmd_list
+diff --git a/tests/run_agent/test_plugin_context_engine_init.py b/tests/run_agent/test_plugin_context_engine_init.py
+index 7285cb1f6..b15c7536b 100644
+--- a/tests/run_agent/test_plugin_context_engine_init.py
++++ b/tests/run_agent/test_plugin_context_engine_init.py
+@@ -6,6 +6,8 @@ context_length, causing the CLI status bar to show 'ctx --'.
+ 
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
++
+ from agent.context_engine import ContextEngine
+ 
+ 
+@@ -37,6 +39,15 @@ class _ToolEngine(_StubEngine):
+         ]
+ 
+ 
++class _ConfigurableEngine(_StubEngine):
++    def __init__(self):
++        super().__init__()
++        self.configured_with = None
++
++    def configure(self, config):
++        self.configured_with = dict(config)
++
++
+ def test_plugin_engine_gets_context_length_on_init():
+     """Plugin context engine should have context_length set during AIAgent init."""
+     engine = _StubEngine()
+@@ -139,3 +150,56 @@ def test_plugin_engine_update_model_args():
+     assert "model" in kw
+     assert "provider" in kw
+     assert "api_mode" in kw
++
++
++
++def test_plugin_engine_configure_receives_context_config_before_update_model():
++    """Context engine config fields such as budget_tokens must reach plugin engines."""
++    engine = _ConfigurableEngine()
++    cfg = {"context": {"engine": "stub", "budget_tokens": 128_000}, "agent": {}}
++
++    with (
++        patch("hermes_cli.config.load_config", return_value=cfg),
++        patch("plugins.context_engine.load_context_engine", return_value=engine),
++        patch("agent.model_metadata.get_model_context_length", return_value=300_000),
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        from run_agent import AIAgent
++
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++
++    assert agent.context_compressor is engine
++    assert engine.configured_with == {"engine": "stub", "budget_tokens": 128_000}
++    assert engine.context_length == 300_000
++
++
++def test_plugin_engine_configuration_failure_aborts_initialization():
++    engine = _ConfigurableEngine()
++    engine.configure = MagicMock(side_effect=ValueError("invalid budget"))
++    cfg = {"context": {"engine": "stub", "budget_tokens": 1}, "agent": {}}
++
++    with (
++        patch("hermes_cli.config.load_config", return_value=cfg),
++        patch("plugins.context_engine.load_context_engine", return_value=engine),
++        patch("agent.model_metadata.get_model_context_length", return_value=300_000),
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        from run_agent import AIAgent
++        with pytest.raises(ValueError, match="invalid budget"):
++            AIAgent(
++                api_key="test-key-1234567890",
++                base_url="https://openrouter.ai/api/v1",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
+# SoulLink incremental live context telemetry patch
+diff --git a/plugins/context_engine/pcltm-context/__init__.py b/plugins/context_engine/pcltm-context/__init__.py
+index 68629de49..bd3c83a21 100644
+--- a/plugins/context_engine/pcltm-context/__init__.py
++++ b/plugins/context_engine/pcltm-context/__init__.py
+@@ -17,6 +17,7 @@ import os
+ import sqlite3
+ import sys
+ from dataclasses import dataclass
++from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any, Dict, List, Mapping
+ 
+@@ -308,6 +309,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
+         self.last_total_tokens = 0
+         self.compression_count = 0
+         self.session_id = ""
++        self._hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+         self._last_context_render = ""
+         self._last_continuity_tokens = 0
+         self._last_continuity_message_count = 0
+@@ -439,6 +441,34 @@ class PCLTMContextCompressionEngine(ContextEngine):
+         self.last_total_tokens = int(
+             usage.get("total_tokens") or (self.last_prompt_tokens + self.last_completion_tokens)
+         )
++        payload = {
++            "source": "exact_host_context_usage",
++            "observed_at": datetime.now(timezone.utc).isoformat(),
++            "session_id": self.session_id,
++            "engine": self.name,
++            "prompt_tokens": self.last_prompt_tokens,
++            "completion_tokens": self.last_completion_tokens,
++            "total_tokens": self.last_total_tokens,
++            "input_tokens": int(usage.get("input_tokens") or self.last_prompt_tokens),
++            "output_tokens": int(usage.get("output_tokens") or self.last_completion_tokens),
++            "cache_read_tokens": int(usage.get("cache_read_tokens") or 0),
++            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
++            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
++            "context_length": int(self.context_length or 0),
++            "budget_tokens": int(self._configured_budget_tokens or self.threshold_tokens or 0),
++            "compression_count": int(self.compression_count or 0),
++            "last_budget_breakdown": dict(self._last_budget_breakdown),
++            "last_budget_total_tokens": int(self._last_budget_total_tokens or 0),
++            "last_budget_limit_tokens": int(self._last_budget_limit_tokens or 0),
++        }
++        path = self._hermes_home / "runtime" / "soullink-context-telemetry.json"
++        try:
++            path.parent.mkdir(parents=True, exist_ok=True)
++            temp = path.with_name(path.name + f".{os.getpid()}.tmp")
++            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
++            os.replace(temp, path)
++        except OSError:
++            logger.debug("Failed to write SoulLink context usage telemetry", exc_info=True)
+ 
+     def should_compress(self, prompt_tokens: int = None) -> bool:
+         tokens = int(prompt_tokens or self.last_prompt_tokens or 0)
+@@ -469,6 +499,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
+ 
+     def on_session_start(self, session_id: str, **kwargs) -> None:
+         self.session_id = session_id or self.session_id
++        if kwargs.get("hermes_home"):
++            self._hermes_home = Path(kwargs["hermes_home"])
+ 
+     def on_session_reset(self) -> None:
+         super().on_session_reset()

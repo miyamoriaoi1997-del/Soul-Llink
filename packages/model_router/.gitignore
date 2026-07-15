@@ -1,0 +1,31 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime logs and audit output
+logs/
+*.log
+
+# Local backups / temporary files
+backups/
+*.bak
+*.bak-*
+*~
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets / environment overrides
+.env
+.env.*
+
+# Keep the active router config local unless intentionally force-added after review.
+config.yaml
+config.yaml.bak-*

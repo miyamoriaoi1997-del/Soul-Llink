@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "corpus_id": "continuity-replay-corpus-v1",
+  "authority_boundary": "sanitized_replay_fixture_only",
+  "contains_raw_private_history": false,
+  "scenarios": [
+    {
+      "scenario_id": "explicit-resume-active-task",
+      "category": "cross_session_resume",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "继续。",
+      "expected": {
+        "should_resume": true,
+        "identity_stable": true,
+        "active_task_present": true,
+        "constraints_preserved": true,
+        "evidence_refs_present": true
+      }
+    },
+    {
+      "scenario_id": "new-request-does-not-resurrect-old-task",
+      "category": "task_non_resurrection",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "检查另一个独立问题。",
+      "expected": {
+        "should_resume": false,
+        "old_task_executable": false,
+        "latest_real_user_message_has_authority": true
+      }
+    },
+    {
+      "scenario_id": "control-payload-is-not-user-intent",
+      "category": "authority_boundary",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "新的真实请求。",
+      "historical_control_types": [
+        "context_compaction",
+        "system_note",
+        "preserved_todo"
+      ],
+      "expected": {
+        "control_payload_selected_as_user_message": false,
+        "latest_real_user_message_has_authority": true
+      }
+    },
+    {
+      "scenario_id": "tool-tail-remains-evidence-only",
+      "category": "tool_authority",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "现在状态如何？",
+      "expected": {
+        "tool_tail_executable": false,
+        "tool_evidence_authority": "evidence_only",
+        "open_tool_tail_warning_present": true
+      }
+    },
+    {
+      "scenario_id": "identity-task-and-constraints-survive-session-boundary",
+      "category": "continuity_preservation",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "继续连续性保护工作。",
+      "expected": {
+        "identity_stable": true,
+        "active_task_present": true,
+        "constraints_preserved": true,
+        "unresolved_items_preserved": true,
+        "evidence_refs_present": true
+      }
+    },
+    {
+      "scenario_id": "terminal-task-states-do-not-reactivate",
+      "category": "task_lifecycle",
+      "source_kind": "sanitized_regression_scenario",
+      "current_user_message": "继续当前未完成事项。",
+      "expected": {
+        "completed_items_reactivated": false,
+        "paused_items_reactivated": false,
+        "revoked_items_reactivated": false,
+        "unresolved_items_preserved": true
+      }
+    }
+  ]
+}

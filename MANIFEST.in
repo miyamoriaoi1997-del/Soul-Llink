@@ -1,0 +1,25 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+recursive-include soul_link *.py
+recursive-include packages/pcltm *.py
+recursive-include packages/persona_engine *.py *.md *.yaml
+recursive-include packages/model_router *.py *.yaml *.service
+
+prune tests
+prune packages/model_router/tests
+prune packages/persona_engine/tests
+prune packages/persona_engine/docs/plans
+prune .pytest_cache
+prune __pycache__
+prune .venv
+prune var
+prune logs
+recursive-exclude * __pycache__
+recursive-exclude * *.py[cod]
+global-exclude *.db
+global-exclude *.sqlite
+global-exclude *.sqlite3
+global-exclude *.jsonl
+global-exclude .env
