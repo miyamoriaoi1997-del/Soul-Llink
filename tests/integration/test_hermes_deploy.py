@@ -73,7 +73,7 @@ def test_apply_and_rollback_restore_profile_byte_for_byte(tmp_path: Path, monkey
     assert config["custom"] == "keep"
     assert config["memory"]["provider"] == "soullink"
     assert config["context"]["engine"] == "pcltm-context"
-    assert config["compression"]["enabled"] is False
+    assert config["compression"]["enabled"] is True
     assert (home / "plugins/soullink/soullink-root.txt").is_file()
     assert "managed-by: SoulLink/PCLTM" in (home / "SOUL.md").read_text(encoding="utf-8")
 

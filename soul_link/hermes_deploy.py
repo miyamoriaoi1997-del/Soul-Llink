@@ -224,7 +224,10 @@ class HermesDeployment:
         config = self._read_yaml(path)
         config.setdefault("memory", {})["provider"] = "soullink"
         config.setdefault("context", {})["engine"] = "pcltm-context"
-        config.setdefault("compression", {})["enabled"] = False
+        # Hermes gates every context-engine lifecycle behind this host switch.
+        # With context.engine=pcltm-context, enabling it activates PCLTM; it
+        # does not select the built-in ContextCompressor.
+        config.setdefault("compression", {})["enabled"] = True
         plugins = config.setdefault("plugins", {})
         enabled = list(plugins.get("enabled") or [])
         if "pcltm-context" not in enabled:
