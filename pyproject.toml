@@ -38,6 +38,7 @@ soullink = "pcltm.cli:main"
 pcltm = "pcltm.cli:main"
 soullink-continuity-gate = "pcltm.continuity_gate:main"
 soullink-host-adapt = "soul_link.host_adaptation:main"
+soullink-hermes-deploy = "soul_link.hermes_deploy:main"
 
 [project.urls]
 Homepage = "https://github.com/soullink-public/soullink-public-2.0"
@@ -57,6 +58,10 @@ ml = [
 include-package-data = false
 packages = [
     "soul_link",
+    "soul_link.hermes_plugin",
+    "soul_link.hermes_assets",
+    "soul_link.hermes_assets.memory",
+    "soul_link.hermes_assets.context",
     "soul_link.integration",
     "pcltm",
     "pcltm.dac",
@@ -77,6 +82,10 @@ packages = [
 
 [tool.setuptools.package-dir]
 soul_link = "soul_link"
+"soul_link.hermes_plugin" = "soul_link/hermes_plugin"
+"soul_link.hermes_assets" = "soul_link/hermes_assets"
+"soul_link.hermes_assets.memory" = "soul_link/hermes_assets/memory"
+"soul_link.hermes_assets.context" = "soul_link/hermes_assets/context"
 "soul_link.integration" = "soul_link/integration"
 pcltm = "packages/pcltm"
 "pcltm.dac" = "packages/pcltm/dac"
@@ -95,6 +104,8 @@ persona_engine = "packages/persona_engine"
 model_router = "packages/model_router"
 
 [tool.setuptools.package-data]
+"soul_link.hermes_assets.memory" = ["plugin.yaml"]
+"soul_link.hermes_assets.context" = ["plugin.yaml"]
 "pcltm.monitoring.static" = ["*.html", "*.js", "*.css"]
 persona_engine = [
     "config/*.yaml",

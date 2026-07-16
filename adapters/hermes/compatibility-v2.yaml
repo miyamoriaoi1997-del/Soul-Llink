@@ -1,0 +1,19 @@
+host: hermes-agent
+adapter_version: "2"
+strategy: profile_plugins
+host_source_mutation_required: false
+required_capabilities:
+  agent/context_engine.py: class ContextEngine
+  agent/memory_provider.py: class MemoryProvider
+  plugins/memory/__init__.py: load_memory_provider
+  hermes_cli/plugins.py: register_context_engine
+managed_profile_paths:
+  - plugins/soullink
+  - plugins/pcltm-context
+  - config.yaml
+  - SOUL.md
+verify_command:
+  - "{python}"
+  - -m
+  - soul_link.hermes_deploy
+  - verify

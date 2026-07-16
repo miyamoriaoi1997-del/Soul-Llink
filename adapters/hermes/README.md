@@ -1,21 +1,43 @@
 # Hermes host adapter boundary
 
-This directory contains SoulLink-owned integration material for Hermes Agent hosts.
+SoulLink core stays host-neutral under `packages/`. Hermes integration assets are owned and versioned here.
 
-SoulLink/PCLTM core packages stay host-neutral under `packages/`. Runtime-specific Hermes seams, patchsets, and host-adapter notes belong here so they are versioned with SoulLink rather than mistaken for generic Hermes upstream work.
+## Latest Hermes: profile-local deployment (adapter v2)
 
-## Patchsets
-
-- `patches/pcltm-context-engine-host-adapter.patch` — host-side Hermes changes required for the SoulLink/PCLTM context engine integration:
-  - configure plugin context engines from Hermes context config;
-  - pass request-budget information into context compression;
-  - account for tool-output pressure in compaction decisions;
-  - adapt the `plugins/context_engine/pcltm-context` host plugin;
-  - add Hermes-side regression tests for the adapter seam.
-- `soullink-plugin.yaml` — expected Hermes manifest for the production `soullink` memory-provider plugin. It uses `kind: exclusive`, the host-recognized kind for provider plugins selected through `memory.provider`, and avoids the general plugin scanner's unknown-kind fallback.
-
-These patchsets are source artifacts. Apply them only to an explicitly selected Hermes host checkout, then verify with the relevant Hermes-side tests. The host context-engine file currently carries mixed historical line endings; validate the managed patch against an already-applied Windows checkout with:
+For current Hermes Agent releases that expose `MemoryProvider`, `ContextEngine`, user-plugin discovery, and `register_context_engine`, use:
 
 ```bash
-git apply --check --reverse --ignore-space-change --ignore-whitespace adapters/hermes/patches/pcltm-context-engine-host-adapter.patch
+soullink-hermes-deploy detect \
+  --soullink-root /path/to/Soul-Llink \
+  --host-root /path/to/hermes-agent \
+  --hermes-home "$HERMES_HOME"
+
+soullink-hermes-deploy apply \
+  --soullink-root /path/to/Soul-Llink \
+  --host-root /path/to/hermes-agent \
+  --hermes-home "$HERMES_HOME" \
+  --receipt "$HERMES_HOME/soullink-deployment-receipt.json"
 ```
+
+This strategy does **not** modify Hermes source. It transactionally manages only profile-local paths:
+
+- `plugins/soullink` — exclusive PCLTM memory provider;
+- `plugins/pcltm-context` — general plugin registering the governed context engine;
+- `config.yaml` — selects both plugins and disables native compression;
+- `SOUL.md` — installs the SoulLink identity anchor.
+
+The original bytes of all pre-existing managed paths are retained in a durable backup. Apply/verification failure restores them automatically. Explicit rollback:
+
+```bash
+soullink-hermes-deploy rollback \
+  --soullink-root /path/to/Soul-Llink \
+  --receipt "$HERMES_HOME/soullink-deployment-receipt.json"
+```
+
+Hermes must start a fresh process/session after deployment. `verify` launches the host interpreter in a fresh process and proves that Hermes discovers the provider and context engine; it does not hot-reload an already-running agent.
+
+The declarative contract is `compatibility-v2.yaml`.
+
+## Historical core patch (adapter v1)
+
+`patches/pcltm-context-engine-host-adapter.patch` is retained only for older Hermes revisions that predate the required SPIs. Do not force it onto current Hermes. The legacy controller and `compatibility.yaml` remain available for exact historical hosts.

@@ -54,8 +54,8 @@ def _install_structured_memory_view(monkeypatch):
     monkeypatch.setattr(memory_adapter, "load_layered_prompt_context", lambda **_: _FakeLayeredMemoryView())
 
 
-def test_soullink_facade_exports_and_resolves_minimally():
-    link = SoulLink()
+def test_soullink_facade_exports_and_resolves_minimally(tmp_path):
+    link = SoulLink(log_path=tmp_path / "facade.jsonl")
     request = link.ingest(
         "继续做收口",
         recent_context=[{"role": "user", "content": "前文"}],
@@ -83,14 +83,14 @@ def test_persona_engine_base_dir_falls_back_from_non_soullink_cwd(tmp_path, monk
     assert resolve_persona_engine_base_dir(Path(".")) == PERSONA_ACTIVE
 
 
-def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch):
+def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch, tmp_path):
     _install_structured_memory_view(monkeypatch)
     monkeypatch.setattr(
         "persona_engine.emotion_state_manager.EmotionStateManager",
         FakeEmotionStateManager,
     )
     FakeEmotionStateManager.calls = []
-    link = SoulLink()
+    link = SoulLink(log_path=tmp_path / "compose.jsonl")
 
     resolution = link.compose_active_prompt(
         host_system_prompt=(
@@ -127,8 +127,8 @@ def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch):
     ]
 
 
-def test_resolve_uses_single_analysis_for_prompt_candidate(monkeypatch):
-    link = SoulLink()
+def test_resolve_uses_single_analysis_for_prompt_candidate(monkeypatch, tmp_path):
+    link = SoulLink(log_path=tmp_path / "resolve.jsonl")
     calls = {"analyze": 0}
     original_analyze = link._orchestrator._analyze
 

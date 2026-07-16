@@ -1,0 +1,5 @@
+manifest_version: 1
+name: soullink
+version: 2.0.0
+description: SoulLink/PCLTM governed persistent memory provider.
+kind: exclusive

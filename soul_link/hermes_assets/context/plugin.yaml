@@ -1,0 +1,5 @@
+manifest_version: 1
+name: pcltm-context
+version: 2.0.0
+description: SoulLink/PCLTM governed context engine for Hermes Agent.
+kind: standalone
