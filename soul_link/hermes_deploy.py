@@ -198,6 +198,10 @@ class HermesDeployment:
         plugin = home / "plugins/soullink"
         context_plugin = home / "plugins/pcltm-context"
         config = self._read_yaml(home / "config.yaml")
+        disabled = {
+            str(name)
+            for name in (((config.get("agent") or {}).get("disabled_toolsets")) or [])
+        }
         return (
             (plugin / "__init__.py").is_file()
             and (plugin / "plugin.yaml").is_file()
@@ -208,6 +212,9 @@ class HermesDeployment:
             and (config.get("memory") or {}).get("provider") == "soullink"
             and (config.get("context") or {}).get("engine") == "pcltm-context"
             and "pcltm-context" in ((config.get("plugins") or {}).get("enabled") or [])
+            and "session_search" in disabled
+            and "memory" not in disabled
+            and "context_engine" not in disabled
             and "managed-by: SoulLink/PCLTM" in (home / "SOUL.md").read_text(encoding="utf-8")
         ) if (plugin / "soullink-root.txt").is_file() and (home / "SOUL.md").is_file() else False
 
@@ -233,6 +240,19 @@ class HermesDeployment:
         if "pcltm-context" not in enabled:
             enabled.append("pcltm-context")
         plugins["enabled"] = enabled
+
+        # PCLTM is the authoritative cross-session memory surface for a
+        # SoulLink-managed profile.  Suppress Hermes transcript search so the
+        # agent cannot silently bypass PCLTM provenance, while ensuring the
+        # selected memory provider and context engine remain callable.  Keep
+        # every unrelated user-disabled toolset unchanged.
+        agent = config.setdefault("agent", {})
+        disabled = [str(name) for name in (agent.get("disabled_toolsets") or [])]
+        disabled = [name for name in disabled if name not in {"memory", "context_engine"}]
+        if "session_search" not in disabled:
+            disabled.append("session_search")
+        agent["disabled_toolsets"] = disabled
+
         self._atomic_yaml(path, config)
 
     def _install_soul(self, home: Path) -> None:

@@ -58,7 +58,14 @@ def test_apply_and_rollback_restore_profile_byte_for_byte(tmp_path: Path, monkey
     old_plugin = home / "plugins/soullink"
     old_plugin.mkdir(parents=True)
     (old_plugin / "legacy.txt").write_text("legacy", encoding="utf-8")
-    (home / "config.yaml").write_text("memory:\n  provider: legacy\ncustom: keep\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: legacy\n"
+        "agent:\n"
+        "  disabled_toolsets: [memory, context_engine, vision]\n"
+        "custom: keep\n",
+        encoding="utf-8",
+    )
     (home / "SOUL.md").write_text("old identity\n", encoding="utf-8")
     before_host = _tree_hash(host)
     before_profile = _tree_hash(home)
@@ -74,6 +81,11 @@ def test_apply_and_rollback_restore_profile_byte_for_byte(tmp_path: Path, monkey
     assert config["memory"]["provider"] == "soullink"
     assert config["context"]["engine"] == "pcltm-context"
     assert config["compression"]["enabled"] is True
+    assert "session_search" in config["agent"]["disabled_toolsets"]
+    assert "memory" not in config["agent"]["disabled_toolsets"]
+    assert "context_engine" not in config["agent"]["disabled_toolsets"]
+    assert "vision" in config["agent"]["disabled_toolsets"]
+    assert deployment.detect(host, home)["classification"] == "supported"
     assert (home / "plugins/soullink/soullink-root.txt").is_file()
     assert "managed-by: SoulLink/PCLTM" in (home / "SOUL.md").read_text(encoding="utf-8")
 
