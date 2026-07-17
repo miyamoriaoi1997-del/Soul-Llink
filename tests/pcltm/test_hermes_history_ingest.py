@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pcltm.hermes_history import HermesHistoryIngestor
 from pcltm.store import EventStore
+from pcltm.transcript_search import search_exact_evidence
 
 
 def _create_hermes_db(path: Path) -> None:
@@ -54,11 +55,20 @@ def test_ingests_visible_tools_prompt_hashes_and_session_lifecycle(tmp_path: Pat
         events = store.list_events(limit=20)
         ingests = [store.find_ingest_event(f"hermes-message:{index}") for index in range(1, 6)]
         lifecycle = store.find_ingest_event("hermes-session:s1")
+        projection_statuses = {
+            row["status"]: row["count"]
+            for row in store._conn.execute(
+                "SELECT status, COUNT(*) AS count FROM projection_outbox GROUP BY status"
+            )
+        }
+        exact = search_exact_evidence(store, "用户的原始问题", limit=1)
     finally:
         store.close()
 
     assert report == {"scanned": 5, "inserted": 6, "updated": 0, "existing": 0, "sessions": 1}
     assert len(events) == 6
+    assert projection_statuses == {"applied": 12}
+    assert len(exact) == 1 and exact[0].verified is True
     by_role = {event["role"]: event for event in events}
     assert by_role["user"]["content"] == "用户的原始问题"
     assert by_role["assistant"]["content"] == "可见回答"
@@ -124,26 +134,37 @@ def test_raw_history_is_searchable_but_not_approved_prompt_memory(tmp_path: Path
     assert rendered == ""
 
 
-def test_reingest_updates_lifecycle_and_message_state_without_new_rows(tmp_path: Path) -> None:
+def test_reingest_appends_revisions_without_overwriting_prior_events(tmp_path: Path) -> None:
     hermes_db = tmp_path / "state.db"
     pcltm_db = tmp_path / "pcltm.db"
     _create_hermes_db(hermes_db)
     store = EventStore(pcltm_db)
     try:
         HermesHistoryIngestor(store, hermes_db).ingest()
+        original_lifecycle = store.find_ingest_event("hermes-session:s1")
+        original_message = store.find_ingest_event("hermes-message:3")
         with sqlite3.connect(hermes_db) as conn:
             conn.execute("UPDATE sessions SET ended_at=300, end_reason='compression', rewind_count=2 WHERE id='s1'")
-            conn.execute("UPDATE messages SET active=0, compacted=1 WHERE id=3")
+            conn.execute("UPDATE messages SET content='修正后的用户问题', active=0, compacted=1 WHERE id=3")
         report = HermesHistoryIngestor(store, hermes_db).ingest()
         lifecycle = store.find_ingest_event("hermes-session:s1")
         message = store.find_ingest_event("hermes-message:3")
         counts = store.fts_counts()
+        all_events = store.list_events(limit=20)
     finally:
         store.close()
 
     assert report == {"scanned": 5, "inserted": 0, "updated": 2, "existing": 4, "sessions": 1}
+    assert original_lifecycle is not None
+    assert original_message is not None
+    assert lifecycle is not None
+    assert message is not None
+    assert lifecycle["event_id"] != original_lifecycle["event_id"]
+    assert message["event_id"] != original_message["event_id"]
     assert lifecycle["payload_metadata"]["end_reason"] == "compression"
     assert lifecycle["payload_metadata"]["rewind_count"] == 2
     assert message["payload_metadata"]["active"] is False
     assert message["payload_metadata"]["compacted"] is True
-    assert counts["events"] == counts["event_fts"] == 6
+    assert counts["events"] == counts["event_fts"] == 8
+    assert any(event["event_id"] == original_message["event_id"] and event["content"] == "用户的原始问题" for event in all_events)
+    assert any(event["event_id"] == message["event_id"] and event["content"] == "修正后的用户问题" for event in all_events)

@@ -18,6 +18,19 @@ SEARCH_SCHEMA = {
     },
 }
 
+EXACT_RECALL_SCHEMA = {
+    "name": "soullink_memory_recall_exact",
+    "description": "Recall an exact quote from the SoulLink/PCLTM transcript ledger after L1 local-integrity checks (hash, chain, offsets, and current governance). This is not resistant to an attacker who can rewrite all SQLite authority tables.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Exact quote or phrase to locate."},
+            "limit": {"type": "integer", "description": "Maximum verified results, default 8."},
+        },
+        "required": ["query"],
+    },
+}
+
 OPEN_SCHEMA = {
     "name": "soullink_memory_open",
     "description": "Open one SoulLink/PCLTM memory returned by soullink_memory_search.",
@@ -54,13 +67,18 @@ class PCLTMMemoryTools:
         search: Callable[..., Any],
         open_memory: Callable[..., Any],
         remember: Callable[..., Any],
+        recall_exact: Callable[..., Any] | None = None,
     ) -> None:
         self._search = search
         self._open_memory = open_memory
         self._remember = remember
+        self._recall_exact = recall_exact
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [SEARCH_SCHEMA, OPEN_SCHEMA, REMEMBER_SCHEMA]
+        schemas = [SEARCH_SCHEMA, OPEN_SCHEMA, REMEMBER_SCHEMA]
+        if self._recall_exact is not None:
+            schemas.insert(1, EXACT_RECALL_SCHEMA)
+        return schemas
 
     def call(self, tool_name: str, args: Mapping[str, Any]) -> str:
         if tool_name == SEARCH_SCHEMA["name"]:
@@ -77,6 +95,18 @@ class PCLTMMemoryTools:
                 limit=limit,
             )
             return self._json({"success": True, "results": results})
+
+        if tool_name == EXACT_RECALL_SCHEMA["name"]:
+            if self._recall_exact is None:
+                return self._error("exact recall is unavailable")
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return self._error("query is required")
+            limit = self._bounded_int(args.get("limit"), default=8, minimum=1, maximum=100)
+            if limit is None:
+                return self._error("limit must be an integer between 1 and 100")
+            results = self._recall_exact(query=query, limit=limit)
+            return self._json({"success": True, "evidence_level": "E0", "integrity_scope": "l1_local_consistency", "results": results})
 
         if tool_name == OPEN_SCHEMA["name"]:
             memory_id = str(args.get("memory_id") or "").strip()

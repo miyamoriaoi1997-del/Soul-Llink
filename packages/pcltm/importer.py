@@ -21,6 +21,7 @@ class JSONLTranscriptImporter:
     def import_file(self, path: str | Path) -> dict[str, Any]:
         path = Path(path)
         created = 0
+        updated = 0
         skipped_duplicate = 0
         dropped = 0
         by_kind: Counter[str] = Counter()
@@ -42,6 +43,8 @@ class JSONLTranscriptImporter:
                         continue
                     if result["created"]:
                         created += 1
+                    elif result.get("updated"):
+                        updated += 1
                     else:
                         skipped_duplicate += 1
                     event = self.store.get_event(result["event_id"])
@@ -55,6 +58,7 @@ class JSONLTranscriptImporter:
             "ok": not errors and doctor["ok"],
             "path": str(path),
             "created": created,
+            "updated": updated,
             "skipped_duplicate": skipped_duplicate,
             "dropped": dropped,
             "by_kind": dict(by_kind),

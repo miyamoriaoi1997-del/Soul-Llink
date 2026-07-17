@@ -6,6 +6,30 @@ import sys
 from pcltm.host_tools import PCLTMMemoryTools
 
 
+def test_exact_recall_tool_schema_and_dispatch() -> None:
+    calls = []
+    tools = PCLTMMemoryTools(
+        search=lambda **_: [],
+        open_memory=lambda **_: {},
+        remember=lambda **_: True,
+        recall_exact=lambda **kwargs: calls.append(kwargs) or [
+            {"evidence_level": "E0", "quote": "exact", "verified": True}
+        ],
+    )
+
+    assert "soullink_memory_recall_exact" in [schema["name"] for schema in tools.schemas()]
+    result = json.loads(
+        tools.call("soullink_memory_recall_exact", {"query": "exact", "limit": 2})
+    )
+    assert result == {
+        "success": True,
+        "evidence_level": "E0",
+        "integrity_scope": "l1_local_consistency",
+        "results": [{"evidence_level": "E0", "quote": "exact", "verified": True}],
+    }
+    assert calls == [{"query": "exact", "limit": 2}]
+
+
 def test_pcltm_memory_tools_are_host_neutral_and_dispatch_injected_backend() -> None:
     forbidden_before = {name for name in sys.modules if name.split(".", 1)[0] in {"agent", "gateway", "hermes_cli"}}
     calls = []

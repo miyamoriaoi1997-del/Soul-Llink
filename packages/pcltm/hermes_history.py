@@ -5,6 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from .projections.runtime import drain_transcript_projections
 from .store import EventStore
 
 _PROMPT_ROLES = {"system", "developer"}
@@ -55,6 +56,7 @@ class HermesHistoryIngestor:
                 inserted += status == "inserted"
                 updated += status == "updated"
                 existing += status == "existing"
+        drain_transcript_projections(self.store)
         return {"scanned": scanned, "inserted": inserted, "updated": updated, "existing": existing, "sessions": len(sessions)}
 
     @staticmethod

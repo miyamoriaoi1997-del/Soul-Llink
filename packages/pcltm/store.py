@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from .classifier import EventClassifier
+from .evidence_chain import chain_hash, normalize_source_created_at, sha256_text
+from .ledger_schema import ensure_evidence_ledger_schema
+from .projection_outbox import enqueue_event_projections
 from .secret_policy import evaluate_memory_write, redact_secrets
 
 
@@ -16,7 +19,7 @@ _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|API[_-]?KEY|PASSWORD|PASS)[A-Z0-9_]*)\s*=\s*[^\s,;]+"
 )
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 class EventStore:
@@ -27,21 +30,28 @@ class EventStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._bootstrap()
 
     def _bootstrap(self) -> None:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+                """
             )
-            """
-        )
-        self._apply_schema()
-        self._conn.commit()
+            self._apply_schema()
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            self._conn.close()
+            raise
 
     def _apply_schema(self) -> None:
         self._create_core_tables()
@@ -49,6 +59,7 @@ class EventStore:
         self._create_dac_tables()
         self._ensure_event_classification_columns()
         self._ensure_memory_record_columns()
+        ensure_evidence_ledger_schema(self._conn)
         self._create_fts_tables()
         self._ensure_fts_populated()
         for version in range(1, CURRENT_SCHEMA_VERSION + 1):
@@ -308,8 +319,45 @@ class EventStore:
         event_fts_count = self._conn.execute("SELECT count(*) AS n FROM event_fts").fetchone()["n"]
         summary_count = self._conn.execute("SELECT count(*) AS n FROM summary_nodes").fetchone()["n"]
         summary_fts_count = self._conn.execute("SELECT count(*) AS n FROM summary_fts").fetchone()["n"]
-        if event_count != event_fts_count or summary_count != summary_fts_count:
+        if not self._fts_is_consistent():
             self.rebuild_fts()
+
+    def _fts_is_consistent(self) -> bool:
+        event_mismatch = self._conn.execute(
+            """
+            SELECT 1
+            FROM events e
+            LEFT JOIN event_fts f ON f.rowid = e.event_id
+            WHERE f.rowid IS NULL OR f.content <> e.content
+            LIMIT 1
+            """
+        ).fetchone()
+        extra_event_fts = self._conn.execute(
+            """
+            SELECT 1 FROM event_fts f
+            LEFT JOIN events e ON e.event_id = f.rowid
+            WHERE e.event_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        summary_mismatch = self._conn.execute(
+            """
+            SELECT 1
+            FROM summary_nodes s
+            LEFT JOIN summary_fts f ON f.rowid = s.node_id
+            WHERE f.rowid IS NULL OR f.summary <> s.summary
+            LIMIT 1
+            """
+        ).fetchone()
+        extra_summary_fts = self._conn.execute(
+            """
+            SELECT 1 FROM summary_fts f
+            LEFT JOIN summary_nodes s ON s.node_id = f.rowid
+            WHERE s.node_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        return not any((event_mismatch, extra_event_fts, summary_mismatch, extra_summary_fts))
 
     def rebuild_fts(self) -> dict[str, int]:
         self._conn.execute("DELETE FROM event_fts")
@@ -334,6 +382,245 @@ class EventStore:
     def schema_version(self) -> int:
         row = self._conn.execute("SELECT max(version) AS version FROM schema_migrations").fetchone()
         return int(row["version"] or 0)
+
+    def claim_projection_jobs(
+        self,
+        *,
+        worker_id: str,
+        projection_kind: str,
+        limit: int,
+        now: str,
+        lease_until: str,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim pending or expired projection jobs."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                """
+                SELECT * FROM projection_outbox
+                WHERE projection_kind = ?
+                  AND (
+                    (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                    OR (status = 'processing' AND lease_until < ?)
+                  )
+                ORDER BY outbox_id ASC
+                LIMIT ?
+                """,
+                (projection_kind, now, now, max(1, min(int(limit), 100))),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                self._conn.execute(
+                    """
+                    UPDATE projection_outbox
+                    SET status = 'processing', lease_owner = ?, lease_until = ?,
+                        attempt_count = attempt_count + 1
+                    WHERE outbox_id = ?
+                    """,
+                    (worker_id, lease_until, row["outbox_id"]),
+                )
+                value = dict(row)
+                value.update(
+                    {
+                        "status": "processing",
+                        "lease_owner": worker_id,
+                        "lease_until": lease_until,
+                        "attempt_count": int(row["attempt_count"]) + 1,
+                    }
+                )
+                claimed.append(value)
+            self._conn.commit()
+            return claimed
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def ack_projection_job(self, outbox_id: int, *, worker_id: str, now: str) -> bool:
+        """Idempotently mark a worker-owned projection job applied."""
+        cur = self._conn.execute(
+            """
+            UPDATE projection_outbox
+            SET status = 'applied', applied_at = COALESCE(applied_at, ?),
+                lease_owner = NULL, lease_until = NULL, last_error = NULL
+            WHERE outbox_id = ?
+              AND ((status = 'processing' AND lease_owner = ?) OR status = 'applied')
+            """,
+            (now, int(outbox_id), worker_id),
+        )
+        self._conn.commit()
+        return bool(cur.rowcount)
+
+    def fail_projection_job(
+        self,
+        outbox_id: int,
+        *,
+        worker_id: str,
+        error: str,
+        now: str,
+        next_retry_at: str,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Release a failed job for retry or move it to dead-letter."""
+        row = self._conn.execute(
+            "SELECT * FROM projection_outbox WHERE outbox_id = ?",
+            (int(outbox_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"projection job not found: {outbox_id}")
+        if row["status"] != "processing" or row["lease_owner"] != worker_id:
+            raise RuntimeError("projection job is not owned by this worker")
+        status = "dead_letter" if int(row["attempt_count"]) >= max(1, int(max_attempts)) else "pending"
+        retry_at = None if status == "dead_letter" else next_retry_at
+        self._conn.execute(
+            """
+            UPDATE projection_outbox
+            SET status = ?, next_retry_at = ?, last_error = ?,
+                lease_owner = NULL, lease_until = NULL
+            WHERE outbox_id = ? AND status = 'processing' AND lease_owner = ?
+            """,
+            (status, retry_at, error, int(outbox_id), worker_id),
+        )
+        self._conn.commit()
+        updated = self._conn.execute(
+            "SELECT * FROM projection_outbox WHERE outbox_id = ?",
+            (int(outbox_id),),
+        ).fetchone()
+        return dict(updated)
+
+    def verify_event_chain(self) -> dict[str, Any]:
+        """Verify payload hashes and the linked event chain in event order."""
+        previous_chain_hash: str | None = None
+        checked = 0
+        rows = self._conn.execute(
+            """
+            SELECT e.event_id, e.session_id, e.conversation_id, e.platform,
+                   e.role, e.source, e.content, e.recorded_at,
+                   e.payload_sha256, e.previous_chain_hash, e.chain_hash,
+                   e.schema_version, e.external_event_id, e.source_revision,
+                   e.source_created_at, e.turn_id, e.parent_event_id,
+                   e.sensitivity, e.category, e.subcategory, e.visibility,
+                   r.source_hash, r.content_sha256 AS revision_content_sha256,
+                   r.payload_metadata AS revision_payload_metadata
+            FROM events e
+            LEFT JOIN event_revisions r
+              ON r.event_id = e.event_id AND r.source_revision = e.source_revision
+            ORDER BY e.event_id ASC
+            """
+        ).fetchall()
+        anchor = self._conn.execute(
+            "SELECT * FROM event_chain_state WHERE chain_name = 'events-v1'"
+        ).fetchone()
+        if not rows:
+            if anchor is None or int(anchor["event_count"]) == 0:
+                return {"ok": True, "checked": 0, "first_invalid_event_id": None, "reason": None}
+            return {"ok": False, "checked": 0, "first_invalid_event_id": None, "reason": "chain_anchor_mismatch"}
+        for row in rows:
+            event_id = int(row["event_id"])
+            checked += 1
+            if not row["payload_sha256"] or not row["chain_hash"]:
+                return {
+                    "ok": False,
+                    "checked": checked,
+                    "first_invalid_event_id": event_id,
+                    "reason": "missing_chain_envelope",
+                }
+            payload_sha256 = sha256_text(str(row["content"]))
+            if row["revision_content_sha256"] is not None and row["revision_content_sha256"] != payload_sha256:
+                return {
+                    "ok": False,
+                    "checked": checked,
+                    "first_invalid_event_id": event_id,
+                    "reason": "revision_content_hash_mismatch",
+                }
+            if row["revision_payload_metadata"] is not None:
+                try:
+                    revision_metadata = json.loads(row["revision_payload_metadata"])
+                except (TypeError, ValueError):
+                    return {
+                        "ok": False,
+                        "checked": checked,
+                        "first_invalid_event_id": event_id,
+                        "reason": "revision_metadata_invalid",
+                    }
+                revision_time = normalize_source_created_at(
+                    revision_metadata.get("timestamp") or revision_metadata.get("created_at")
+                )
+                if revision_time != normalize_source_created_at(row["source_created_at"]):
+                    return {
+                        "ok": False,
+                        "checked": checked,
+                        "first_invalid_event_id": event_id,
+                        "reason": "revision_source_time_mismatch",
+                    }
+            if payload_sha256 != row["payload_sha256"]:
+                return {
+                    "ok": False,
+                    "checked": checked,
+                    "first_invalid_event_id": event_id,
+                    "reason": "payload_sha256_mismatch",
+                }
+            if row["previous_chain_hash"] != previous_chain_hash:
+                return {
+                    "ok": False,
+                    "checked": checked,
+                    "first_invalid_event_id": event_id,
+                    "reason": "previous_chain_hash_mismatch",
+                }
+            expected = chain_hash(
+                previous_chain_hash=previous_chain_hash,
+                event_id=event_id,
+                session_id=str(row["session_id"]),
+                conversation_id=str(row["conversation_id"]),
+                platform=str(row["platform"]),
+                role=str(row["role"]),
+                source=str(row["source"]),
+                payload_sha256=payload_sha256,
+                recorded_at=str(row["recorded_at"]),
+                schema_version=int(row["schema_version"]),
+                external_event_id=row["external_event_id"],
+                source_revision=int(row["source_revision"]),
+                source_created_at=row["source_created_at"],
+                turn_id=row["turn_id"],
+                parent_event_id=row["parent_event_id"],
+                sensitivity=str(row["sensitivity"]),
+                category=str(row["category"]),
+                subcategory=str(row["subcategory"]),
+                visibility=str(row["visibility"]),
+                source_hash=row["source_hash"],
+            )
+            if expected != row["chain_hash"]:
+                return {
+                    "ok": False,
+                    "checked": checked,
+                    "first_invalid_event_id": event_id,
+                    "reason": "chain_hash_mismatch",
+                }
+            previous_chain_hash = str(row["chain_hash"])
+        if anchor is None:
+            return {
+                "ok": False,
+                "checked": checked,
+                "first_invalid_event_id": None,
+                "reason": "missing_chain_anchor",
+            }
+        if (
+            int(anchor["first_event_id"]) != int(rows[0]["event_id"])
+            or int(anchor["last_event_id"]) != int(rows[-1]["event_id"])
+            or int(anchor["event_count"]) != len(rows)
+            or str(anchor["tip_hash"]) != previous_chain_hash
+        ):
+            return {
+                "ok": False,
+                "checked": checked,
+                "first_invalid_event_id": None,
+                "reason": "chain_anchor_mismatch",
+            }
+        return {
+            "ok": True,
+            "checked": checked,
+            "first_invalid_event_id": None,
+            "reason": None,
+        }
 
     def close(self) -> None:
         self._conn.close()
@@ -407,6 +694,12 @@ class EventStore:
         inject_policy: str | None = None,
         classification_confidence: float | None = None,
         classifier_version: str | None = None,
+        external_event_id: str | None = None,
+        source_revision: int = 1,
+        source_created_at: str | None = None,
+        turn_id: str | None = None,
+        parent_event_id: int | None = None,
+        source_hash: str | None = None,
     ) -> int:
         """Insert one durable event and its FTS row without committing."""
         classification = EventClassifier().classify(
@@ -436,7 +729,90 @@ class EventStore:
             ),
         )
         event_id = int(cur.lastrowid)
+        recorded_at = str(
+            self._conn.execute(
+                "SELECT created_at FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()["created_at"]
+        )
+        payload_sha256 = sha256_text(content)
+        previous_row = self._conn.execute(
+            "SELECT chain_hash FROM events WHERE event_id < ? AND chain_hash <> '' ORDER BY event_id DESC LIMIT 1",
+            (event_id,),
+        ).fetchone()
+        previous_chain_hash = str(previous_row["chain_hash"]) if previous_row is not None else None
+        resolved_chain_hash = chain_hash(
+            previous_chain_hash=previous_chain_hash,
+            event_id=event_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            platform=platform,
+            role=role,
+            source=source,
+            payload_sha256=payload_sha256,
+            recorded_at=recorded_at,
+            schema_version=CURRENT_SCHEMA_VERSION,
+            external_event_id=external_event_id,
+            source_revision=int(source_revision),
+            source_created_at=source_created_at,
+            turn_id=turn_id,
+            parent_event_id=parent_event_id,
+            sensitivity=resolved_sensitivity,
+            category=category or classification.category,
+            subcategory=subcategory or classification.subcategory,
+            visibility=inject_policy or classification.inject_policy,
+            source_hash=source_hash,
+        )
+        self._conn.execute(
+            """
+            UPDATE events
+            SET external_event_id = ?, turn_id = ?, parent_event_id = ?,
+                source_created_at = ?, recorded_at = ?, payload_sha256 = ?,
+                previous_chain_hash = ?, chain_hash = ?, source_revision = ?,
+                visibility = ?, schema_version = ?
+            WHERE event_id = ?
+            """,
+            (
+                external_event_id,
+                turn_id,
+                parent_event_id,
+                source_created_at,
+                recorded_at,
+                payload_sha256,
+                previous_chain_hash,
+                resolved_chain_hash,
+                int(source_revision),
+                inject_policy or classification.inject_policy,
+                CURRENT_SCHEMA_VERSION,
+                event_id,
+            ),
+        )
         self._conn.execute("INSERT INTO event_fts(rowid, content) VALUES (?, ?)", (event_id, content))
+        anchor = self._conn.execute(
+            "SELECT first_event_id, event_count FROM event_chain_state WHERE chain_name = 'events-v1'"
+        ).fetchone()
+        first_event_id = event_id if anchor is None or anchor["first_event_id"] is None else int(anchor["first_event_id"])
+        event_count = 1 if anchor is None else int(anchor["event_count"]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO event_chain_state (
+                chain_name, first_event_id, last_event_id, event_count,
+                tip_hash, schema_version
+            ) VALUES ('events-v1', ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_name) DO UPDATE SET
+                last_event_id = excluded.last_event_id,
+                event_count = excluded.event_count,
+                tip_hash = excluded.tip_hash,
+                schema_version = excluded.schema_version,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            (
+                first_event_id,
+                event_id,
+                event_count,
+                resolved_chain_hash,
+                CURRENT_SCHEMA_VERSION,
+            ),
+        )
         return event_id
 
     def ingest_external_event(
@@ -465,7 +841,27 @@ class EventStore:
             if existing_row is not None:
                 self._conn.rollback()
                 return int(existing_row["event_id"]), False
-            event_id = self._insert_event_row(**event)
+            event_id = self._insert_event_row(
+                **event,
+                external_event_id=external_id,
+                source_created_at=normalize_source_created_at(
+                    (payload_metadata or {}).get("timestamp") or (payload_metadata or {}).get("created_at")
+                ),
+                source_hash=source_hash,
+            )
+            self._conn.execute(
+                """
+                INSERT INTO event_revisions (
+                    event_id, source_revision, source_hash, content_sha256, payload_metadata
+                ) VALUES (?, 1, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    source_hash,
+                    sha256_text(str(event["content"])),
+                    json.dumps(payload_metadata or {}, ensure_ascii=False),
+                ),
+            )
             self._conn.execute(
                 """
                 INSERT INTO ingest_events (external_id, source_hash, kind, event_id, attachments, payload_metadata)
@@ -477,6 +873,16 @@ class EventStore:
                     json.dumps(payload_metadata or {}, ensure_ascii=False),
                 ),
             )
+            event_row = self._conn.execute(
+                "SELECT payload_sha256, source_revision FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            enqueue_event_projections(
+                self._conn,
+                event_id=event_id,
+                aggregate_version=int(event_row["source_revision"]),
+                payload_sha256=str(event_row["payload_sha256"]),
+            )
             self._conn.commit()
             return event_id, True
         except BaseException:
@@ -484,32 +890,101 @@ class EventStore:
             raise
 
     def upsert_external_event(self, *, external_id: str, source_hash: str, kind: str, attachments: list[dict[str, Any]] | None = None, payload_metadata: dict[str, Any] | None = None, **event: Any) -> tuple[int, str]:
-        """Atomically insert or refresh an externally identified event."""
+        """Atomically append a new immutable revision for changed source data."""
         existing = self.find_ingest_event(external_id)
         if existing is None:
-            event_id, inserted = self.ingest_external_event(external_id=external_id, source_hash=source_hash, kind=kind, attachments=attachments, payload_metadata=payload_metadata, **event)
+            event_id, inserted = self.ingest_external_event(
+                external_id=external_id,
+                source_hash=source_hash,
+                kind=kind,
+                attachments=attachments,
+                payload_metadata=payload_metadata,
+                **event,
+            )
             return event_id, "inserted" if inserted else "existing"
-        event_id = int(existing["event_id"])
         if existing["source_hash"] == source_hash:
-            return event_id, "existing"
-        columns = ("session_id", "conversation_id", "platform", "role", "source", "content", "persona_mode", "route_bucket", "model_hint", "sensitivity", "category", "subcategory", "inject_policy", "classifier_version")
-        missing = [column for column in columns if column not in event]
-        if missing:
-            raise ValueError(f"missing event fields for update: {missing}")
+            return int(existing["event_id"]), "existing"
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            current = self._conn.execute("SELECT source_hash, event_id FROM ingest_events WHERE external_id = ?", (external_id,)).fetchone()
+            current = self._conn.execute(
+                "SELECT source_hash, event_id FROM ingest_events WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
             if current is None:
                 self._conn.rollback()
-                return self.upsert_external_event(external_id=external_id, source_hash=source_hash, kind=kind, attachments=attachments, payload_metadata=payload_metadata, **event)
-            event_id = int(current["event_id"])
+                return self.upsert_external_event(
+                    external_id=external_id,
+                    source_hash=source_hash,
+                    kind=kind,
+                    attachments=attachments,
+                    payload_metadata=payload_metadata,
+                    **event,
+                )
             if current["source_hash"] == source_hash:
                 self._conn.rollback()
-                return event_id, "existing"
-            assignments = ", ".join(f"{column} = ?" for column in columns)
-            self._conn.execute(f"UPDATE events SET {assignments} WHERE event_id = ?", tuple(event[column] for column in columns) + (event_id,))
-            self._conn.execute("UPDATE event_fts SET content = ? WHERE rowid = ?", (event["content"], event_id))
-            self._conn.execute("UPDATE ingest_events SET source_hash = ?, kind = ?, attachments = ?, payload_metadata = ? WHERE external_id = ?", (source_hash, kind, json.dumps(attachments or [], ensure_ascii=False), json.dumps(payload_metadata or {}, ensure_ascii=False), external_id))
+                return int(current["event_id"]), "existing"
+            previous_event_id = int(current["event_id"])
+            previous_event = self._conn.execute(
+                "SELECT source_revision FROM events WHERE event_id = ?",
+                (previous_event_id,),
+            ).fetchone()
+            source_revision = int(previous_event["source_revision"] or 1) + 1
+            event_id = self._insert_event_row(
+                **event,
+                external_event_id=external_id,
+                source_revision=source_revision,
+                source_created_at=normalize_source_created_at(
+                    (payload_metadata or {}).get("timestamp") or (payload_metadata or {}).get("created_at")
+                ),
+                source_hash=source_hash,
+            )
+            self._conn.execute(
+                """
+                INSERT INTO event_revisions (
+                    event_id, source_revision, source_hash, content_sha256, payload_metadata
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    source_revision,
+                    source_hash,
+                    sha256_text(str(event["content"])),
+                    json.dumps(payload_metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO event_governance (
+                    event_id, action, previous_state, new_state, actor, reason
+                ) VALUES (?, 'supersede', 'active', 'superseded', 'source_sync', ?)
+                """,
+                (previous_event_id, f"superseded by event {event_id}"),
+            )
+            self._conn.execute(
+                """
+                UPDATE ingest_events
+                SET source_hash = ?, kind = ?, event_id = ?, attachments = ?, payload_metadata = ?
+                WHERE external_id = ?
+                """,
+                (
+                    source_hash,
+                    kind,
+                    event_id,
+                    json.dumps(attachments or [], ensure_ascii=False),
+                    json.dumps(payload_metadata or {}, ensure_ascii=False),
+                    external_id,
+                ),
+            )
+            event_row = self._conn.execute(
+                "SELECT payload_sha256 FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            enqueue_event_projections(
+                self._conn,
+                event_id=event_id,
+                aggregate_version=source_revision,
+                payload_sha256=str(event_row["payload_sha256"]),
+            )
             self._conn.commit()
             return event_id, "updated"
         except BaseException:
@@ -559,6 +1034,16 @@ class EventStore:
                 subcategory=subcategory, inject_policy=inject_policy,
                 classification_confidence=classification_confidence,
                 classifier_version=classifier_version,
+            )
+            event_row = self._conn.execute(
+                "SELECT payload_sha256, source_revision FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            enqueue_event_projections(
+                self._conn,
+                event_id=event_id,
+                aggregate_version=int(event_row["source_revision"]),
+                payload_sha256=str(event_row["payload_sha256"]),
             )
             self._conn.commit()
             return event_id

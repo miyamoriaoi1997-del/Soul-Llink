@@ -477,11 +477,37 @@ class SoulLinkMemoryProvider(MemoryProvider):
             search_archival_memories,
             sync_memory_tool_write,
         )
+        from pcltm.runtime_paths import resolve_db_path
+        from pcltm.store import EventStore
+        from pcltm.transcript_search import search_exact_evidence
+
+        def recall_exact(*, query: str, limit: int):
+            store = EventStore(resolve_db_path())
+            try:
+                return [
+                    {
+                        "evidence_level": item.evidence_level,
+                        "event_id": item.event_id,
+                        "chunk_id": item.chunk_id,
+                        "quote": item.quote,
+                        "start_char": item.start_char,
+                        "end_char": item.end_char,
+                        "source_created_at": item.source_created_at,
+                        "payload_sha256": item.payload_sha256,
+                        "verified": item.verified,
+                        "source_type": item.source_type,
+                        "integrity_scope": item.integrity_scope,
+                    }
+                    for item in search_exact_evidence(store, query, limit=limit)
+                ]
+            finally:
+                store.close()
 
         return PCLTMMemoryTools(
             search=lambda **kwargs: search_archival_memories(**kwargs),
             open_memory=lambda **kwargs: open_archival_memory(**kwargs),
             remember=lambda **kwargs: sync_memory_tool_write(**kwargs),
+            recall_exact=recall_exact,
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

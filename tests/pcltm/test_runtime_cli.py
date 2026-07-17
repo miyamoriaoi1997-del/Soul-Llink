@@ -98,7 +98,7 @@ def test_live_context_smoke_reports_runtime_paths(monkeypatch, tmp_path) -> None
     report = live_context_smoke()
 
     assert report["db_path"] == str(db)
-    assert report["schema_version"] == 8
+    assert report["schema_version"] == 9
     assert report["memfs_root"] == str(memfs)
 
 
