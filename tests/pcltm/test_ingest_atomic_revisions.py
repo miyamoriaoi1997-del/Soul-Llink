@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import pcltm.projections.runtime as projection_runtime
 from pcltm.ingest import PCLTMIngestAdapter
 from pcltm.store import EventStore
 
@@ -58,3 +61,45 @@ def test_ingest_adapter_keeps_noise_as_retrieve_only_permanent_evidence(tmp_path
     assert event["inject_policy"] == "retrieve_only"
     assert event["visibility"] == "retrieve_only"
     assert short_term == []
+
+
+def test_ingest_adapter_converges_transcript_projections_before_return(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    adapter = PCLTMIngestAdapter(store)
+    try:
+        result = adapter.ingest(_payload("public projection convergence"))
+        chunks = store._conn.execute(
+            "SELECT chunk_text FROM event_chunks WHERE event_id=?", (result["event_id"],)
+        ).fetchall()
+        statuses = store._conn.execute(
+            "SELECT projection_kind, status FROM projection_outbox WHERE event_seq=? ORDER BY projection_kind",
+            (result["event_id"],),
+        ).fetchall()
+    finally:
+        store.close()
+
+    assert [row["chunk_text"] for row in chunks] == ["public projection convergence"]
+    assert [(row["projection_kind"], row["status"]) for row in statuses] == [
+        ("transcript_chunks", "applied"),
+        ("transcript_fts", "applied"),
+    ]
+
+
+def test_duplicate_ingest_fails_while_fts_projection_waits_for_retry(tmp_path: Path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    adapter = PCLTMIngestAdapter(store)
+    real_apply = projection_runtime._apply_fts_job
+
+    def fail_fts(*args, **kwargs):
+        raise RuntimeError("forced FTS failure")
+
+    try:
+        monkeypatch.setattr(projection_runtime, "_apply_fts_job", fail_fts)
+        with pytest.raises(RuntimeError, match="forced FTS failure"):
+            adapter.ingest(_payload("public FTS retry"))
+        monkeypatch.setattr(projection_runtime, "_apply_fts_job", real_apply)
+
+        with pytest.raises(RuntimeError, match="projections are not converged"):
+            adapter.ingest(_payload("public FTS retry"))
+    finally:
+        store.close()

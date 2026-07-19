@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from pcltm.store import EventStore
 
 
@@ -381,6 +383,37 @@ def test_bootstrap_repairs_same_count_fts_content_drift(tmp_path: Path) -> None:
 
     assert [row["event_id"] for row in authoritative] == [event_id]
     assert drift == []
+
+
+def test_failed_bootstrap_with_fts_drift_does_not_commit_rebuild(tmp_path: Path, monkeypatch) -> None:
+    import pcltm.store as store_module
+
+    db = tmp_path / "pcltm.db"
+    store = EventStore(db)
+    event_id = store.append_event(
+        session_id="s", conversation_id="c", platform="desktop",
+        role="user", source="test", content="authoritative source content",
+        category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+    )
+    store._conn.execute("UPDATE event_fts SET content='stale index content' WHERE rowid=?", (event_id,))
+    store._conn.commit()
+    store.close()
+
+    real_ensure = store_module.EventStore._ensure_fts_populated
+
+    def fail_after_fts_rebuild(self) -> None:
+        real_ensure(self)
+        raise RuntimeError("forced failure after FTS rebuild")
+
+    monkeypatch.setattr(store_module.EventStore, "_ensure_fts_populated", fail_after_fts_rebuild)
+    with pytest.raises(RuntimeError, match="forced failure after FTS rebuild"):
+        EventStore(db)
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        indexed = conn.execute("SELECT content FROM event_fts WHERE rowid=?", (event_id,)).fetchone()["content"]
+
+    assert indexed == "stale index content"
 
 
 def test_schema_migration_is_idempotent_for_v9_database(tmp_path: Path) -> None:

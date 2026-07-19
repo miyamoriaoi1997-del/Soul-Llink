@@ -71,6 +71,7 @@ packages = [
     "pcltm.monitoring.static",
     "pcltm.persona",
     "pcltm.procedural",
+    "pcltm.projections",
     "pcltm.session",
     "pcltm.state",
     "persona_engine",
@@ -95,6 +96,7 @@ pcltm = "packages/pcltm"
 "pcltm.monitoring.static" = "packages/pcltm/monitoring/static"
 "pcltm.persona" = "packages/pcltm/persona"
 "pcltm.procedural" = "packages/pcltm/procedural"
+"pcltm.projections" = "packages/pcltm/projections"
 "pcltm.session" = "packages/pcltm/session"
 "pcltm.state" = "packages/pcltm/state"
 persona_engine = "packages/persona_engine"

@@ -961,7 +961,6 @@ class PCLTMContextCompressionEngine(ContextEngine):
             latest_text = _content_text(messages[latest_user_idx].get("content")) if latest_user_idx < len(messages) else ""
             rendered = "\n".join([
                 "<pcltm_context>",
-                "【mode】work",
                 f"【latest_real_user_message】{latest_text}",
                 f"【current_user_request】{latest_text}",
                 "</pcltm_context>",
@@ -971,7 +970,6 @@ class PCLTMContextCompressionEngine(ContextEngine):
         request_text = context.current_user_request or context.latest_real_user_message
         rendered = "\n".join([
             "<pcltm_context>",
-            "【mode】work",
             f"【latest_real_user_message】{context.latest_real_user_message}",
             f"【current_user_request】{request_text}",
             "【runtime_context_status】",

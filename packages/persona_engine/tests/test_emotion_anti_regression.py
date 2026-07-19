@@ -32,8 +32,8 @@ def test_emotion_intensity_guidance_is_length_independent_even_when_overwhelming
     )
     block = EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
-    assert "已经失控" in block
-    assert "只抓最核心的一种反应" in block
+    assert "【表达】可见度=" in block
+    assert "【情绪】" in block
     assert "必须长篇" not in block
     assert "尽量多写" not in block
 

@@ -10,7 +10,11 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+try:
+    from agent.memory_provider import MemoryProvider
+except ModuleNotFoundError:  # Host API absent in standalone/import-contract checks.
+    class MemoryProvider:  # type: ignore[no-redef]
+        pass
 
 
 def _soullink_root() -> Path:
@@ -43,6 +47,24 @@ def _ensure_paths() -> Path:
 def _hermes_home() -> Path:
     raw = os.environ.get("HERMES_HOME")
     return Path(raw).expanduser() if raw else Path.home() / ".hermes"
+
+
+def _state_machine_runtime_config() -> Dict[str, bool]:
+    """Read strict host gates; missing, malformed, and truthy values fail closed."""
+    try:
+        import yaml
+
+        config = yaml.safe_load((_hermes_home() / "config.yaml").read_text(encoding="utf-8-sig"))
+        entries = config.get("plugins", {}).get("entries", {}) if isinstance(config, dict) else {}
+        settings = entries.get("soullink", {}).get("state_machine", {}) if isinstance(entries, dict) else {}
+    except Exception:
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    return {
+        "transition_table_shadow": settings.get("transition_table_shadow") is True,
+        "bounded_activation": settings.get("bounded_activation") is True,
+    }
 
 
 def _template_path(layer: str) -> Path:
@@ -215,11 +237,24 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 from persona_engine.persona_orchestrator.state_orchestrator import StateOrchestrator
 
                 factory = StateOrchestrator
+            runtime_config = _state_machine_runtime_config()
             self._state_orchestrator = factory(
                 _soullink_root() / "packages" / "persona_engine",
                 log_path=_hermes_home() / "logs" / "persona-orchestrator.jsonl",
                 core_source="host_core",
             )
+            transitions = getattr(self._state_orchestrator, "transitions", None)
+            if transitions is not None:
+                transitions.enable_shadow = runtime_config["transition_table_shadow"]
+                transitions.enable_bounded_activation = runtime_config["bounded_activation"]
+                if transitions.enable_bounded_activation:
+                    transitions.enable_shadow = True
+                if transitions.enable_shadow and getattr(transitions, "shadow_table", None) is None:
+                    from persona_engine.persona_orchestrator.transition_policy import build_legacy_transition_table
+                    from persona_engine.persona_orchestrator.transition_shadow import TransitionShadowComparator
+
+                    transitions.shadow_table = build_legacy_transition_table()
+                    transitions.shadow_comparator = TransitionShadowComparator(enable_logging=True)
         return self._state_orchestrator
 
     def _read_soul_mode_layer(self, mode: str) -> str:

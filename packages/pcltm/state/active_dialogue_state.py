@@ -172,7 +172,6 @@ class ActiveDialogueState:
             lines.append("  pending_questions: " + sealed_list('pending_questions', self.pending_questions))
         if self.local_constraints:
             lines.append("  local_constraints: " + sealed_list('local_constraints', self.local_constraints))
-        lines.append(f"  response_mode: {self.response_mode}")
         if self.continuation_hint:
             lines.append(f"  continuation_hint: {sealed_value('continuation_hint', self.continuation_hint)}")
         return "\n".join(lines)

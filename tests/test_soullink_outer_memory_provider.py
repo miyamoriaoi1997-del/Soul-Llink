@@ -3,10 +3,12 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
+
+import pytest
 
 
-def _load_provider_class():
+def _load_outer_provider_module():
     try:
         import agent.memory_provider  # type: ignore[import-not-found]  # noqa: F401
     except ModuleNotFoundError:
@@ -26,15 +28,158 @@ def _load_provider_class():
         sys.modules["agent"] = agent_module
         sys.modules["agent.memory_provider"] = memory_provider_module
         sys.modules["agent.skill_commands"] = skill_commands_module
-    plugin_path = (
-        Path(__file__).resolve().parents[1]
-        / "adapters/hermes/memory_provider/__init__.py"
-    )
+    plugin_path = Path(__file__).resolve().parents[1] / "adapters/hermes/memory_provider/__init__.py"
     spec = importlib.util.spec_from_file_location("soullink_outer_plugin_under_test", plugin_path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
-    return module.SoulLinkMemoryProvider
+    return module
+
+
+def _load_provider_class():
+    return _load_outer_provider_module().SoulLinkMemoryProvider
+
+
+def _load_actual_provider_module():
+    module_path = Path(__file__).resolve().parents[1] / "soul_link/hermes_plugin/memory_provider.py"
+    spec = importlib.util.spec_from_file_location("soullink_actual_plugin_under_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected"),
+    [
+        (
+            """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        transition_table_shadow: true
+        bounded_activation: true
+""",
+            {"transition_table_shadow": True, "bounded_activation": True},
+        ),
+        ("", {"transition_table_shadow": False, "bounded_activation": False}),
+        (
+            """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        transition_table_shadow: 'true'
+        bounded_activation: 1
+""",
+            {"transition_table_shadow": False, "bounded_activation": False},
+        ),
+    ],
+)
+def test_outer_adapter_state_machine_runtime_config_requires_explicit_boolean_host_flags(tmp_path, monkeypatch, config_text, expected):
+    module = _load_outer_provider_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if config_text:
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    assert module._state_machine_runtime_config() == expected
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected"),
+    [
+        (
+            """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        transition_table_shadow: true
+        bounded_activation: true
+""",
+            {"transition_table_shadow": True, "bounded_activation": True},
+        ),
+        ("", {"transition_table_shadow": False, "bounded_activation": False}),
+        (
+            """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        transition_table_shadow: 'true'
+        bounded_activation: 1
+""",
+            {"transition_table_shadow": False, "bounded_activation": False},
+        ),
+    ],
+)
+def test_actual_provider_state_machine_runtime_config_requires_explicit_boolean_host_flags(tmp_path, monkeypatch, config_text, expected):
+    module = _load_actual_provider_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if config_text:
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    assert module._state_machine_runtime_config() == expected
+
+
+def test_outer_provider_applies_host_state_machine_flags_after_construction(tmp_path, monkeypatch):
+    provider = _load_provider_class()()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        bounded_activation: true
+""",
+        encoding="utf-8",
+    )
+    transitions = SimpleNamespace(
+        enable_shadow=False,
+        enable_bounded_activation=False,
+        shadow_table=None,
+        shadow_comparator=None,
+    )
+    orchestrator = SimpleNamespace(transitions=transitions)
+    provider._state_orchestrator_factory = lambda *args, **kwargs: orchestrator
+
+    assert provider._get_state_orchestrator() is orchestrator
+    assert transitions.enable_bounded_activation is True
+    assert transitions.enable_shadow is True
+    assert transitions.shadow_table is not None
+    assert transitions.shadow_comparator is not None
+
+
+def test_actual_provider_applies_bounded_host_flag_to_shadow_and_comparator(tmp_path, monkeypatch):
+    module = _load_actual_provider_module()
+    provider = module.SoulLinkMemoryProvider()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+plugins:
+  entries:
+    soullink:
+      state_machine:
+        bounded_activation: true
+""",
+        encoding="utf-8",
+    )
+    transitions = SimpleNamespace(
+        enable_shadow=False,
+        enable_bounded_activation=False,
+        shadow_table=None,
+        shadow_comparator=None,
+    )
+    orchestrator = SimpleNamespace(transitions=transitions)
+    provider._state_orchestrator_factory = lambda *args, **kwargs: orchestrator
+
+    assert provider._get_state_orchestrator() is orchestrator
+    assert transitions.enable_bounded_activation is True
+    assert transitions.enable_shadow is True
+    assert transitions.shadow_table is not None
+    assert transitions.shadow_comparator is not None
 
 
 def test_outer_prefetch_mode_hint_separates_work_and_relationship_queries():

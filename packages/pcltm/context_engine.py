@@ -133,7 +133,6 @@ class PCLTMContext:
                 "answer only the separate live user message, using this frame for bindings, memory, "
                 "and safety constraints."
             ),
-            f"【mode】{self.mode}",
             "【latest_real_user_message】<bound_to_latest_chat_user_message>",
         ]
         current_request_line = (

@@ -644,112 +644,85 @@ class EmotionStateManager:
         return body
     
     def get_tone_modifiers(self) -> str:
-        """Get tone modification prompt based on current emotion state.
-        
-        Returns a single string that modifies response tone. The intensity
-        of the modification scales dynamically with emotion deviation from
-        baseline — mild deviations produce subtle hints, extreme deviations
-        produce overwhelming emotion-driven directives that can override
-        normal persona restraint.
-        
-        Returns:
-            Tone modifier string to inject after SOUL.md, or empty string if no adjustment needed
+        """Return a bounded, state-derived emotion directive for one turn.
+
+        The calculator remains the source of tiers and policy.  This renderer
+        deliberately carries only the dynamic state needed by the prompt rather
+        than repeating calculator frameworks or four long dimension narratives.
         """
         current_state = self.get_current_emotion_state()
         mood_entry = self._get_today_mood_entry()
         mood_bias = mood_entry.bias if mood_entry.active else None
-        modifier_result = self.calculator.get_tone_modifiers(current_state, mood_bias=mood_bias)
-        
-        dimensions = modifier_result.get("dimensions", {})
+        result = self.calculator.get_tone_modifiers(current_state, mood_bias=mood_bias)
+        dimensions = result.get("dimensions", {})
         if not dimensions and not mood_entry.active:
-            return ""
-        
-        overall_intensity = modifier_result["overall_intensity"]
-        overall_direction = modifier_result.get("overall_direction", "positive")
-        framework = modifier_result["framework"]
-        footnote = modifier_result["footnote"]
+            return (
+                "<emotion_modifier>\n"
+                "【锚点】身份/事实/工具纪律不变；不覆盖work或crisis边界。\n"
+                "</emotion_modifier>"
+            )
 
-        # Desire control — placed FIRST for maximum attention weight
-        desire = modifier_result.get("desire", "")
-        emotion_blend = modifier_result.get("emotion_blend", {})
-        emotion_appraisal = modifier_result.get("emotion_appraisal", {})
-        emotion_momentum = modifier_result.get("emotion_momentum", {})
-        regulation_strategy = modifier_result.get("regulation_strategy", "")
-        emotion_aftereffect = modifier_result.get("emotion_aftereffect", {})
-        expression_guidance = modifier_result.get("expression_guidance", "")
+        desire = result.get("desire", "")
+        desire_tier = desire.split("。", 1)[0].replace("【欲望】", "")
+        blend = result.get("emotion_blend", {})
+        appraisal = result.get("emotion_appraisal", {})
+        momentum = result.get("emotion_momentum", {})
+        aftereffect = result.get("emotion_aftereffect", {})
+        primary = blend.get("primary", "")
+        secondary = blend.get("secondary", "")
+        trigger = appraisal.get("trigger", "")
+        trend = momentum.get("trend", "")
+        residue = aftereffect.get("phase", "")
 
-        # ── Compact emotion context block ──
-        context_parts = []
-        if emotion_blend:
-            primary = emotion_blend.get('primary', '')
-            secondary = emotion_blend.get('secondary', '')
-            context_parts.append(f"【情绪】核心={primary}；副={secondary}")
-        if emotion_appraisal:
-            trigger = emotion_appraisal.get('trigger', '')
-            appraisal = emotion_appraisal.get('appraisal', '')
-            response_bias = emotion_appraisal.get('response_bias', '')
-            context_parts.append(f"触发={trigger}→{appraisal}")
-            if response_bias:
-                context_parts.append(f"反应倾向：{response_bias}")
-        if emotion_momentum:
-            trend = emotion_momentum.get('trend', '')
-            guidance = emotion_momentum.get('guidance', '')
-            context_parts.append(f"惯性={trend}；{guidance}")
-        if emotion_aftereffect:
-            phase = emotion_aftereffect.get('phase', '')
-            af_guidance = emotion_aftereffect.get('guidance', '')
-            context_parts.append(f"余温={phase}；{af_guidance}")
-        if regulation_strategy:
-            context_parts.append(f"调节={regulation_strategy}")
+        # Continuous values prevent tier boundaries from flattening expression.
+        deviations = [
+            abs(float(current_state.get(dim, self.calculator.baselines[dim])) - self.calculator.baselines[dim])
+            for dim in self.calculator.SCORE_WEIGHTS
+        ]
+        visibility = min(0.95, 0.15 + sum(deviations) / (len(deviations) * 75.0))
+        self_control = max(0.05, 1.0 - visibility)
 
-        context_text = "\n".join(line for line in context_parts if line.strip())
+        # Relationship progression is conservative: a relationship trigger,
+        # non-restrained desire, and at least one relationship axis must agree.
+        refined_trigger = current_state.get("last_trigger_type", "")
+        relationship_trigger = refined_trigger in {
+            "recognition", "needed", "relationship_recovery", "intimacy_push",
+        }
+        relationship_axes = (
+            float(current_state.get("affection", 60)) > self.calculator.baselines["affection"]
+            or float(current_state.get("trust", 60)) > self.calculator.baselines["trust"]
+            or float(current_state.get("possessiveness", 60)) > self.calculator.baselines["possessiveness"]
+        )
+        relationship_gate = (
+            relationship_trigger
+            and desire_tier in {"ambivalent", "uninhibited"}
+            and relationship_axes
+        )
 
-        # ── Compact dimension block: dominant + labels ──
-        dim_labels = []
-        dominant_parts = []
-        for dim, info in dimensions.items():
-            if info.get("direction") != overall_direction:
-                continue
-            tier = info.get("tier", "mild")
-            direction_sign = "+" if info.get("direction") == "positive" else "-"
-            dim_labels.append(f"{dim}={tier}{direction_sign}")
-            # Collect dominant dimensions (intense or overwhelming) for description
-            if tier in ("intense", "overwhelming"):
-                dominant_parts.append(info.get("instruction", ""))
+        parts = [desire]
+        if primary or secondary:
+            parts.append(f"【情绪】{primary}/{secondary}")
+        if trigger:
+            parts.append(f"【触发】{trigger}")
+        parts.append(f"【表达】可见度={visibility:.2f}；自控={self_control:.2f}")
+        pressure = {
+            "mild": "轻微可见，保留克制。",
+            "moderate": "清楚可见，不必展开。",
+            "intense": "明显外显，减少自我压低。",
+            "overwhelming": "强反应聚焦；不可压成中性。",
+        }.get(result.get("overall_intensity"), "轻微可见，保留克制。")
+        parts.append(f"【压力】{pressure}")
+        if trend and trend != "稳定延续":
+            parts.append(f"【惯性】{trend}")
+        if residue and residue != "稳定":
+            parts.append(f"【余温】{residue}")
+        parts.append(f"【关系】{'允许推进' if relationship_gate else '保持当前距离'}")
+        if mood_entry.active:
+            parts.append(self._format_mood_modifier(mood_entry))
+        parts.append("【锚点】身份/事实/工具纪律不变；不覆盖work或crisis边界。")
 
-        dim_label_text = ", ".join(dim_labels)
-        # Build dominant description: combine top 1-2 dimension instructions
-        if dominant_parts:
-            dominant_text = "；".join(dominant_parts[:2])
-        else:
-            dominant_text = ""
-
-        # ── Mood modifier ──
-        mood_text = self._format_mood_modifier(mood_entry)
-
-        # ── Final assembly: compact structure ──
-        parts = []
-        if desire:
-            parts.append(desire)
-        parts.append(f"\n{framework}")
-        parts.append(f"【表达】{expression_guidance}")
-        if context_text:
-            parts.append(f"\n{context_text}")
-        if dim_label_text:
-            parts.append(f"\n【维度】{dim_label_text}")
-        if dominant_text:
-            parts.append(f"【主导】{dominant_text}")
-        if mood_text:
-            parts.append(f"\n{mood_text}")
-        parts.append(f"\n{footnote}")
-
-        modifier_body = "\n".join(parts)
-        
-        return f"""
-<emotion_modifier>
-{modifier_body}
-</emotion_modifier>
-"""
+        modifier_body = "\n".join(part for part in parts if part)
+        return f"<emotion_modifier>\n{modifier_body}\n</emotion_modifier>"
 
     def _get_today_mood_entry(self) -> MoodEntry:
         """Return today's deterministic mood entry for effective/shadow use."""

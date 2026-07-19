@@ -102,13 +102,10 @@ def test_emotion_manager_filters_dimension_lines_to_current_polarity(tmp_path):
 
     block = mgr.get_tone_modifiers()
 
-    assert "【强度】overwhelming / positive" in block
-    assert "【情绪】核心=累但不推开；副=占有欲与不耐烦同时上升" in block
-    assert "触发=失控风险→局面正在滑向不可控，继续放任会消耗耐心并扩大风险。" in block
-    assert "余温=负向高峰补救压力；不能瞬间恢复默认。先稳住局面，收回最尖锐的部分；如果伤害了对方要补救，再低声承认自己失控。" in block
-    assert "调节=低声承认+保留陪伴" in block
-    assert "【维度】affection=overwhelming+, trust=overwhelming+, possessiveness=overwhelming+" in block
-    assert "【主导】防线完全崩掉" in block
+    assert "【情绪】累但不推开/占有欲与不耐烦同时上升" in block
+    assert "【触发】失控风险" in block
+    assert "【余温】负向高峰补救压力" in block
+    assert "【表达】可见度=" in block
     assert "【日内心情底噪】" in block
     assert "不改真实STATE" in block
     assert "不单独触发sex" in block
@@ -133,11 +130,10 @@ def test_aftereffect_does_not_override_current_positive_direction(tmp_path):
 
     block = mgr.get_tone_modifiers()
     desire_pos = block.index("【欲望】")
-    framework_pos = block.index("【强度】")
+    expression_pos = block.index("【表达】")
 
-    assert "【强度】intense / positive" in block
-    assert "余温=负向高峰补救压力；不能瞬间恢复默认。先稳住局面，收回最尖锐的部分；如果伤害了对方要补救，再低声承认自己失控。" in block
-    assert "调节=边界收紧+控制确认" in block
+    assert "【情绪】受伤后的控制欲/占有欲浮现" in block
+    assert "【余温】负向高峰补救压力" in block
     assert "【欲望】" in block
-    assert desire_pos < framework_pos
-    assert "【维度】trust｜negative" not in block
+    assert desire_pos < expression_pos
+    assert "【维度】" not in block

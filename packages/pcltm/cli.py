@@ -291,7 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     webui_parser.add_argument("--persona-log", default=None)
     webui_parser.add_argument("--router-log", default=None)
     webui_parser.add_argument("--state-path", default=None, help="SoulLink STATE.md path")
-    webui_parser.add_argument("--mode", default="work", help="Mode used for the sidecar injection preview")
+    webui_parser.add_argument("--mode", default=None, help="Optional retrieval scope for the sidecar preview; not a state-machine output")
     webui_parser.add_argument("--memory-body-limit", type=int, default=100)
     return parser
 

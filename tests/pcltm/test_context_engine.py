@@ -21,6 +21,17 @@ def test_top_level_exports_use_unified_pcltm_context_name():
     assert pcltm.PCLTMContextPacket is PCLTMContext
 
 
+def test_continuity_context_does_not_publish_a_persona_mode():
+    context = PCLTMContextEngine(mode="work").build_shadow_context(
+        [{"role": "user", "content": "continue the current task"}]
+    )
+
+    rendered = context.render()
+
+    assert "【mode】" not in rendered
+    assert "response_mode:" not in rendered
+
+
 def test_sanitize_tool_chain_drops_orphan_tool_after_final_assistant():
     messages = [
         {"role": "user", "content": "看看盘面"},

@@ -55,3 +55,14 @@ def test_update_from_response_writes_exact_host_context_usage(tmp_path) -> None:
     assert payload["budget_tokens"] == 256_000
     assert payload["cache_read_tokens"] == 48_000
     assert payload["observed_at"]
+
+
+def test_active_continuity_frame_does_not_claim_a_state_machine_mode() -> None:
+    module = _load_engine_module()
+    engine = module.PCLTMContextCompressionEngine(model="test-model")
+    messages = [{"role": "user", "content": "continue"}]
+
+    frame = engine._active_frame_message(messages, 0)
+
+    assert frame is not None
+    assert "【mode】" not in frame["content"]

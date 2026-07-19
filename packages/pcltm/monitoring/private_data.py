@@ -151,10 +151,9 @@ def collect_injection_preview(
         used[target] += separator + len(content)
     lines = [
         "<pcltm_context>",
-        f"【mode】{mode or 'default'}",
-        f"【state_machine_mode】{mode or 'default'}",
-        f"【pcltm_mode】{mode or 'default'}",
-        f"【mode_sync】{'consistent' if mode in {'daily', 'work', 'sex'} else 'fallback_hint'}",
+        "【provenance】sidecar_reconstruction_preview",
+        "【is_state_machine_output】false",
+        f"【retrieval_scope】{mode or 'unscoped'}",
         f"【query】{query or ''}",
     ]
     for target in ("USER.md", "MEMORY.md"):
@@ -165,10 +164,8 @@ def collect_injection_preview(
     return {
         "source": "sidecar_reconstruction_preview",
         "is_exact_host_capture": False,
-        "mode": mode or "default",
-        "state_machine_mode": mode or "default",
-        "pcltm_mode": mode or "default",
-        "mode_sync": "consistent" if mode in {"daily", "work", "sex"} else "fallback_hint",
+        "is_state_machine_output": False,
+        "retrieval_scope": mode or "unscoped",
         "query": query or "",
         "rendered": rendered,
         "rendered_chars": len(rendered),

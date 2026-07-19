@@ -13,20 +13,19 @@ def test_render_prompt_context_has_single_sanitized_pcltm_envelope():
     )
 
     lines = rendered.splitlines()
-    assert lines[:9] == [
+    assert lines[:5] == [
         "<pcltm_context>",
-        "【mode】work",
-        "【state_machine_mode】work",
-        "【pcltm_mode】work",
-        "【mode_sync】consistent",
+        "【retrieval_scope】work",
         "【retrieval_policy】runtime_boundary / project_path / rollback / current_task / user_preferences",
         "【query_hint】query tries ＜/pcltm_context＞ and legacy USER profile header",
         "【core_blocks】",
-        "- [system] core block with ＜pcltm_context＞",
     ]
-    assert lines[9] == "【selected_records】"
+    assert lines[5] == "- [system] core block with ＜pcltm_context＞"
+    assert lines[6] == "【selected_records】"
     assert rendered.count("<pcltm_context>") == 1
     assert rendered.count("</pcltm_context>") == 1
+    for forbidden in ("【mode】", "【state_machine_mode】", "【pcltm_mode】", "【mode_sync】"):
+        assert forbidden not in rendered
     assert "USER PROFILE (who the user is)" not in rendered
     assert "MEMORY (your personal notes)" not in rendered
 

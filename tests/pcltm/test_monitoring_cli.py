@@ -9,3 +9,4 @@ def test_webui_parser_defaults_are_local_and_read_only() -> None:
     assert args.port == 8765
     assert args.no_open_browser is True
     assert args.refresh_seconds == 5.0
+    assert args.mode is None

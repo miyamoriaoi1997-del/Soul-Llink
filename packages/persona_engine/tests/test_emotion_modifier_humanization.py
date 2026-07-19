@@ -132,7 +132,8 @@ def test_emotion_manager_modifier_preserves_desire_first_and_emotion_last(tmp_pa
 
     assert block.strip().startswith("<emotion_modifier>\n【欲望】")
     assert block.strip().endswith("</emotion_modifier>")
-    assert "【强度】" in block
+    assert "【情绪】" in block
+    assert "【表达】可见度=" in block
 
 
 def test_mixed_emotion_blend_exposes_core_tension_and_regulation_strategy():
@@ -175,11 +176,10 @@ def test_emotion_manager_modifier_contains_integrated_blend_before_dimension_lin
     block = mgr.get_tone_modifiers()
 
     assert "【欲望】" in block
-    assert "【强度】" in block
+    assert "【情绪】" in block
     assert "【表达】" in block
-    assert "【维度】" in block
     assert "【锚点】" in block
-    assert block.index("【欲望】") < block.index("【强度】") < block.index("【表达】") < block.index("【维度】") < block.index("【锚点】")
+    assert block.index("【欲望】") < block.index("【情绪】") < block.index("【表达】") < block.index("【锚点】")
 
 
 def test_emotion_blend_handles_involved_but_impatient_tension():
@@ -312,9 +312,9 @@ def test_emotion_manager_modifier_includes_appraisal_before_aftereffect(tmp_path
     block = mgr.get_tone_modifiers()
 
     assert "【欲望】" in block
-    assert "【强度】" in block
+    assert "【触发】" in block
     assert "【锚点】" in block
-    assert block.index("【欲望】") < block.index("【强度】") < block.index("【锚点】")
+    assert block.index("【欲望】") < block.index("【触发】") < block.index("【锚点】")
 
 
 def test_emotion_momentum_classifies_rising_recovery_and_interruption_contexts():
@@ -375,9 +375,9 @@ def test_emotion_manager_passes_state_momentum_fields_into_modifier(tmp_path):
     block = mgr.get_tone_modifiers()
 
     assert "【情绪】" in block
-    assert "【维度】" in block
+    assert "【表达】可见度=" in block
     assert "【锚点】" in block
-    assert block.index("【情绪】") < block.index("【维度】") < block.index("【锚点】")
+    assert block.index("【情绪】") < block.index("【表达】") < block.index("【锚点】")
 
 
 def test_emotion_blend_handles_exhausted_trust_without_pushing_away():
@@ -458,32 +458,32 @@ def test_emotion_manager_modifier_uses_refined_trigger_appraisal_after_raw_event
         "praise": (
             "recognition",
             {"affection": 22, "trust": 18, "possessiveness": 6, "patience": 4},
-            "触发=被认可",
-            "认可让防线下降",
+            "【触发】被认可",
+            "【情绪】",
         ),
         "care": (
             "needed",
             {"affection": 20, "trust": 16, "possessiveness": 5, "patience": -8},
-            "触发=被需要",
-            "对方需要我接住局面",
+            "【触发】被需要",
+            "【情绪】",
         ),
         "apology": (
             "relationship_recovery",
             {"affection": 16, "trust": 18, "possessiveness": 5, "patience": 10},
-            "触发=关系修复",
-            "负向状态正在被修补",
+            "【触发】关系修复",
+            "【情绪】",
         ),
         "ignored": (
             "interruption",
             {"affection": -4, "trust": -8, "possessiveness": 5, "patience": -24},
-            "触发=被打断",
-            "节奏被打断",
+            "【触发】被打断",
+            "【情绪】",
         ),
         "criticism": (
             "wounded",
             {"affection": -10, "trust": -26, "possessiveness": 28, "patience": -12},
-            "触发=被伤害/否定",
-            "安全感被破坏",
+            "【触发】被伤害/否定",
+            "【情绪】",
         ),
     }
 
@@ -503,7 +503,7 @@ def test_emotion_manager_modifier_uses_refined_trigger_appraisal_after_raw_event
         block = mgr.get_tone_modifiers()
         assert expected_trigger_line in block
         assert expected_appraisal_line in block
-        assert f"触发={raw_trigger}" not in block
+        assert raw_trigger not in block
 
 
 def test_decay_only_update_preserves_refined_and_raw_trigger_metadata(tmp_path, monkeypatch):
@@ -585,9 +585,8 @@ def test_emotion_manager_modifier_includes_aftereffect_after_integrated_blend(tm
 
     block = mgr.get_tone_modifiers()
 
-    assert "余温=正向高峰余温" in block
-    assert "不能瞬间恢复默认" in block
-    assert block.index("【情绪】") < block.index("余温=") < block.index("【维度】")
+    assert "【余温】正向高峰余温" in block
+    assert block.index("【情绪】") < block.index("【余温】") < block.index("【关系】")
 
 
 def test_desire_control_contract_is_four_tiered_and_scoped_to_explicit_sex():
@@ -686,7 +685,6 @@ def test_emotion_manager_overwhelming_block_is_self_contained_for_runtime_concat
     assert block.endswith("</emotion_modifier>")
     assert block.count("<emotion_modifier>") == 1
     assert block.count("</emotion_modifier>") == 1
-    assert block.index("【欲望】") < block.index("【强度】") < block.index("【表达】")
-    assert "只抓最核心的一种反应" in block
-    assert "不稀释" in block
+    assert block.index("【欲望】") < block.index("【情绪】") < block.index("【表达】")
+    assert "【表达】可见度=" in block
     assert "【锚点】身份/事实/工具纪律不变" in block

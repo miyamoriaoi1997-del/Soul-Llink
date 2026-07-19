@@ -25,3 +25,4 @@ def test_private_monitor_static_assets_expose_live_capture_and_soul_views() -> N
     assert "exact_host_context_usage" in js
     assert "PCLTM Mode" in js
     assert "Mode Sync" in js
+    assert "Retrieval scope" in js

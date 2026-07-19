@@ -88,9 +88,10 @@ def test_load_prompt_context_is_governed_but_keeps_single_pcltm_envelope(governe
     assert rendered.endswith("</pcltm_context>")
     assert rendered.count("<pcltm_context>") == 1
     assert rendered.count("</pcltm_context>") == 1
-    assert "【state_machine_mode】work" in rendered
-    assert "【pcltm_mode】work" in rendered
-    assert "【mode_sync】consistent" in rendered
+    assert "【retrieval_scope】work" in rendered
+    assert "【state_machine_mode】" not in rendered
+    assert "【pcltm_mode】" not in rendered
+    assert "【mode_sync】" not in rendered
     assert "【governed_memory_view】" in rendered
     assert "【recall_intent】" in rendered
     assert "context_diagnostics" in rendered

@@ -134,8 +134,10 @@ def index_doctor(
             store = EventStore(db)
             try:
                 rebuild_report = store.rebuild_fts()
+                store._conn.commit()
             finally:
                 store.close()
+
             issues = [issue for issue in issues if not str(issue.get("code", "")).endswith("_fts_mismatch")]
     missing_layers = [layer for layer in MEMFS_LAYERS if not (memfs / layer).is_dir()]
     if missing_layers:

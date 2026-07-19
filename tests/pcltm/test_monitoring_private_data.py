@@ -42,9 +42,12 @@ def test_injection_preview_is_labeled_and_does_not_update_retrieval_stats(tmp_pa
     after = db.read_bytes()
     assert report["source"] == "sidecar_reconstruction_preview"
     assert report["is_exact_host_capture"] is False
-    assert report["state_machine_mode"] == "work"
-    assert report["pcltm_mode"] == "work"
-    assert report["mode_sync"] == "consistent"
+    assert report["retrieval_scope"] == "work"
+    assert report["is_state_machine_output"] is False
+    assert "state_machine_mode" not in report
+    assert "pcltm_mode" not in report
+    assert "mode_sync" not in report
+    assert "【state_machine_mode】" not in report["rendered"]
     assert "preview body" in report["rendered"]
     assert report["selected_record_ids"]
     assert before == after

@@ -368,7 +368,6 @@ class EventStore:
         summaries = self._conn.execute("SELECT node_id, summary FROM summary_nodes ORDER BY node_id ASC").fetchall()
         for row in summaries:
             self._conn.execute("INSERT INTO summary_fts(rowid, summary) VALUES (?, ?)", (row["node_id"], row["summary"]))
-        self._conn.commit()
         return {"event_rows": len(events), "summary_rows": len(summaries)}
 
     def fts_counts(self) -> dict[str, int]:

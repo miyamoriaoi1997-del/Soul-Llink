@@ -11,3 +11,5 @@ def test_portable_runtime_subpackages_are_in_wheel_configuration() -> None:
 
     assert "soul_link.integration" in setuptools["packages"]
     assert setuptools["package-dir"]["soul_link.integration"] == "soul_link/integration"
+    assert "pcltm.projections" in setuptools["packages"]
+    assert setuptools["package-dir"]["pcltm.projections"] == "packages/pcltm/projections"

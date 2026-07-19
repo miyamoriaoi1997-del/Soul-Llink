@@ -3,7 +3,18 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+import pcltm.projections.runtime as projection_runtime
+from pcltm.projections.transcript_chunks import TranscriptChunkProjector
 from pcltm.store import EventStore
+
+
+def _apply_chunk_projection(store: EventStore) -> None:
+    result = TranscriptChunkProjector(store, worker_id="test-chunks").run_once(
+        now="2026-07-19T17:00:00Z", lease_until="2026-07-19T17:01:00Z",
+    )
+    assert result == {"claimed": 1, "applied": 1, "failed": 0}
 
 
 def test_external_ingest_commits_event_and_projection_jobs_together(tmp_path: Path) -> None:
@@ -190,3 +201,148 @@ def test_failed_projection_retries_then_moves_to_dead_letter(tmp_path: Path) -> 
     assert retrying["next_retry_at"] == "2026-07-17T03:05:00Z"
     assert dead["status"] == "dead_letter"
     assert dead["last_error"] == "permanent"
+
+
+@pytest.mark.parametrize("damage", ("missing", "stale"))
+def test_fts_worker_rebuilds_missing_or_stale_projection_before_ack(tmp_path: Path, damage: str) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    try:
+        event_id = store.append_event(
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="authoritative transcript",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        if damage == "missing":
+            store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
+        else:
+            store._conn.execute("UPDATE event_fts SET content = ? WHERE rowid = ?", ("stale", event_id))
+        store._conn.commit()
+
+        projection_runtime.drain_transcript_projections(store, worker_id="fts-repair")
+        indexed = store._conn.execute("SELECT content FROM event_fts WHERE rowid = ?", (event_id,)).fetchone()
+        outbox = store._conn.execute(
+            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert indexed["content"] == "authoritative transcript"
+    assert outbox["status"] == "applied"
+
+
+def test_fts_worker_retries_idempotently_after_materialization_before_ack_failure(tmp_path: Path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    try:
+        event_id = store.append_event(
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="retry-safe transcript",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
+        store._conn.commit()
+        _apply_chunk_projection(store)
+        real_ack = store.ack_projection_job
+        failed = False
+
+        def fail_once_after_materialization(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise RuntimeError("ack transport failed")
+            return real_ack(*args, **kwargs)
+
+        monkeypatch.setattr(store, "ack_projection_job", fail_once_after_materialization)
+        with pytest.raises(RuntimeError, match="ack transport failed"):
+            projection_runtime.drain_transcript_projections(store, worker_id="fts-retry")
+        first = store._conn.execute(
+            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        ).fetchone()
+        indexed_after_failure = store._conn.execute(
+            "SELECT content FROM event_fts WHERE rowid = ?", (event_id,)
+        ).fetchone()
+        store._conn.execute(
+            "UPDATE projection_outbox SET next_retry_at = NULL WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        )
+        store._conn.commit()
+        projection_runtime.drain_transcript_projections(store, worker_id="fts-retry")
+        second = store._conn.execute(
+            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert indexed_after_failure["content"] == "retry-safe transcript"
+    assert first["status"] == "pending"
+    assert second["status"] == "applied"
+
+
+def test_fts_worker_write_failure_leaves_job_unacknowledged(tmp_path: Path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    try:
+        event_id = store.append_event(
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="write failure transcript",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
+        store._conn.commit()
+        _apply_chunk_projection(store)
+        monkeypatch.setattr(projection_runtime, "_materialize_fts", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+
+        with pytest.raises(RuntimeError, match="transcript FTS projection failed"):
+            projection_runtime.drain_transcript_projections(store, worker_id="fts-write-failure")
+        outbox = store._conn.execute(
+            "SELECT status, last_error FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert outbox["status"] == "pending"
+    assert "disk full" in outbox["last_error"]
+
+
+def test_fts_worker_ack_false_after_real_lease_handoff_is_not_reported_applied(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = tmp_path / "pcltm.db"
+    store = EventStore(db)
+    contender = EventStore(db)
+    try:
+        event_id = store.append_event(
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="lease handoff transcript",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        _apply_chunk_projection(store)
+        real_ack = store.ack_projection_job
+
+        def handoff_before_ack(outbox_id: int, *, worker_id: str, now: str) -> bool:
+            claimed = contender.claim_projection_jobs(
+                worker_id="fts-contender",
+                projection_kind="transcript_fts",
+                limit=1,
+                now="2099-01-01T00:00:00Z",
+                lease_until="2099-01-01T00:01:00Z",
+            )
+            assert [job["outbox_id"] for job in claimed] == [outbox_id]
+            return real_ack(outbox_id, worker_id=worker_id, now=now)
+
+        monkeypatch.setattr(store, "ack_projection_job", handoff_before_ack)
+        with pytest.raises(RuntimeError, match="acknowledgement ownership lost"):
+            projection_runtime.drain_transcript_projections(store, worker_id="fts-original")
+
+        outbox = contender._conn.execute(
+            "SELECT status, lease_owner FROM projection_outbox "
+            "WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
+            (event_id,),
+        ).fetchone()
+    finally:
+        store.close()
+        contender.close()
+
+    assert dict(outbox) == {"status": "processing", "lease_owner": "fts-contender"}

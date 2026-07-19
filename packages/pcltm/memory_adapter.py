@@ -1199,10 +1199,10 @@ def _sanitize_direct_entry(text: str) -> str:
 def _render_prompt_context(entries_by_target: dict[str, list[str]], *, mode: str | None, query: str | None) -> str:
     lines = [
         "<pcltm_context>",
-        f"【mode】{mode or 'default'}",
-        f"【state_machine_mode】{mode or 'default'}",
-        f"【pcltm_mode】{mode or 'default'}",
-        f"【mode_sync】{'consistent' if mode in {'daily', 'work', 'sex'} else 'fallback_hint'}",
+        # This host-supplied argument scopes retrieval only.  PCLTM neither
+        # publishes nor derives state-machine mode, and cannot claim sync with
+        # that separate authority in model-facing memory context.
+        f"【retrieval_scope】{mode or 'unscoped'}",
         f"【retrieval_policy】{_policy_for_mode(mode)}",
     ]
     if query:

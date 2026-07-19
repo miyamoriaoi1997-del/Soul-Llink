@@ -53,7 +53,7 @@ def test_active_mood_injects_daily_bottom_noise_without_mutating_state(tmp_path)
     assert "不改真实STATE" in block
     assert "不单独触发sex" in block
     assert "不覆盖work或crisis边界" in block
-    assert block.index("【强度】") < block.index("【日内心情底噪】") < block.index("【锚点】")
+    assert block.index("【表达】") < block.index("【日内心情底噪】") < block.index("【锚点】")
 
 
 def test_inactive_mood_does_not_inject_bottom_noise(tmp_path):

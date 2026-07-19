@@ -6,6 +6,11 @@ import hashlib
 import json
 from typing import Any
 
+from .projections.runtime import (
+    drain_transcript_projections,
+    require_transcript_projections_applied,
+)
+
 
 _KIND_SOURCE = {
     "chat_message": "chat",
@@ -57,6 +62,8 @@ class PCLTMIngestAdapter:
         ingest = self.store.find_ingest_event(external_id)
         if ingest is None:
             raise RuntimeError(f"atomic ingest did not publish external event: {external_id}")
+        drain_transcript_projections(self.store, worker_id="pcltm-ingest")
+        require_transcript_projections_applied(self.store, event_id=event_id)
         return {
             "created": status == "inserted",
             "updated": status == "updated",
