@@ -16,23 +16,50 @@ import yaml
 
 @dataclass(frozen=True, slots=True)
 class DeploymentReceipt:
+    """Deployment receipt with rollback handle and integrity fingerprints.
+
+    Security boundary: fingerprints detect single-sided corruption of backup files,
+    marker, or receipt independently. They do NOT prevent coordinated tampering where
+    an attacker modifies receipt.json + marker + backup files together, as all three
+    artifacts reside in the filesystem with no external trusted anchor.
+
+    Protects against:
+    - Tampered backup file alone (fingerprint mismatch detected)
+    - Tampered marker alone (receipt vs marker mismatch detected)
+    - Missing backup file (incomplete backup detected)
+    - Receipt with wrong adapter version (version mismatch detected)
+    - Receipt pointing to different host/home (binding mismatch detected)
+
+    Does NOT protect against:
+    - Coordinated modification of receipt + marker + backup files together
+    - Attacker with write access to both $HERMES_HOME and receipt storage
+
+    Future mitigation options include receipt signing, remote storage, or user-confirmed hashes.
+    """
     host_root: Path
     hermes_home: Path
     soullink_root: Path
     backup_path: Path
     adapter_version: str = "2"
+    fingerprints: dict[str, str] | None = None
+    entries: dict[str, bool] | None = None
 
     def write(self, path: Path) -> None:
         path = Path(path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".tmp")
-        temp.write_text(json.dumps({
+        payload = {
             "host_root": str(self.host_root),
             "hermes_home": str(self.hermes_home),
             "soullink_root": str(self.soullink_root),
             "backup_path": str(self.backup_path),
             "adapter_version": self.adapter_version,
-        }, indent=2), encoding="utf-8")
+        }
+        if self.fingerprints is not None:
+            payload["fingerprints"] = self.fingerprints
+        if self.entries is not None:
+            payload["entries"] = self.entries
+        temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(temp, path)
 
     @classmethod
@@ -40,7 +67,8 @@ class DeploymentReceipt:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(**{key: Path(data[key]).resolve() for key in (
             "host_root", "hermes_home", "soullink_root", "backup_path"
-        )}, adapter_version=str(data["adapter_version"]))
+        )}, adapter_version=str(data["adapter_version"]),
+            fingerprints=data.get("fingerprints"), entries=data.get("entries"))
 
 
 class HermesDeployment:
@@ -99,6 +127,10 @@ class HermesDeployment:
             return None
 
         home.mkdir(parents=True, exist_ok=True)
+        baseline_paths = {
+            path.relative_to(home).as_posix()
+            for path in home.rglob("*")
+        }
         backup = home / f".soullink-deploy-backup-{uuid4().hex}"
         backup.mkdir()
         marker = {
@@ -129,9 +161,22 @@ class HermesDeployment:
             self._install_soul(home)
             if not self.verify(host, home):
                 raise RuntimeError("SoulLink verification failed")
-            return DeploymentReceipt(host, home, self.root, backup)
+            self._record_created_paths(home, backup, baseline_paths, marker)
+            (backup / ".soullink-deploy.json").write_text(
+                json.dumps(marker, indent=2), encoding="utf-8"
+            )
+            return DeploymentReceipt(
+                host, home, self.root, backup,
+                adapter_version=self.adapter_version,
+                fingerprints=marker.get("fingerprints", {}),
+                entries=marker.get("entries", {})
+            )
         except BaseException:
             if mutation_started:
+                self._record_created_paths(home, backup, baseline_paths, marker)
+                (backup / ".soullink-deploy.json").write_text(
+                    json.dumps(marker, indent=2), encoding="utf-8"
+                )
                 self._validate_backup(backup, marker)
                 self._restore(home, backup, marker)
             shutil.rmtree(backup, ignore_errors=not mutation_started)
@@ -157,6 +202,7 @@ class HermesDeployment:
         env.update({
             "HERMES_HOME": str(home), "SOULLINK_ROOT": str(self.root),
             "PYTHONPATH": os.pathsep.join((str(host), str(self.root), str(self.root / "packages"))),
+            "PYTHONDONTWRITEBYTECODE": "1",
         })
         try:
             result = subprocess.run(
@@ -190,6 +236,12 @@ class HermesDeployment:
         if any(marker.get(key) != value for key, value in expected.items()):
             raise RuntimeError("deployment backup marker mismatch")
         self._validate_backup(backup, marker)
+        if not isinstance(receipt.fingerprints, dict) or not isinstance(receipt.entries, dict):
+            raise RuntimeError("deployment receipt manifest missing")
+        if receipt.fingerprints != marker.get("fingerprints", {}):
+            raise RuntimeError("deployment backup fingerprint mismatch between receipt and marker")
+        if receipt.entries != marker.get("entries", {}):
+            raise RuntimeError("deployment backup entries mismatch between receipt and marker")
         self._restore(home, backup, marker)
         shutil.rmtree(backup)
         return True
@@ -290,6 +342,31 @@ class HermesDeployment:
                 else:
                     shutil.copy2(saved, target)
 
+    def _record_created_paths(
+        self, home: Path, backup: Path, baseline_paths: set[str], marker: dict
+    ) -> None:
+        """Bind topmost verify-created paths so rollback removes only new state."""
+        managed = tuple(Path(relative) for relative in self.managed)
+        backup_relative = backup.relative_to(home)
+        new_paths = sorted(
+            (
+                path for path in home.rglob("*")
+                if path.relative_to(home).as_posix() not in baseline_paths
+            ),
+            key=lambda path: len(path.relative_to(home).parts),
+        )
+        recorded: list[Path] = []
+        for path in new_paths:
+            relative = path.relative_to(home)
+            if relative == backup_relative or backup_relative in relative.parents:
+                continue
+            if any(relative == item or item in relative.parents for item in managed):
+                continue
+            if any(parent == relative or parent in relative.parents for parent in recorded):
+                continue
+            marker["entries"][relative.as_posix()] = False
+            recorded.append(relative)
+
     def _validate_backup(self, backup: Path, marker: dict) -> None:
         fingerprints = marker.get("fingerprints", {})
         for relative, existed in marker.get("entries", {}).items():
@@ -349,6 +426,11 @@ class HermesDeployment:
 
     @staticmethod
     def _inside(root: Path, relative: str) -> Path:
+        if not relative:
+            raise RuntimeError("unsafe managed path: empty path")
+        path = Path(relative)
+        if path.is_absolute() or path.anchor or path.drive or ".." in path.parts:
+            raise RuntimeError(f"unsafe managed path: {relative}")
         target = (root / relative).resolve()
         try:
             target.relative_to(root.resolve())

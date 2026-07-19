@@ -39,11 +39,19 @@ class RoutingConfig:
         """Get a lexicon term group as a flat list of strings."""
         return self._normalize_terms(self._lexicon.get(group, []))
 
+    def lexicon_typed(self, group: str) -> list[dict[str, Any] | str]:
+        """Get a lexicon term group with metadata preserved."""
+        return self.typed_terms(self._lexicon.get(group, []))
+
     # ── Classifier term accessors ──────────────────────────────────────────
 
     def classifier_terms(self, group: str) -> list[str]:
         """Get a classifier term group as a flat list of strings."""
         return self._normalize_terms(self._classifier.get(group, []))
+
+    def classifier_terms_typed(self, group: str) -> list[dict[str, Any] | str]:
+        """Get a classifier term group with metadata preserved."""
+        return self.typed_terms(self._classifier.get(group, []))
 
     # ── Intent rule accessors ──────────────────────────────────────────────
 
@@ -96,13 +104,35 @@ class RoutingConfig:
 
     @staticmethod
     def _normalize_terms(raw_list: list) -> list[str]:
-        """Normalize term entries: plain strings pass through, dicts extract 'term'."""
+        """Normalize term entries: plain strings pass through, dicts extract 'term'.
+
+        Legacy accessor - flattens to strings for backward compatibility.
+        Use typed_terms() to preserve metadata.
+        """
         result: list[str] = []
         for item in raw_list:
             if isinstance(item, str):
                 result.append(item)
             elif isinstance(item, dict) and "term" in item:
                 result.append(item["term"])
+            else:
+                result.append(str(item))
+        return result
+
+    @staticmethod
+    def typed_terms(raw_list: list) -> list[dict[str, Any] | str]:
+        """Get terms with metadata preserved.
+
+        Returns list where each item is either:
+        - A plain string term
+        - A dict with 'term' and optional 'weight', 'requires_context', etc.
+        """
+        result: list[dict[str, Any] | str] = []
+        for item in raw_list:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                result.append(item)
             else:
                 result.append(str(item))
         return result

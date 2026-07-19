@@ -20,6 +20,7 @@ from .observability import OrchestratorLogger
 from .prompt_composer import PromptComposer
 from .semantic_classifier import SemanticModeClassifier
 from .transition_manager import TransitionManager
+from .transition_manager_v2 import TransitionManagerV2
 from .types import ActivePromptResult, MODE_DAILY, MODE_SEX, MODE_WORK, MemorySelection, ModeDecision, StatePacket
 
 
@@ -64,7 +65,8 @@ class StateOrchestrator:
             if enable_semantic_shadow
             else None
         )
-        self.transitions = TransitionManager()
+        # Use v2 TransitionManager with shadow table support
+        self.transitions = TransitionManagerV2()
         self.memory_selector = MemorySelector()
         self.composer = PromptComposer(self.base_dir, core_source=core_source)
         self.logger = OrchestratorLogger(log_path or (self.base_dir / "logs" / "persona_orchestrator_shadow.jsonl"))
