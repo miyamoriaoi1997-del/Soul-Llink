@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 import yaml
@@ -37,13 +37,18 @@ class CompatibilityManifest:
         for relative in required_paths + created_paths:
             normalized = str(relative).replace("\\", "/")
             path = Path(normalized)
+            windows_path = PureWindowsPath(str(relative))
             if (
                 not normalized
                 or normalized.startswith("/")
                 or path.is_absolute()
                 or path.anchor
                 or path.drive
+                or windows_path.is_absolute()
+                or windows_path.anchor
+                or windows_path.drive
                 or ".." in path.parts
+                or ".." in windows_path.parts
             ):
                 raise ValueError(f"unsafe host path: {relative!r}")
         if set(required_paths) & set(created_paths):

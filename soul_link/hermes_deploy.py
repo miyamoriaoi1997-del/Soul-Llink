@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 import yaml
@@ -429,7 +429,17 @@ class HermesDeployment:
         if not relative:
             raise RuntimeError("unsafe managed path: empty path")
         path = Path(relative)
-        if path.is_absolute() or path.anchor or path.drive or ".." in path.parts:
+        windows_path = PureWindowsPath(relative)
+        if (
+            path.is_absolute()
+            or path.anchor
+            or path.drive
+            or windows_path.is_absolute()
+            or windows_path.anchor
+            or windows_path.drive
+            or ".." in path.parts
+            or ".." in windows_path.parts
+        ):
             raise RuntimeError(f"unsafe managed path: {relative}")
         target = (root / relative).resolve()
         try:
