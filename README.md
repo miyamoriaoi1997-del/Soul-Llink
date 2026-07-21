@@ -182,7 +182,7 @@ The public edition is meant to demonstrate the reusable architecture, not to pub
 - An OpenAI-compatible endpoint is optional and needed only when using the model router or an LLM-backed semantic classifier
 - PyTorch and Transformers are optional; install the `ml` dependency group only when local neural emotion inference is required
 
-SoulLink does not require Hermes for its core runtime. Hermes support is provided by explicit adapter assets under `adapters/hermes/`.
+SoulLink does not require Hermes or Codex for its core runtime. Host support is provided through explicit, optional adapters.
 
 ## Quick Start
 
@@ -233,7 +233,7 @@ export HERMES_PCLTM_MEMFS_ROOT=/srv/soullink/memfs
 
 ## Command-Line Interface
 
-The wheel installs four console commands:
+The wheel installs the core commands plus managed Hermes and Codex adapter commands:
 
 | Command | Purpose |
 |---|---|
@@ -241,6 +241,10 @@ The wheel installs four console commands:
 | `pcltm` | Alias of `soullink` |
 | `soullink-continuity-gate` | Evaluate pinned continuity artifacts using deployment-owned baselines and policy |
 | `soullink-host-adapt` | Detect, apply, verify, and roll back a versioned host patchset |
+| `soullink-hermes-deploy` | Managed Hermes deployment lifecycle |
+| `soullink-codex-deploy` | Detect, apply, verify, and byte-exactly roll back a Codex installation |
+| `soullink-codex-mcp` | SoulLink/PCLTM STDIO MCP server used by Codex |
+| `soullink-codex-hook` | Codex lifecycle hook entrypoint |
 
 Useful health and evidence commands:
 
@@ -306,6 +310,40 @@ Important rules:
 5. Host compatibility is version-specific. Never apply a patchset to an unknown host revision merely because paths look similar.
 
 The reference memory-provider and plugin manifests are examples of explicit integration boundaries. They do not silently activate themselves during package installation.
+
+## Codex Host Integration
+
+The Codex adapter uses supported Codex extension surfaces only: a local STDIO MCP server in
+`$CODEX_HOME/config.toml` and lifecycle command hooks in `$CODEX_HOME/hooks.json`. It does not patch
+Codex source. Existing config and hook entries are retained; a pre-existing foreign
+`[mcp_servers.soullink]` table is treated as an incompatibility instead of being overwritten.
+
+```bash
+soullink-codex-deploy detect --codex-home ~/.codex
+
+soullink-codex-deploy apply \
+  --codex-home ~/.codex \
+  --db /srv/soullink/pcltm.db \
+  --memfs /srv/soullink/memfs \
+  --receipt /safe/path/soullink-codex-receipt.json
+
+soullink-codex-deploy verify --codex-home ~/.codex
+codex mcp get soullink
+
+soullink-codex-deploy rollback \
+  --receipt /safe/path/soullink-codex-receipt.json
+```
+
+The MCP server exposes governed `search`, `open`, `exact recall`, `remember`, identity-status, and
+runtime-status tools. `SessionStart` and `UserPromptSubmit` hooks provide bounded developer context;
+other registered hooks are audit-only. Codex lifecycle hooks do **not** expose an exact final-model-input
+boundary, so the adapter reports `final_forward_observation = unavailable_host_boundary` and never labels
+hook output or retrieval previews as captured final-forward evidence.
+
+Treat the generated hook commands as executable local code and review them before granting hook trust.
+The installer creates a receipt and hash-checked backup before mutation. Failed apply/verify/receipt writes
+restore the original managed file set automatically; explicit rollback restores pre-existing files byte for
+byte and removes the receipt.
 
 ## Model Router
 

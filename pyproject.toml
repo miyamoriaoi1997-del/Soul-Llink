@@ -29,6 +29,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "mcp>=1.9.0",
     "openai>=1.0.0",
     "pyyaml>=6.0",
 ]
@@ -39,6 +40,9 @@ pcltm = "pcltm.cli:main"
 soullink-continuity-gate = "pcltm.continuity_gate:main"
 soullink-host-adapt = "soul_link.host_adaptation:main"
 soullink-hermes-deploy = "soul_link.hermes_deploy:main"
+soullink-codex-deploy = "soul_link.codex_deploy:main"
+soullink-codex-mcp = "soul_link.codex_mcp:main"
+soullink-codex-hook = "soul_link.codex_hook:main"
 
 [project.urls]
 Homepage = "https://github.com/soullink-public/soullink-public-2.0"
