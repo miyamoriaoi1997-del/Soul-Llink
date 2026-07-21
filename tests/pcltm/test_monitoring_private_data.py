@@ -108,3 +108,29 @@ def test_soul_content_reads_active_anchor_and_all_mode_layers(tmp_path: Path) ->
     assert report["source"] == "runtime_soul_files"
     assert report["active"]["content"] == "# active soul"
     assert report["layers"]["work"]["content"] == "# work"
+
+
+def test_runtime_turn_capture_preserves_exact_selected_record_evidence(tmp_path: Path) -> None:
+    import json
+
+    capture = tmp_path / "latest-turn.json"
+    capture.write_text(json.dumps({
+        "source": "exact_host_capture",
+        "forwarded_model_boundary": {"status": "captured", "source": "final_model_forward"},
+        "memory_selection": {
+            "status": "captured",
+            "selected_count": 1,
+            "selected_records": [{
+                "ordinal": 1, "bucket": "user", "content": "governed body",
+                "content_sha256": "a" * 64,
+            }],
+            "candidate_records": {"status": "unavailable"},
+            "judgment_workset": {"status": "unavailable"},
+        },
+    }), encoding="utf-8")
+
+    report = collect_runtime_turn_capture(capture)
+
+    assert report["memory_selection"]["selected_count"] == 1
+    assert report["memory_selection"]["selected_records"][0]["content"] == "governed body"
+    assert report["forwarded_model_boundary"]["source"] == "final_model_forward"

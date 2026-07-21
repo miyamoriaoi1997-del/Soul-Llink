@@ -3,74 +3,43 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SoulLink Observatory</title>
+  <title>SoulLink · 灵魂观测台</title>
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
-  <div class="ambient"></div>
-  <header class="topbar">
-    <div class="brand"><span class="brandmark">S</span><div><b>SoulLink</b><small>PCLTM OBSERVATORY</small></div></div>
-    <nav><button class="nav active" data-view="overview">总览</button><button class="nav" data-view="runtime-injection">实时注入</button><button class="nav" data-view="soul">Soul</button><button class="nav" data-view="memories">记忆正文</button><button class="nav" data-view="injection">PCLTM预览</button><button class="nav" data-view="diagnostics">诊断</button></nav>
-    <div class="controls"><span id="freshness" class="fresh"><i></i>等待数据</span><button id="refresh" class="refresh">刷新</button><label class="switch"><input id="auto" type="checkbox" checked><span></span>实时</label></div>
-  </header>
-
-  <main>
-    <section class="hero">
-      <div><p class="eyebrow">PRIVATE · LOOPBACK · READ ONLY</p><h1>运行态，一目了然。</h1><p class="subtitle">情绪、记忆、上下文与注入选择的本机实时观察面。</p></div>
-      <div class="hero-stat"><span>快照耗时</span><strong id="duration">—</strong><small>milliseconds</small></div>
-    </section>
-
-    <section id="overview" class="view active-view">
-      <div id="summary" class="status-grid" aria-label="状态总览"></div>
-      <div class="dashboard-grid">
-        <article class="panel emotion-panel">
-          <div class="panel-head"><div><p class="kicker">LIVE STATE</p><h2>情绪遥测</h2></div><span id="emotion-source" class="source-pill">—</span></div>
-          <div class="emotion-score"><div><span>当前情绪</span><strong id="emotion-current">—</strong><small>/ 5.00</small></div><div class="score-track"><span id="emotion-score-bar"></span></div></div>
-          <div id="emotion-axes" class="axes"></div>
-          <div id="emotion-meta" class="meta-strip"></div>
-        </article>
-        <article class="panel context-panel">
-          <div class="panel-head"><div><p class="kicker">GOVERNED BUDGET</p><h2>上下文预算</h2></div><span id="context-percent" class="big-percent">—</span></div>
-          <div class="budget-ring-wrap"><div id="budget-ring" class="budget-ring"><div><strong id="budget-used">—</strong><small>chars</small></div></div><div id="context-details" class="stacked-details"></div></div>
-        </article>
-      </div>
-      <div class="dashboard-grid lower">
-        <article class="panel"><div class="panel-head"><div><p class="kicker">MEMORY INDEX</p><h2>记忆与索引</h2></div></div><div id="memory-stats" class="metric-grid"></div></article>
-        <article class="panel"><div class="panel-head"><div><p class="kicker">RUNTIME SIGNALS</p><h2>Persona / Router</h2></div></div><div class="split-runtime"><div><h3>Persona</h3><div id="persona"></div></div><div><h3>Router</h3><div id="router"></div></div></div></article>
-      </div>
-    </section>
-
-    <section id="runtime-injection" class="view">
-      <div class="section-head"><div><p class="kicker">EXACT HOST CAPTURE</p><h2>当前实时注入</h2><p>由回复前宿主钩子原子捕获；这是当前 turn 实际注入，不是旁路推测。</p></div><span id="capture-source" class="source-pill">—</span></div>
-      <div class="dashboard-grid">
-        <article class="panel"><div class="panel-head"><div><p class="kicker">EMOTION MODIFIER</p><h2>情绪注入词</h2></div></div><pre id="emotion-modifier-body">暂无捕获</pre></article>
-        <article class="panel"><div class="panel-head"><div><p class="kicker">STATE MACHINE</p><h2>状态机注入状态</h2></div></div><div id="state-machine-details" class="stacked-details"></div><pre id="state-machine-body">暂无捕获</pre></article>
-      </div>
-      <article class="panel injection-panel"><div class="panel-head"><div><p class="kicker">FULL TURN PAYLOAD</p><h2>本轮完整 SoulLink 注入</h2></div></div><pre id="runtime-injection-body">暂无捕获</pre><div id="capture-meta" class="selected-records"></div></article>
-    </section>
-
-    <section id="soul" class="view">
-      <div class="section-head"><div><p class="kicker">ACTIVE IDENTITY SOURCE</p><h2>Soul 内容</h2><p>直接读取当前生效 SOUL.md 与 canonical mode layers，保留真实路径。</p></div><span id="soul-source" class="source-pill">—</span></div>
-      <div class="filter-row soul-tabs"><button class="soul-tab active" data-soul="active">当前生效</button><button class="soul-tab" data-soul="core">Core</button><button class="soul-tab" data-soul="daily">Daily</button><button class="soul-tab" data-soul="work">Work</button><button class="soul-tab" data-soul="sex">Boundary</button></div>
-      <article class="panel injection-panel"><div id="soul-meta" class="selected-records"></div><pre id="soul-body">暂无 Soul 内容</pre></article>
-    </section>
-
-    <section id="memories" class="view">
-      <div class="section-head"><div><p class="kicker">GOVERNED RECORDS</p><h2>记忆正文</h2><p>直接读取本机 PCLTM 数据库；无遮罩、无二次解锁。</p></div><div class="filter-row"><input id="memory-search" placeholder="搜索正文 / 类型 / scope"><select id="memory-status"><option value="all">全部状态</option><option value="approved">已批准</option><option value="pending">待审</option><option value="rejected">淘汰</option></select></div></div>
-      <div id="memory-list" class="memory-list"></div>
-    </section>
-
-    <section id="injection" class="view">
-      <div class="section-head"><div><p class="kicker">CONTEXT PAYLOAD</p><h2>注入块审阅</h2><p>清楚区分宿主精确捕获与旁路重建，避免把预览冒充事实。</p></div></div>
-      <article class="panel injection-panel"><div class="injection-head"><div><span id="injection-label" class="truth-label">—</span><h3 id="injection-title">等待注入数据</h3></div><div id="injection-metrics" class="inline-metrics"></div></div><pre id="injection-body"></pre><div id="selected-records" class="selected-records"></div></article>
-    </section>
-
-    <section id="diagnostics" class="view">
-      <div class="section-head"><div><p class="kicker">ISSUES & EVIDENCE</p><h2>告警与诊断</h2><p>每条诊断保留来源与补救建议。</p></div></div>
-      <div id="issues" class="issues"></div>
-    </section>
-  </main>
-  <footer><span>SoulLink Observatory</span><span>单机私有 · localhost · 所有接口只读</span></footer>
-  <script src="/assets/app.js"></script>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="sigil">S</div><div><strong>SoulLink</strong><small>SOUL OBSERVATORY · V12.4</small></div></div>
+    <div class="nav-group"><div class="nav-label">OBSERVE</div>
+      <button class="nav-item active" data-view="now"><span class="glyph">◉</span><span>此刻</span></button>
+      <button class="nav-item" data-view="memory"><span class="glyph">⌁</span><span>记忆流</span></button>
+      <button class="nav-item" data-view="injection"><span class="glyph">≋</span><span>注入链</span></button>
+    </div>
+    <div class="nav-group"><div class="nav-label">INSPECT</div>
+      <button class="nav-item" data-view="identity"><span class="glyph">◇</span><span>人格层</span></button>
+      <button class="nav-item" data-view="evidence"><span class="glyph">⌗</span><span>证据与诊断</span></button>
+    </div>
+    <div class="side-foot"><div class="live-line"><i class="pulse"></i><span id="side-status">等待快照</span></div><div class="side-meta">loopback / read-only<br><span id="side-time">—</span></div></div>
+  </aside>
+  <div class="shell">
+    <header class="topbar"><div class="crumb">观测 / <b id="crumb">此刻</b></div><div class="top-actions"><span class="truth" id="truth"><i></i> LIVE SNAPSHOT · READ ONLY</span><button class="icon-btn" id="pause" title="暂停自动刷新">暂停</button><button class="icon-btn" id="refresh" title="刷新快照">↻</button></div></header>
+    <main class="content">
+      <section id="now" class="view active">
+        <div class="turn-header"><div><h1>此刻的状态，以及它如何形成。</h1><p>只读取权威快照；缺失的实时捕获会明确显示为不可用，不以概念数据代替。</p></div><div class="turn-id" id="turn-id">SNAPSHOT<br>—</div></div>
+        <div class="monitor-grid hero-grid">
+          <article class="panel presence"><div class="presence-main"><div class="mode-seal"><strong id="mode-label">memory injection · unavailable</strong><span id="memory-summary">等待权威快照</span></div><div id="memory-path" class="memory-path" role="img" aria-live="polite" aria-label="记忆从总库到当前回答的精确观测路径"></div><div class="presence-copy"><small>MEMORY INJECTION NOW</small><h3 id="memory-headline">等待本轮记忆证据。</h3><p id="memory-explain">当宿主精确捕获不可用时，界面不会展示猜测的本轮影响。</p></div></div><div id="axis-row" class="axis-row"></div></article>
+          <article class="panel causal"><div class="panel-head"><h2>本轮状态轨迹</h2><span class="kicker">AUTHORITATIVE SOURCES</span></div><div id="causal-events" class="event-list"></div><div class="causal-footer"><div class="cause-title">WHY THIS STATE</div><div class="cause-body" id="cause">等待 state-machine 或精确宿主捕获。</div><div class="cause-source" id="causeSource">source unavailable</div></div></article>
+        </div>
+        <div class="lower-grid"><article class="panel influence-trace"><div class="panel-head"><h2>本轮判断证据</h2><span class="kicker">SELECTION · BUDGET · GOVERNOR</span></div><div id="live-funnel" class="decision-summary"></div></article><article class="panel"><div class="panel-head"><h2>上下文构成</h2><span class="kicker">EXACT HOST USAGE</span></div><div id="context-live" class="data-grid"></div></article></div>
+        <article class="panel evidence"><div class="panel-head"><h2>事实底座</h2><span class="kicker">PROVENANCE, NOT DECORATION</span></div><div id="now-evidence" class="runtime-grid"></div></article>
+      </section>
+      <section id="memory" class="view"><div class="page-intro"><div><h1>本轮回答为什么会这样形成。</h1><p>记忆正文来自只读 runtime DB；“影响回答”仅在精确宿主捕获提供记录时标注。</p></div><div class="page-proof" id="memory-proof">RUNTIME DB · READ ONLY</div></div><article class="panel memory-story-panel"><div id="memory-library" class="memory-library-baseline"></div><div id="memory-stories" class="memory-stories-live"></div><div id="memory-detail" class="memory-detail-strip"><div><small>选择一条记录</small><h3>暂无记忆详情</h3></div></div></article></section>
+      <section id="injection" class="view"><div class="page-intro"><div><h1>本轮注入是如何组装的。</h1><p>优先展示 pre-model hook 的 exact capture；若不可用，仅展示明确标注的旁路重建预览。</p></div><div class="page-proof" id="injection-proof">WAITING FOR CAPTURE</div></div><article class="panel"><div class="panel-head"><h2>注入组装链</h2><span class="kicker">SOURCE → GOVERN → ASSEMBLE → FORWARD</span></div><div id="chain-stages" class="chain"></div><div class="chain-detail"><pre class="code live-code" id="chainPreview">暂无注入数据</pre><div id="source-map" class="source-map"></div></div></article></section>
+      <section id="identity" class="view"><div class="page-intro"><div><h1>当前生效的人格结构。</h1><p>身份内容读取 canonical Soul 文件；活跃模式只接受精确宿主捕获中的状态机输出。</p></div><div class="page-proof" id="identity-proof">RUNTIME SOUL FILES</div></div><div class="layer-stack"><article class="panel"><div class="panel-head"><h2>生效层级</h2><span class="kicker">ORDERED · NON-REDEFINING</span></div><div id="layers" class="layers"></div></article><article class="panel"><div class="panel-head"><h2>人格内容</h2><span class="kicker" id="soul-source">—</span></div><pre class="code live-code" id="soul-content">暂无 Soul 内容</pre></article></div></section>
+      <section id="evidence" class="view"><div class="page-intro"><div><h1>证据、健康与异常。</h1><p>仅展示本次快照的真实来源、时间与故障信息。</p></div><div class="page-proof">READ ONLY · LOOPBACK</div></div><div id="diag-cards" class="diag-cards"></div><article class="panel"><div class="panel-head"><h2>运行证据</h2><span class="kicker">LATEST SNAPSHOT</span><button class="icon-btn raw-toggle" id="rawToggle">查看原始快照</button></div><div id="evidence-table" class="table-wrap"></div><pre class="raw-block code live-code" id="rawBlock"></pre></article></section>
+    </main>
+  </div>
+</div>
+<script src="/assets/app.js"></script>
 </body>
 </html>
