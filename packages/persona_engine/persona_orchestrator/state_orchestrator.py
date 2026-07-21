@@ -207,7 +207,9 @@ class StateOrchestrator:
         previous_mode: str | None = None,
         platform: str = "cli",
         packet: StatePacket | None = None,
+        runtime_authority: str = "active",
     ) -> ActivePromptResult:
+        shadow_only = runtime_authority != "active"
         if packet is None:
             analysis = self._analyze(
                 user_message=user_message,
@@ -216,11 +218,11 @@ class StateOrchestrator:
                 emotion_modifier=emotion_modifier,
                 previous_mode=previous_mode,
                 platform=platform,
-                shadow_only=False,
+                shadow_only=shadow_only,
             )
             packet, memory_notes, selected_layers = analysis
         else:
-            packet.shadow_only = False
+            packet.shadow_only = shadow_only
             memory_notes = self.memory_selector.select(packet.mode, packet.safety_flags).reason
             selected_layers = list(packet.selected_layers)
 
@@ -287,7 +289,12 @@ class StateOrchestrator:
         if self._component_health["pcltm"].get("status") == "degraded":
             warnings.append("pcltm_degraded")
         packet.route_metadata["runtime_health"] = self.health_status()
-        log_ok = self.logger.log(packet, extra={"warnings": warnings, "active_candidate": True, "memory_context_summary": memory_context_summary})
+        log_ok = self.logger.log(packet, extra={
+            "warnings": warnings,
+            "active_candidate": not shadow_only,
+            "runtime_authority": "shadow" if shadow_only else "active",
+            "memory_context_summary": memory_context_summary,
+        })
         if not log_ok:
             packet.route_metadata["runtime_health"] = self.health_status()
         return ActivePromptResult(

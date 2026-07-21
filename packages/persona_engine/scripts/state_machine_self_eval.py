@@ -186,6 +186,52 @@ def extract_audit_candidates(records: Iterable[dict[str, Any]]) -> list[dict[str
                 session_modes.setdefault(session_id, []).append(mode)
     return candidates
 
+def build_continuous_sample(
+    records: Iterable[dict[str, Any]], *, sample_size: int = 12, sampling_key: str,
+) -> list[dict[str, Any]]:
+    """Select a stable bounded runtime sample without manufacturing labels."""
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for line_number, record in enumerate(records, start=1):
+        packet = record.get("packet") if isinstance(record.get("packet"), dict) else {}
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        route_metadata = packet.get("route_metadata") if isinstance(packet.get("route_metadata"), dict) else {}
+        decision_audit = route_metadata.get("decision_audit") if isinstance(route_metadata.get("decision_audit"), dict) else {}
+        previous_mode = decision_audit.get("previous_mode")
+        status = "captured" if previous_mode in {"daily", "work", "sex"} else "unavailable"
+        identity = "|".join(str(value or "") for value in (
+            sampling_key, record.get("timestamp"), extra.get("session_id"), extra.get("turn_number"), line_number,
+        ))
+        candidate_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        candidates.append((candidate_id, {
+            "candidate_id": candidate_id, "source_line_number": line_number,
+            "timestamp": record.get("timestamp"), "session_id": extra.get("session_id"),
+            "turn_number": extra.get("turn_number"), "previous_mode": previous_mode,
+            "previous_mode_status": status, "timeliness_eligible": status == "captured",
+            "actual_mode": packet.get("mode"), "actual_transition": packet.get("transition"),
+            "actual_layers": list(packet.get("selected_layers") or []),
+            "needs_manual_label": True, "source": "production_runtime_sample",
+        }))
+    return [row for _key, row in sorted(candidates, key=lambda item: item[0])[:max(0, int(sample_size))]]
+
+
+def build_labeled_runtime_report(sample: Iterable[dict[str, Any]], labels: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Measure correctness and same-turn timeliness from explicit human labels."""
+    trusted = {str(x.get("candidate_id")): x for x in labels if x.get("candidate_id") and x.get("reviewer") and x.get("source") == "manual_feedback"}
+    rows = [(item, trusted[str(item.get("candidate_id"))]) for item in sample if str(item.get("candidate_id")) in trusted]
+    total = len(rows)
+    eligible = [(item, label) for item, label in rows if item.get("timeliness_eligible") is True]
+    decisive = [(item, label) for item, label in eligible if item.get("previous_mode") != label.get("expected_mode")]
+    same_turn = [(item, label) for item, label in decisive if item.get("actual_mode") == label.get("expected_mode") and item.get("actual_transition") == label.get("expected_transition")]
+    return {"authority": "human_labeled_production_sample", "metrics": {
+        "labeled_count": total,
+        "mode_accuracy": sum(i.get("actual_mode") == l.get("expected_mode") for i, l in rows) / total if total else None,
+        "transition_accuracy": sum(i.get("actual_transition") == l.get("expected_transition") for i, l in rows) / total if total else None,
+        "timeliness": {"timeliness_eligible_count": len(eligible), "timeliness_ineligible_count": total - len(eligible),
+            "decisive_switch_case_count": len(decisive), "same_turn_switch_count": len(same_turn),
+            "same_turn_switch_rate": len(same_turn) / len(decisive) if decisive else None,
+            "stale_mode_hold_count": len(decisive) - len(same_turn)},
+    }}
+
 
 def apply_feedback_labels(
     candidates: list[dict[str, Any]],
@@ -274,6 +320,10 @@ def main() -> int:
     parser.add_argument("--report", required=True)
     parser.add_argument("--candidates")
     parser.add_argument("--feedback")
+    parser.add_argument("--sample")
+    parser.add_argument("--sampling-key")
+    parser.add_argument("--sample-size", type=int, default=12)
+    parser.add_argument("--sample-report")
     args = parser.parse_args()
 
     _write_json(args.report, {
@@ -299,6 +349,12 @@ def main() -> int:
             "authority": AUTHORITY,
             "candidates": candidates,
         })
+    if args.audit_log and args.sample and args.sampling_key:
+        sample = build_continuous_sample(load_jsonl(args.audit_log), sample_size=args.sample_size, sampling_key=args.sampling_key)
+        _write_json(args.sample, {"authority": "production_runtime_sample_for_manual_labeling", "sampling_key": args.sampling_key, "sample": sample})
+        if args.sample_report:
+            feedback = load_jsonl(args.feedback) if args.feedback and Path(args.feedback).exists() else []
+            _write_json(args.sample_report, build_labeled_runtime_report(sample, feedback))
     _write_json(args.report, report)
     print(json.dumps({"report": args.report, "metrics": report["metrics"], "promotion": report["promotion"]}, ensure_ascii=False))
     return 0 if report["promotion"]["status"] == "manual_review_candidate" else 2

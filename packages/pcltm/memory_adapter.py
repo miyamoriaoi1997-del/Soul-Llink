@@ -155,6 +155,9 @@ class ViewPolicy:
         "active_task",
         "继续任务",
     )
+    # Optional policy data, supplied by the deployment/evaluation boundary.
+    # Keep the adapter mechanism generic rather than embedding domain phrases.
+    query_alias_groups: tuple[tuple[str, ...], ...] = ()
     boundary_metadata_terms: tuple[str, ...] = ("secret_boundary", "runtime_boundary", "boundary", "production_risk")
     emotion_boundary_terms: tuple[str, ...] = ("emotion", "desire", "sex", "consent", "aftercare", "情绪", "SOUL", "overwhelming", "欲望", "边界", "亲密")
     protected_tags: frozenset[str] = field(default_factory=lambda: frozenset({"critical", "production", "boundary", "identity"}))
@@ -328,6 +331,10 @@ def _query_terms(query: str | None, policy: ViewPolicy = DEFAULT_VIEW_POLICY) ->
     for token in policy.query_terms:
         if token.lower() in text:
             terms.add(token.lower())
+    for group in policy.query_alias_groups:
+        normalized_group = tuple(str(token).strip().lower() for token in group if str(token).strip())
+        if any(token in text for token in normalized_group):
+            terms.update(normalized_group)
     for size in (2, 3, 4):
         for i in range(0, max(0, len(query) - size + 1)):
             chunk = query[i : i + size]
@@ -348,6 +355,12 @@ def _query_content_terms(query: str | None, policy: ViewPolicy = DEFAULT_VIEW_PO
     if not terms:
         return set()
     protected = {token.lower() for token in policy.query_terms}
+    protected.update(
+        str(token).strip().lower()
+        for group in policy.query_alias_groups
+        for token in group
+        if str(token).strip()
+    )
     filtered: set[str] = set()
     for term in terms:
         normalized = term.strip().lower()
@@ -439,6 +452,27 @@ def _metadata_recall_terms(metadata: dict) -> set[str]:
             terms.add(raw.lower())
         elif isinstance(raw, Iterable):
             terms.update(str(value).lower() for value in raw if value is not None)
+    terms.update(_fact_projection_terms(metadata))
+    return terms
+
+
+def _fact_projection_terms(metadata: dict) -> set[str]:
+    """Project only explicit structured fact values into lexical recall."""
+    terms: set[str] = set()
+    facts = metadata.get("facts")
+    if isinstance(facts, dict):
+        stack: list[Any] = list(facts.values())
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                stack.extend(value.values())
+            elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+                stack.extend(value)
+            elif value is not None:
+                text = str(value).strip().lower()
+                if text:
+                    terms.add(text)
+                    terms.update(re.findall(r"[a-zA-Z0-9_./+-]{2,}|[\u4e00-\u9fff]{2,}", text))
     return terms
 
 
@@ -714,7 +748,8 @@ def _rank_rows(
         metadata = _metadata(row)
         record_id = int(row["record_id"] if "record_id" in row.keys() else 0)
 
-        lexical_boost, exact_query_hit, query_hit_count = _query_match_features(text, effective_query, policy)
+        projected_text = " ".join((text, *sorted(_fact_projection_terms(metadata))))
+        lexical_boost, exact_query_hit, query_hit_count = _query_match_features(projected_text, effective_query, policy)
         bucket_boost = _bucket_query_relevance(metadata, effective_query, policy)
         # Semantic boost from BM25 index. Cap here so experiments can adjust the
         # index scale without letting semantic scores swamp safety/governor rank.
@@ -1577,7 +1612,10 @@ def load_layered_prompt_context(
 
     if has_memfs_content:
         try:
-            store = MemFSStore(memfs_root)
+            store = MemFSStore(
+                memfs_root,
+                query_alias_groups=policy.query_alias_groups,
+            )
             scope_mode = _memfs_mode_scope(mode, policy)
             view = PromptMemoryView()
             view.selected_layers = tuple(layer for layer in ("system", "pinned", "episodic", "transient") if layer in prompt_active_layers)

@@ -20,6 +20,7 @@ def test_runtime_shadow_active_flag_does_not_enable_switch_for_task_mode(tmp_pat
     assert record['model_hint'] == 'technical'
     assert record['switch_allowed'] is False
     assert record['switch_reason'] == 'runtime_shadow_observation_only'
+    assert record['packet'].shadow_only is False
 
 
 def test_runtime_shadow_routes_active_sex_candidate_to_sex_bucket_without_enabling_switch(tmp_path):
@@ -42,6 +43,7 @@ def test_runtime_shadow_routes_active_sex_candidate_to_sex_bucket_without_enabli
     assert record['model_hint'] == 'sex'
     assert record['switch_allowed'] is False
     assert record['switch_reason'] == 'runtime_shadow_observation_only'
+    assert record['packet'].shadow_only is False
 
 
 def test_shadow_runtime_stays_audit_only_even_when_mode_matches(tmp_path):
@@ -61,3 +63,4 @@ def test_shadow_runtime_stays_audit_only_even_when_mode_matches(tmp_path):
     assert record['mode'] == 'sex'
     assert record['switch_allowed'] is False
     assert record['switch_reason'] == 'runtime_shadow_observation_only'
+    assert record['packet'].shadow_only is True

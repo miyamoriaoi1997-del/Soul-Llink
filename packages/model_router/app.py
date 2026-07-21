@@ -149,6 +149,7 @@ def _state_machine_signal(payload: dict) -> dict:
         "switch_allowed",
         "hermes_switch_reason",
         "switch_reason",
+        "hermes_turn_correlation_id",
     ):
         if key in metadata:
             signal[key] = metadata[key]
@@ -409,6 +410,9 @@ class Handler(BaseHTTPRequestHandler):
         row = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "request_hash": request_hash,
+            "turn_correlation_id": str(
+                ((payload.get("metadata") or {}).get("hermes_turn_correlation_id") or "")
+            ) or None,
             "original_model": original_model,
             "route": decision.route if decision else None,
             "selected_model": decision.selected_model if decision else None,

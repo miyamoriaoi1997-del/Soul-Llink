@@ -76,6 +76,7 @@ class RuntimeShadowAdapter:
             emotion_modifier=emotion_modifier,
             previous_mode=previous_mode,
             platform=platform,
+            runtime_authority="active" if active else "shadow",
         )
         route_bucket = self._route_bucket(result.packet.mode, result.packet.selected_layers)
         record = {

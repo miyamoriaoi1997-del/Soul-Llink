@@ -194,6 +194,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._emotion_turn_lock = threading.Lock()
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
+        self._turn_route_overrides: Dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -219,6 +220,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "")
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
+        self._turn_route_overrides = {}
         self._active_mode = None
         self._pcltm_mode = None
         self._mode_sync = None
@@ -283,6 +285,20 @@ class SoulLinkMemoryProvider(MemoryProvider):
             "</state_machine_injection>"
         )
 
+    @staticmethod
+    def _route_request_overrides(route_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = (
+            "hermes_route_bucket", "hermes_model_hint", "hermes_selected_model",
+            "hermes_turn_correlation_id",
+        )
+        metadata = {key: route_metadata[key] for key in allowed if key in route_metadata}
+        return {"extra_body": {"metadata": metadata}} if metadata else {}
+
+    def request_overrides(self) -> Dict[str, Any]:
+        """Return bounded per-turn router metadata without changing prompt content."""
+        metadata = ((self._turn_route_overrides.get("extra_body") or {}).get("metadata") or {})
+        return self._route_request_overrides(metadata)
+
     def _write_runtime_capture(self, payload: Dict[str, Any]) -> None:
         path = Path(self._runtime_capture_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +358,13 @@ class SoulLinkMemoryProvider(MemoryProvider):
             )
             mode_layer = self._read_soul_mode_layer(packet.mode)
             state_machine_context = self._format_state_machine_context(packet, mode_layer)
-            self._turn_emotion_context = emotion_context + "\n\n" + state_machine_context
+            self._turn_emotion_context = state_machine_context + "\n\n" + emotion_context
+            correlation_id = hashlib.sha256(
+                f"{session_id}\0{int(turn_number)}\0{text}".encode("utf-8")
+            ).hexdigest()[:24]
+            route_metadata = dict(packet.route_metadata) if isinstance(packet.route_metadata, dict) else {}
+            route_metadata["hermes_turn_correlation_id"] = correlation_id
+            self._turn_route_overrides = self._route_request_overrides(route_metadata)
             self._active_mode = packet.mode
             if session_id:
                 self._session_modes[session_id] = packet.mode
@@ -356,6 +378,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
                     "captured_at": datetime.now(timezone.utc).isoformat(),
                     "session_id": session_id,
                     "turn_number": int(turn_number),
+                    "turn_correlation_id": correlation_id,
                     "emotion_state": state,
                     "emotion_modifier": emotion_modifier,
                     "state_machine": {
@@ -397,6 +420,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._session_id = new_session_id
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
+        self._turn_route_overrides = {}
         if reset:
             self._session_modes.pop(new_session_id, None)
         self._active_mode = self._session_modes.get(new_session_id)

@@ -176,7 +176,11 @@ def collect_injection_preview(
     }
 
 
-def collect_runtime_turn_capture(capture_path: str | Path) -> dict[str, Any]:
+def collect_runtime_turn_capture(
+    capture_path: str | Path,
+    *,
+    router_audit_path: str | Path | None = None,
+) -> dict[str, Any]:
     """Read the exact latest pre-reply turn capture written by the host provider."""
     path = Path(capture_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -184,6 +188,31 @@ def collect_runtime_turn_capture(capture_path: str | Path) -> dict[str, Any]:
         raise ValueError("runtime turn capture is not an exact host capture")
     payload = dict(payload)
     payload["capture_path"] = str(path)
+    correlation_id = str(payload.get("turn_correlation_id") or "")
+    state_machine = payload.get("state_machine") if isinstance(payload.get("state_machine"), dict) else {}
+    route_metadata = state_machine.get("route_metadata") if isinstance(state_machine.get("route_metadata"), dict) else {}
+    decision_model = route_metadata.get("hermes_selected_model")
+    matched = None
+    audit_path = Path(router_audit_path) if router_audit_path else None
+    if correlation_id and audit_path and audit_path.is_file():
+        for raw in reversed(audit_path.read_text(encoding="utf-8").splitlines()[-500:]):
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and str(row.get("turn_correlation_id") or "") == correlation_id:
+                matched = row
+                break
+    payload["model_chain"] = {
+        "status": "correlated" if matched else "unavailable",
+        "correlation_scope": "turn_level_latest_outcome",
+        "turn_correlation_id": correlation_id or None,
+        "router_request_hash": matched.get("request_hash") if matched else None,
+        "decision_model": decision_model,
+        "actual_forwarded_model": matched.get("forwarded_model") if matched else None,
+        "router_ok": matched.get("ok") if matched else None,
+        "source": "router_final_forward_audit" if matched else "router_audit_not_correlated",
+    }
     return payload
 
 

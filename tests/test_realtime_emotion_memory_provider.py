@@ -163,6 +163,35 @@ def test_turn_start_injects_state_machine_selected_soul_and_writes_exact_capture
     assert capture["emotion_modifier"] == "<emotion_modifier>updated-before-reply</emotion_modifier>"
     assert capture["soul_mode_layer"]["content"] == "# work layer exact body"
     assert capture["turn_injection"] in context
+    assert capture["turn_correlation_id"]
+    overrides = provider.request_overrides()
+    assert overrides["extra_body"]["metadata"]["hermes_turn_correlation_id"] == capture["turn_correlation_id"]
+
+
+def test_request_overrides_expose_only_current_state_machine_route(provider_factory):
+    provider = provider_factory()
+    provider._turn_route_overrides = {
+        "extra_body": {
+            "metadata": {
+                "hermes_route_bucket": "task",
+                "hermes_model_hint": "technical",
+                "hermes_selected_model": "work-model",
+                "hermes_turn_correlation_id": "turn-id",
+                "private_internal": "must-not-leak",
+            }
+        }
+    }
+
+    assert provider.request_overrides() == {
+        "extra_body": {
+            "metadata": {
+                "hermes_route_bucket": "task",
+                "hermes_model_hint": "technical",
+                "hermes_selected_model": "work-model",
+                "hermes_turn_correlation_id": "turn-id",
+            }
+        }
+    }
 
 
 def test_pcltm_failure_records_error_instead_of_false_consistency(tmp_path, monkeypatch):

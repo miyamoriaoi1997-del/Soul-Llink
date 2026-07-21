@@ -58,8 +58,14 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
 class MemFSStore:
     """Local filesystem-backed MemFS view layer."""
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        query_alias_groups: tuple[tuple[str, ...], ...] = (),
+    ):
         self.root = Path(root)
+        self.query_alias_groups = query_alias_groups
 
     def init(self) -> None:
         """Create the expected MemFS directory layout without deleting data."""
@@ -538,7 +544,11 @@ class MemFSStore:
         if not terms:
             return 0.0
         bucket_text = " ".join(item.buckets).lower()
-        metadata_text = f"{item.path} {item.description}".lower()
+        metadata_text = " ".join((
+            item.path,
+            item.description,
+            *sorted(self._fact_projection_terms(item.metadata)),
+        )).lower()
         body_text = item.body.lower()
         score = 0.0
         for term in terms:
@@ -555,12 +565,36 @@ class MemFSStore:
             return []
         terms = [term for term in re.split(r"\W+", query.lower()) if term]
         compact = "".join(query.lower().split())
+        for group in self.query_alias_groups:
+            normalized = tuple(str(term).strip().lower() for term in group if str(term).strip())
+            if any(term in compact for term in normalized):
+                terms.extend(normalized)
         for size in (2, 3, 4):
             for i in range(0, max(0, len(compact) - size + 1)):
                 chunk = compact[i : i + size]
                 if any("\u4e00" <= ch <= "\u9fff" for ch in chunk):
                     terms.append(chunk)
         return list(dict.fromkeys(terms))
+
+    @staticmethod
+    def _fact_projection_terms(metadata: dict[str, Any]) -> set[str]:
+        """Project explicit structured fact values without changing memory bodies."""
+        terms: set[str] = set()
+        facts = metadata.get("facts")
+        if not isinstance(facts, dict):
+            return terms
+        stack: list[Any] = list(facts.values())
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                stack.extend(value.values())
+            elif isinstance(value, (list, tuple, set)):
+                stack.extend(value)
+            elif value is not None:
+                text = str(value).strip().lower()
+                if text:
+                    terms.add(text)
+        return terms
 
     def _recency_sort_key(self, path: str) -> tuple[int, int]:
         year, month, _ = self._recency_key(path)

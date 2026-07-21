@@ -74,6 +74,27 @@ def test_runtime_turn_capture_returns_exact_emotion_and_state_machine_blocks(tmp
     assert report["soul_mode_layer"]["content"] == "# Work"
 
 
+def test_runtime_turn_capture_uses_latest_router_outcome_for_same_turn_retry(tmp_path: Path) -> None:
+    capture = tmp_path / "latest-turn.json"
+    audit = tmp_path / "audit.jsonl"
+    capture.write_text(
+        '{"source":"exact_host_capture","turn_correlation_id":"turn-retry",'
+        '"state_machine":{"route_metadata":{"hermes_selected_model":"work-model"}}}',
+        encoding="utf-8",
+    )
+    audit.write_text(
+        '{"turn_correlation_id":"turn-retry","request_hash":"first","forwarded_model":"fallback","ok":false}\n'
+        '{"turn_correlation_id":"turn-retry","request_hash":"retry","forwarded_model":"work-model","ok":true}\n',
+        encoding="utf-8",
+    )
+
+    report = collect_runtime_turn_capture(capture, router_audit_path=audit)
+
+    assert report["model_chain"]["correlation_scope"] == "turn_level_latest_outcome"
+    assert report["model_chain"]["router_request_hash"] == "retry"
+    assert report["model_chain"]["actual_forwarded_model"] == "work-model"
+
+
 def test_soul_content_reads_active_anchor_and_all_mode_layers(tmp_path: Path) -> None:
     active = tmp_path / "SOUL.md"
     layers = tmp_path / "layers"

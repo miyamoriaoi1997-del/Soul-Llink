@@ -333,7 +333,9 @@ def _run_webui(args: argparse.Namespace) -> int:
             "emotion": lambda: {"emotion": collect_emotion_state(state_path)},
             "memory_bodies": lambda: {"memory_bodies": collect_memory_bodies(db, limit=args.memory_body_limit)},
             "injection": lambda: {"injection": collect_injection_preview(db, mode=args.mode)},
-            "runtime_capture": lambda: {"runtime_capture": collect_runtime_turn_capture(capture_path)},
+            "runtime_capture": lambda: {"runtime_capture": collect_runtime_turn_capture(
+                capture_path, router_audit_path=router_log,
+            )},
             "soul": lambda: {"soul": collect_soul_content(soul_path, soul_layers)},
         },
         ttl_seconds=max(2.0, args.refresh_seconds / 2),

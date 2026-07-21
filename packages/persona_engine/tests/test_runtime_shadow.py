@@ -22,6 +22,7 @@ def test_runtime_shadow_adapter_returns_candidate_without_active_takeover(tmp_pa
     assert result['platform'] == 'telegram'
     assert result['packet'].mode == 'work'
     assert result['packet'].selected_layers == ['core', 'work']
+    assert result['packet'].shadow_only is True
     assert result['candidate_prompt'].rstrip().endswith('<emotion_modifier>fresh</emotion_modifier>')
     assert result['candidate_prompt'].count('<emotion_modifier>') == 1
     assert result['candidate_prompt_hash'] == result['prompt_hash']
@@ -79,4 +80,5 @@ def test_runtime_shadow_adapter_logs_real_chat_audit_fields_without_raw_text(tmp
     assert record['model_hint'] == 'technical'
     assert record['switch_allowed'] is False
     assert record['switch_reason'] == 'runtime_shadow_observation_only'
+    assert record['packet']['shadow_only'] is True
     assert len(record['user_message_hash']) == 16

@@ -268,6 +268,21 @@ def test_request_hash_does_not_expose_prompt():
     assert "prompt" not in h
 
 
+def test_router_audit_preserves_turn_correlation_and_actual_forwarded_model(cfg, tmp_path):
+    handler = object.__new__(Handler)
+    handler.server = type("Server", (), {"cfg": cfg})()
+    payload = {
+        "model": "persona-auto",
+        "metadata": {"hermes_turn_correlation_id": "turn-public"},
+    }
+
+    handler._audit("request-public", payload, None, "work-model", False, 200, True, 0.0, None)
+
+    row = json.loads(cfg.audit_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["turn_correlation_id"] == "turn-public"
+    assert row["forwarded_model"] == "work-model"
+
+
 def test_health_payload_supports_health_alias_and_reports_models(cfg):
     handler = object.__new__(Handler)
     handler.server = type("Server", (), {"cfg": cfg})()
