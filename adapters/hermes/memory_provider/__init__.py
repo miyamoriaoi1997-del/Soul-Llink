@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -420,7 +421,8 @@ class SoulLinkMemoryProvider(MemoryProvider):
             self._turn_emotion_context = ""
             return
         session_id = str(kwargs.get("session_id") or getattr(self, "_session_id", ""))
-        turn_key = (session_id, int(turn_number), text)
+        host_turn_id = str(kwargs.get("turn_id") or "").strip()
+        turn_key = (session_id, host_turn_id or int(turn_number), text)
         with self._emotion_turn_lock:
             if turn_key == self._last_emotion_turn_key:
                 return
@@ -447,8 +449,10 @@ class SoulLinkMemoryProvider(MemoryProvider):
             mode_layer = self._read_soul_mode_layer(packet.mode)
             state_machine_context = self._format_state_machine_context(packet, mode_layer)
             self._turn_emotion_context = state_machine_context + "\n\n" + emotion_context
+            correlation_provenance = "hermes_turn_id" if host_turn_id else "generated_fallback"
+            correlation_source = host_turn_id or uuid.uuid4().hex
             correlation_id = hashlib.sha256(
-                f"{session_id}\0{int(turn_number)}\0{text}".encode("utf-8")
+                f"{session_id}\0{correlation_source}".encode("utf-8")
             ).hexdigest()[:24]
             route_metadata = dict(packet.route_metadata) if isinstance(packet.route_metadata, dict) else {}
             route_metadata["hermes_turn_correlation_id"] = correlation_id
@@ -465,8 +469,11 @@ class SoulLinkMemoryProvider(MemoryProvider):
                     "source": "exact_host_capture",
                     "captured_at": datetime.now(timezone.utc).isoformat(),
                     "session_id": session_id,
-                    "turn_number": int(turn_number),
+                    "host_turn_count": int(turn_number),
+                    "host_turn_count_semantics": "session_local_non_authoritative",
+                    "host_turn_id": host_turn_id or None,
                     "turn_correlation_id": correlation_id,
+                    "turn_correlation_provenance": correlation_provenance,
                     "emotion_state": state,
                     "emotion_modifier": emotion_modifier,
                     "state_machine": {

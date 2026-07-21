@@ -39,7 +39,7 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         "required_paths:\n"
         "  - agent/context_engine.py\n"
         "verify_commands:\n"
-        "  - [python, -c, \"from pathlib import Path; raise SystemExit(0 if Path('agent/context_engine.py').read_text().strip() == 'applied' else 1)\"]\n",
+        "  - ['{python}', -c, \"from pathlib import Path; raise SystemExit(0 if Path('agent/context_engine.py').read_text().strip() == 'applied' else 1)\"]\n",
         encoding="utf-8",
     )
     return host, target, manifest, tmp_path / "receipt.json"

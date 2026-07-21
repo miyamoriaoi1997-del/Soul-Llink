@@ -42,7 +42,7 @@ def _contains_any(text: str, needles: Sequence[str]) -> bool:
 
 _DONE_MARKERS = ("完成", "完工", "done", "passed", "提交", "committed", "已解决")
 _PAUSE_MARKERS = ("暂停", "先停", "停停", "pause", "blocked", "等待")
-_REVOKE_MARKERS = ("撤销", "回滚", "取消", "不要", "别继续", "revert", "cancel")
+_EXPLICIT_REVOKE_MARKERS = ("撤销", "回滚", "取消", "别继续", "revert", "cancel")
 _DECISION_MARKERS = ("决定", "采用", "不采用", "边界", "必须", "不能", "优先", "注意")
 _COMMITMENT_MARKERS = ("我会", "完成", "提交", "验证", "测试", "will", "done", "passed")
 _MEMORY_MARKERS = ("记住", "偏好", "以后", "用户不喜欢", "preference", "remember")
@@ -286,8 +286,14 @@ class SessionSummaryChain:
         return "\n".join(lines)
 
 
-def summarize_segment(turns: Sequence[DialogueTurn], *, segment_id: int, start_turn: int) -> SessionSegment:
-    current_task = ""
+def summarize_segment(
+    turns: Sequence[DialogueTurn],
+    *,
+    segment_id: int,
+    start_turn: int,
+    prior_task: str = "",
+) -> SessionSegment:
+    current_task = _clean_text(prior_task)
     last_user_intent = ""
     decisions: tuple[str, ...] = ()
     commitments: tuple[str, ...] = ()
@@ -302,6 +308,7 @@ def summarize_segment(turns: Sequence[DialogueTurn], *, segment_id: int, start_t
 
     for offset, turn in enumerate(turns):
         text = _turn_text(turn)
+        previous_task = current_task
         if turn.user:
             last_user_intent = _clean_text(turn.user)
             current_task = _clean_text(turn.user)
@@ -322,9 +329,14 @@ def summarize_segment(turns: Sequence[DialogueTurn], *, segment_id: int, start_t
             unresolved = tuple(item for item in unresolved if item != (current_task or text))
         if _contains_any(text, _PAUSE_MARKERS):
             paused = _append_unique(paused, current_task or text, max_items=6)
-        if _contains_any(text, _REVOKE_MARKERS):
-            revoked = _append_unique(revoked, current_task or text, max_items=6)
-            unresolved = tuple(item for item in unresolved if item != (current_task or text))
+        if _contains_any(text, _EXPLICIT_REVOKE_MARKERS):
+            revoked_task = (
+                previous_task
+                if turn.user and _contains_any(turn.user, _EXPLICIT_REVOKE_MARKERS) and previous_task
+                else current_task or text
+            )
+            revoked = _append_unique(revoked, revoked_task, max_items=6)
+            unresolved = tuple(item for item in unresolved if item != revoked_task)
         if _contains_any(text, ("不能", "必须", "不要", "优先", "边界")):
             constraints = _append_unique(constraints, text, max_items=4)
 
@@ -423,18 +435,20 @@ def build_session_summary_chain(
         return SessionSummaryChain(session_id=session_id, active_dialogue_state=active_dialogue_state, segment_size=segment_size, max_segments=max_segments)
     active_dialogue_state = active_dialogue_state or update_from_turns(turns)
     boundaries = segment_turns(turns, max_turns_per_segment=segment_size, max_tokens_per_segment=max_tokens_per_segment)
-    segments = tuple(
-        summarize_segment(turns[boundary.start_turn : boundary.end_turn], segment_id=boundary.segment_id, start_turn=boundary.start_turn)
-        for boundary in boundaries
-    )
-    if max_segments > 0 and len(segments) > max_segments:
-        overflow_turns = segments[-max_segments].start_turn
-        segments = tuple(
-            summarize_segment(turns[segment.start_turn + 1 : segment.end_turn], segment_id=segment.segment_id, start_turn=segment.start_turn + 1)
-            if index == 0 and overflow_turns > 0 and segment.start_turn < segment.end_turn
-            else segment
-            for index, segment in enumerate(segments[-max_segments:])
+    built_segments: list[SessionSegment] = []
+    prior_task = ""
+    for boundary in boundaries:
+        segment = summarize_segment(
+            turns[boundary.start_turn : boundary.end_turn],
+            segment_id=boundary.segment_id,
+            start_turn=boundary.start_turn,
+            prior_task=prior_task,
         )
+        built_segments.append(segment)
+        prior_task = segment.current_task or prior_task
+    segments = tuple(built_segments)
+    if max_segments > 0 and len(segments) > max_segments:
+        segments = segments[-max_segments:]
     return _chain_from_segments(
         segments,
         session_id=session_id,

@@ -5,6 +5,7 @@ required_paths:
   - agent/agent_init.py
   - agent/context_engine.py
   - agent/conversation_compression.py
+  - agent/turn_context.py
   - hermes_cli/plugins_cmd.py
   - plugins/context_engine/pcltm-context/__init__.py
   - tests/hermes_cli/test_plugins_cmd.py

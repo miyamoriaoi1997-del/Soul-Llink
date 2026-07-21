@@ -236,6 +236,40 @@ def test_same_turn_start_is_idempotent_but_next_turn_updates(provider_factory, m
     assert [x[0]["content"] for x in FakeEmotionManager.updates] == ["同一消息", "下一消息"]
 
 
+def test_capture_uses_unique_host_turn_identity_not_resettable_host_counter(provider_factory, monkeypatch):
+    provider = provider_factory()
+    FakeEmotionManager.updates = []
+    monkeypatch.setattr(provider, "_emotion_manager_factory", FakeEmotionManager)
+
+    provider.on_turn_start(3, "压缩前", session_id="s1", turn_id="s1:task-a:turn-a")
+    first = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+    provider.on_turn_start(2, "压缩后", session_id="s1", turn_id="s1:task-b:turn-b")
+    second = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+
+    assert "turn_number" not in first
+    assert "turn_number" not in second
+    assert first["host_turn_count"] == 3
+    assert second["host_turn_count"] == 2
+    assert second["host_turn_count_semantics"] == "session_local_non_authoritative"
+    assert first["host_turn_id"] == "s1:task-a:turn-a"
+    assert second["host_turn_id"] == "s1:task-b:turn-b"
+    assert first["turn_correlation_id"] != second["turn_correlation_id"]
+    assert second["turn_correlation_provenance"] == "hermes_turn_id"
+
+
+def test_capture_marks_generated_turn_identity_as_degraded(provider_factory, monkeypatch):
+    provider = provider_factory()
+    FakeEmotionManager.updates = []
+    monkeypatch.setattr(provider, "_emotion_manager_factory", FakeEmotionManager)
+
+    provider.on_turn_start(1, "旧宿主", session_id="s1")
+    capture = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+
+    assert capture["host_turn_id"] is None
+    assert capture["turn_correlation_provenance"] == "generated_fallback"
+    assert capture["turn_correlation_id"]
+
+
 class FailedEmotionManager(FakeEmotionManager):
     def update_emotion_state(self, messages):
         self.updates.append(messages)

@@ -14,6 +14,23 @@ index 180e1d971..a16db7e11 100644
          # Resolve context_length for plugin engines — mirrors switch_model() path
          from agent.model_metadata import get_model_context_length
          _plugin_ctx_len = get_model_context_length(
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -589,7 +589,12 @@ def build_turn_context(
+     # Notify memory providers of the new turn (BEFORE prefetch_all).
+     if agent._memory_manager:
+         try:
+             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
++            agent._memory_manager.on_turn_start(
++                agent._user_turn_count,
++                _turn_msg,
++                session_id=agent.session_id,
++                turn_id=turn_id,
++            )
+         except Exception:
+             pass
 diff --git a/agent/context_engine.py b/agent/context_engine.py
 index 79c31fb48..ef9b705a9 100644
 --- a/agent/context_engine.py

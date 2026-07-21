@@ -112,7 +112,56 @@ def test_bounded_chain_drops_old_segments_but_keeps_latest_raw_derived_state():
     chain = build_session_summary_chain(turns, segment_size=2, max_segments=3)
 
     assert len(chain.segments) == 3
-    assert chain.segments[0].start_turn == 5
+    assert chain.segments[0].start_turn == 4
     assert chain.segments[-1].end_turn == 10
     assert chain.source_turn_count == 10
     assert chain.current_task == "任务 9"
+
+
+def test_scope_correction_revokes_prior_extension_across_segments_and_resume():
+    turns = [
+        DialogueTurn(user="实现现有 JSONL 审计器。", assistant="我会按现有契约实现。"),
+        DialogueTurn(user="再新增一个批处理扩展。", assistant="我会增加批处理扩展。"),
+        DialogueTurn(
+            user="取消批处理扩展，只修现有审计器，不要增加新功能。",
+            assistant="我会删除扩展并回到现有审计器范围。",
+        ),
+        DialogueTurn(user="继续。", assistant="继续修现有审计器。"),
+    ]
+
+    chain = build_session_summary_chain(turns, segment_size=2, max_segments=4)
+    rendered = chain.render()
+
+    assert "再新增一个批处理扩展。" in chain.revoked_index
+    assert "再新增一个批处理扩展。" not in chain.unresolved_index
+    assert chain.current_task == "取消批处理扩展，只修现有审计器，不要增加新功能。"
+    assert "只修现有审计器，不要增加新功能" in rendered
+
+
+def test_negative_constraint_is_not_misclassified_as_revoked_work():
+    turns = [
+        DialogueTurn(user="实现现有审计器。", assistant="继续实现。"),
+        DialogueTurn(user="继续，但不要增加新功能。", assistant="只处理现有范围。"),
+    ]
+
+    chain = build_session_summary_chain(turns, segment_size=1)
+
+    assert chain.revoked_index == ()
+    assert chain.segments[-1].revoked_items == ()
+    assert "不要增加新功能" in " ".join(chain.segments[-1].local_constraints)
+
+
+def test_bounded_chain_retains_revoke_event_at_first_kept_segment():
+    turns = [
+        DialogueTurn(user="实现现有审计器。", assistant="开始实现。"),
+        DialogueTurn(user="新增批处理扩展。", assistant="开始扩展。"),
+        DialogueTurn(user="取消批处理扩展，只修现有审计器。", assistant="删除扩展。"),
+        DialogueTurn(user="继续。", assistant="继续现有审计器。"),
+    ]
+
+    chain = build_session_summary_chain(turns, segment_size=1, max_segments=2)
+
+    assert len(chain.segments) == 2
+    assert chain.segments[0].start_turn == 2
+    assert "新增批处理扩展。" in chain.revoked_index
+    assert "新增批处理扩展。" not in chain.unresolved_index

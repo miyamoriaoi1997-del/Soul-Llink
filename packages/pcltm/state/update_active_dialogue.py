@@ -70,6 +70,8 @@ _COMMITMENT_MARKERS = (
     "I will",
 )
 
+_SCOPE_CORRECTION_MARKERS = ("撤销", "回滚", "取消", "不要", "别继续", "revert", "cancel")
+
 
 def _norm(text: str) -> str:
     return " ".join(str(text or "").strip().split())
@@ -163,13 +165,16 @@ def update_active_dialogue(
 
     continuation = is_continuation_request(user_text)
     interruption = is_side_interruption(user_text)
+    scope_correction = continuation and any(
+        marker.lower() in user_text.lower() for marker in _SCOPE_CORRECTION_MARKERS
+    )
 
     conversation_goal = state.conversation_goal
     current_task = state.current_task
     open_threads = state.open_threads
 
     if user_text:
-        if continuation and current_task:
+        if continuation and current_task and not scope_correction:
             # Keep the active task anchored; the weak phrase points back to it.
             pass
         elif interruption and current_task:
