@@ -307,6 +307,7 @@ def _run_webui(args: argparse.Namespace) -> int:
         collect_runtime_turn_capture,
         collect_soul_content,
     )
+    from .monitoring.memory_library import collect_memory_library_stats
     from .monitoring.server import create_server
     from .monitoring.snapshot import SnapshotService
 
@@ -332,6 +333,7 @@ def _run_webui(args: argparse.Namespace) -> int:
             "router": lambda: {"router": router(), "issues": router().get("issues", [])},
             "emotion": lambda: {"emotion": collect_emotion_state(state_path)},
             "memory_bodies": lambda: {"memory_bodies": collect_memory_bodies(db, limit=args.memory_body_limit)},
+            "memory_library": lambda: {"memory_library_stats": collect_memory_library_stats(db)},
             "injection": lambda: {"injection": collect_injection_preview(db, mode=args.mode)},
             "runtime_capture": lambda: {"runtime_capture": collect_runtime_turn_capture(
                 capture_path, router_audit_path=router_log,

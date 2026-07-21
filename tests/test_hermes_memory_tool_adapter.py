@@ -17,12 +17,13 @@ def _load_provider_class():
     return module.SoulLinkMemoryProvider
 
 
-def test_hermes_provider_binds_shared_pcltm_memory_tools(monkeypatch) -> None:
+def test_hermes_provider_binds_shared_pcltm_memory_tools(monkeypatch, tmp_path) -> None:
     calls = []
     monkeypatch.setattr(memory_adapter, "search_archival_memories", lambda **kwargs: calls.append(("search", kwargs)) or [])
     monkeypatch.setattr(memory_adapter, "open_archival_memory", lambda **kwargs: calls.append(("open", kwargs)) or {"memory_id": "m1"})
     monkeypatch.setattr(memory_adapter, "sync_memory_tool_write", lambda **kwargs: calls.append(("remember", kwargs)) or True)
     monkeypatch.setattr(transcript_search, "search_exact_evidence", lambda store, query, limit: calls.append(("exact", {"query": query, "limit": limit})) or [])
+    monkeypatch.setenv("HERMES_PCLTM_DB", str(tmp_path / "pcltm.db"))
     provider = _load_provider_class()()
 
     assert [schema["name"] for schema in provider.get_tool_schemas()] == [

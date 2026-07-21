@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -194,6 +195,8 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._emotion_turn_lock = threading.Lock()
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
+        self._turn_memory_context = ""
+        self._turn_memory_selection_observation: Dict[str, Any] = {}
         self._turn_route_overrides: Dict[str, Any] = {}
 
     @property
@@ -323,6 +326,90 @@ class SoulLinkMemoryProvider(MemoryProvider):
             + "\n</soullink_turn_state>"
         )
 
+    @staticmethod
+    def _selected_records(memory_context: str) -> List[Dict[str, Any]]:
+        match = re.search(
+            r"【selected_records】\s*(.*?)(?=\n【[^\n]+】|</pcltm_context>|</memory-context>|\Z)",
+            memory_context,
+            re.DOTALL,
+        )
+        if not match:
+            return []
+        records: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        for raw_line in match.group(1).splitlines():
+            item = re.match(r"^- \[([^\]]+)\]\s*(.*)$", raw_line.strip())
+            if item:
+                current = {"bucket": item.group(1), "content": item.group(2).strip()}
+                records.append(current)
+            elif current and raw_line.strip():
+                current["content"] += "\n" + raw_line.strip()
+        for ordinal, record in enumerate(records, 1):
+            record["ordinal"] = ordinal
+            record["content_sha256"] = hashlib.sha256(record["content"].encode("utf-8")).hexdigest()
+        return records
+
+
+    @staticmethod
+    def _message_text(message: Dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return ""
+
+
+    def on_before_model_forward(self, api_messages: List[Dict[str, Any]], **kwargs) -> None:
+        """Observe selected memories after the exact injected context reaches outbound."""
+        if not isinstance(self._runtime_capture_payload, dict):
+            return
+        memory_context = self._turn_memory_context
+        forwarded = bool(memory_context) and any(
+            memory_context in self._message_text(message)
+            for message in api_messages
+            if isinstance(message, dict)
+        )
+        if forwarded:
+            records = self._selected_records(memory_context)
+            observed = self._turn_memory_selection_observation
+            observation_matches = (
+                isinstance(observed, dict)
+                and observed.get("status") == "captured"
+                and observed.get("context_sha256") == hashlib.sha256(memory_context.encode("utf-8")).hexdigest()
+            )
+            self._runtime_capture_payload["forwarded_model_boundary"] = {
+                "status": "captured",
+                "source": "final_model_forward",
+            }
+            self._runtime_capture_payload["memory_selection"] = {
+                "status": "captured",
+                "selected_count": len(records),
+                "selected_records": records,
+                "candidate_records": observed.get("candidate_records") if observation_matches else {"status": "unavailable"},
+                "judgment_workset": observed.get("judgment_workset") if observation_matches else {"status": "unavailable"},
+                "governor_result": observed.get("governor_result") if observation_matches else {"status": "unavailable"},
+                "context_sha256": hashlib.sha256(memory_context.encode("utf-8")).hexdigest(),
+            }
+        else:
+            self._runtime_capture_payload["forwarded_model_boundary"] = {
+                "status": "unavailable",
+                "source": "final_model_forward",
+            }
+            self._runtime_capture_payload["memory_selection"] = {
+                "status": "unavailable",
+                "reason": "injected_memory_context_not_present_in_final_messages",
+                "selected_records": [],
+                "candidate_records": {"status": "unavailable"},
+                "judgment_workset": {"status": "unavailable"},
+            }
+        self._write_runtime_capture(self._runtime_capture_payload)
+
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Update emotion once for the real user turn, before host prefetch."""
         from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -355,6 +442,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 platform=getattr(self, "_platform", "") or "cli",
                 session_id=session_id,
                 turn_number=int(turn_number),
+                runtime_authority="active",
             )
             mode_layer = self._read_soul_mode_layer(packet.mode)
             state_machine_context = self._format_state_machine_context(packet, mode_layer)
@@ -454,6 +542,13 @@ class SoulLinkMemoryProvider(MemoryProvider):
 
         return PCLTMContextPort(loader=load_prompt_context).prefetch(query, active_mode=active_mode)
 
+    def _load_memory_selection_observation(self) -> Dict[str, Any]:
+        _ensure_paths()
+        from pcltm.memory_adapter import last_memory_selection_observation
+
+        return last_memory_selection_observation()
+
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         try:
             memory_context = self._load_memory_context(query=query, active_mode=self._active_mode)
@@ -469,6 +564,14 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 self._write_runtime_capture(self._runtime_capture_payload)
             raise
         self._pcltm_mode = self._active_mode
+        self._turn_memory_context = memory_context
+        observed = self._load_memory_selection_observation()
+        expected_sha = hashlib.sha256(memory_context.encode("utf-8")).hexdigest()
+        self._turn_memory_selection_observation = (
+            observed
+            if isinstance(observed, dict) and observed.get("context_sha256") == expected_sha
+            else {}
+        )
         self._mode_sync = "consistent" if self._active_mode in {"daily", "work", "sex"} else "fallback_hint"
         if isinstance(self._runtime_capture_payload, dict):
             self._runtime_capture_payload["mode_sync"] = {

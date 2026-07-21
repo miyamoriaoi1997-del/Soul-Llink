@@ -216,6 +216,30 @@ def test_selected_model_bypasses_model_switch_cooldown():
     assert selector._turns_on_current_model == 0
 
 
+def test_final_active_mode_overrides_stale_context_router_model():
+    selector = ModelSelector(
+        config_dict={
+            'default_model': 'default-model',
+            'mode_overrides': {
+                'work': 'work-model',
+                'daily': 'daily-model',
+                'active_layer': 'private-mode-model',
+            },
+            'platform_overrides': {},
+            'emotion_overrides': {},
+            'model_switch_cooldown': 3,
+        }
+    )
+
+    routed = selector.select(
+        mode='work',
+        context_result=SimpleNamespace(selected_model='daily-model'),
+    )
+
+    assert routed == 'work-model'
+    assert selector._last_model == 'work-model'
+
+
 def test_production_router_config_maps_sex_model_to_active_layer(tmp_path):
     config_path = tmp_path / 'model-router-example.yaml'
     config_path.write_text(

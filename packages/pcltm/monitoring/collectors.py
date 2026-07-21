@@ -201,6 +201,9 @@ def collect_context_budget(
     effective_budget = (
         _positive_integer(telemetry, "budget_tokens") if exact_host_usage else budget_tokens
     ) or budget_tokens
+    effective_model_context = (
+        _positive_integer(telemetry, "context_length") if exact_host_usage else 0
+    ) or _positive_integer(model, "context_length")
     usage_ratio = (
         prompt_tokens / effective_budget
         if exact_host_usage and effective_budget and prompt_tokens is not None
@@ -211,11 +214,11 @@ def collect_context_budget(
     capsules = telemetry.get("capsules") if isinstance(telemetry.get("capsules"), Mapping) else {}
     source = str(telemetry.get("source")) if exact_host_usage else "config+last_telemetry" if telemetry_usable else "config"
     report = {
-        "model_context_tokens": _positive_integer(model, "context_length"),
-        "budget_tokens": budget_tokens,
+        "model_context_tokens": effective_model_context,
+        "budget_tokens": effective_budget,
         "trigger_threshold": compression.get("threshold"),
-        "engine": str(context.get("engine") or ""),
-        "budget_buckets": _budget_buckets(budget_tokens),
+        "engine": str(telemetry.get("engine") or context.get("engine") or ""),
+        "budget_buckets": _budget_buckets(effective_budget),
         "within_budget": (
             prompt_tokens <= effective_budget
             if exact_host_usage and prompt_tokens is not None and effective_budget
@@ -269,7 +272,7 @@ def collect_runtime_memory(
     memfs = Path(memfs_root)
     issues: list[IssueDict] = []
     counts = {
-        "events": 0, "event_fts": 0, "summaries": 0,
+        "events": 0, "event_fts": 0, "event_chunks": 0, "summaries": 0,
         "summary_fts": 0, "memory_records": 0,
         "approved_memory_records": 0, "pending_memory_records": 0,
     }
@@ -306,6 +309,7 @@ def collect_runtime_memory(
             counts.update({
                 "events": count("events"),
                 "event_fts": count("event_fts"),
+                "event_chunks": count("event_chunks"),
                 "summaries": count("summary_nodes"),
                 "summary_fts": count("summary_fts"),
                 "memory_records": count("memory_records"),
@@ -353,6 +357,17 @@ def collect_runtime_memory(
     memory = sanitize_source("memory", {
         "event_count": events, "summary_count": summaries,
         "record_count": counts["memory_records"],
+        "derived_memory_count": counts["memory_records"],
+        "persistent_memory_total": events + counts["memory_records"],
+        "evidence_chunk_count": counts["event_chunks"],
+        "provenance": {
+            "source": "stable_sqlite_snapshot",
+            "database": "pcltm_runtime_db",
+            "counting_rule": "persistent_memory_total = events + memory_records; event_chunks excluded",
+            "event_table": "events",
+            "derived_memory_table": "memory_records",
+            "evidence_table": "event_chunks",
+        },
         "approved_count": counts["approved_memory_records"],
         "pending_count": counts["pending_memory_records"],
         "fts_count": event_fts + summary_fts,

@@ -115,6 +115,7 @@ class StateOrchestrator:
             candidates = [Path(config_path)]
         else:
             candidates = [
+                self.base_dir.parent / "model_router" / "config.yaml",
                 (Path.home() / "soul-link" / "config" / "model-router.example.yaml"),
                 self.base_dir / "config" / "model-router.example.yaml",
                 self.base_dir / ".." / "model_router" / "config.example.yaml",
@@ -172,7 +173,9 @@ class StateOrchestrator:
         platform: str = "cli",
         session_id: str = "",
         turn_number: int | None = None,
+        runtime_authority: str = "shadow",
     ) -> StatePacket:
+        authority = "active" if runtime_authority == "active" else "shadow"
         packet, memory_notes, selected_layers = self._analyze(
             user_message=user_message,
             recent_messages=recent_messages,
@@ -180,13 +183,13 @@ class StateOrchestrator:
             emotion_modifier=emotion_modifier,
             previous_mode=previous_mode,
             platform=platform,
-            shadow_only=True,
+            shadow_only=authority != "active",
         )
         composition = self.composer.compose(
             selected_layers=selected_layers,
             emotion_modifier=emotion_modifier,
             memory_notes=memory_notes,
-            shadow_only=True,
+            shadow_only=authority != "active",
         )
         packet.prompt_hash = composition.prompt_hash
         packet.selected_layers = composition.selected_layers
@@ -194,6 +197,7 @@ class StateOrchestrator:
             "warnings": composition.warnings,
             "session_id": session_id,
             "turn_number": turn_number,
+            "runtime_authority": authority,
         })
         return packet
 

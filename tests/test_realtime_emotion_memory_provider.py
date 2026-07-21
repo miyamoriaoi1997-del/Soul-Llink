@@ -166,6 +166,7 @@ def test_turn_start_injects_state_machine_selected_soul_and_writes_exact_capture
     assert capture["turn_correlation_id"]
     overrides = provider.request_overrides()
     assert overrides["extra_body"]["metadata"]["hermes_turn_correlation_id"] == capture["turn_correlation_id"]
+    assert FakeStateOrchestrator.calls[-1]["runtime_authority"] == "active"
 
 
 def test_request_overrides_expose_only_current_state_machine_route(provider_factory):
@@ -363,3 +364,87 @@ def test_sync_turn_ingests_canonical_hermes_session_messages(tmp_path, monkeypat
             "实时回答",
         ]
         assert conn.execute("SELECT count(*) FROM events WHERE role='lifecycle' AND inject_policy='retrieve_only'").fetchone()[0] == 1
+
+
+def test_final_forward_capture_exposes_only_records_actually_present_in_outbound(provider_factory, monkeypatch):
+    provider = provider_factory()
+    monkeypatch.setattr(provider, "_emotion_manager_factory", FakeEmotionManager)
+    memory = (
+        "<pcltm_context>\n"
+        "【governed_memory_view】\n"
+        "【selected_records】\n"
+        "- [user] first governed memory\n"
+        "- [runtime_boundary] second governed memory\n"
+        "</pcltm_context>"
+    )
+    monkeypatch.setattr(provider, "_load_memory_context", lambda **kwargs: memory)
+
+    provider.on_turn_start(5, "检查接口", session_id="s1")
+    injected = provider.prefetch("检查接口", session_id="s1")
+    messages = [{"role": "user", "content": f"request\n\n{injected}"}]
+    before = json.loads(json.dumps(messages))
+
+    provider.on_before_model_forward(messages)
+    capture = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+
+    assert messages == before
+    assert capture["forwarded_model_boundary"] == {
+        "status": "captured", "source": "final_model_forward",
+    }
+    assert capture["memory_selection"]["selected_count"] == 2
+    assert capture["memory_selection"]["candidate_records"] == {"status": "unavailable"}
+    assert capture["memory_selection"]["judgment_workset"] == {"status": "unavailable"}
+    assert capture["memory_selection"]["selected_records"][0]["bucket"] == "user"
+    assert capture["memory_selection"]["selected_records"][0]["content"] == "first governed memory"
+    assert len(capture["memory_selection"]["selected_records"][0]["content_sha256"]) == 64
+
+
+def test_final_forward_capture_merges_same_prefetch_candidate_and_judgment_observation(provider_factory, monkeypatch):
+    provider = provider_factory()
+    monkeypatch.setattr(provider, "_emotion_manager_factory", FakeEmotionManager)
+    memory = "<pcltm_context>\n【selected_records】\n- [user] selected\n</pcltm_context>"
+    observation = {
+        "status": "captured",
+        "context_sha256": __import__("hashlib").sha256(memory.encode("utf-8")).hexdigest(),
+        "candidate_records": {"status": "captured", "records": [{"record_id": 41}]},
+        "judgment_workset": {
+            "status": "captured",
+            "records": [{"record_id": 41, "selection_decision": "selected", "budget_decision": "admitted"}],
+        },
+        "governor_result": {"within_budget": True, "omitted_chars": 0},
+    }
+    monkeypatch.setattr(provider, "_load_memory_context", lambda **kwargs: memory)
+    monkeypatch.setattr(provider, "_load_memory_selection_observation", lambda: observation)
+
+    provider.on_turn_start(9, "检查完整漏斗", session_id="s1")
+    injected = provider.prefetch("检查完整漏斗", session_id="s1")
+    messages = [{"role": "user", "content": injected}]
+    before = json.loads(json.dumps(messages))
+    provider.on_before_model_forward(messages)
+    capture = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+
+    assert messages == before
+    assert capture["memory_selection"]["candidate_records"] == observation["candidate_records"]
+    assert capture["memory_selection"]["judgment_workset"] == observation["judgment_workset"]
+    assert capture["memory_selection"]["governor_result"] == observation["governor_result"]
+
+
+def test_final_forward_capture_fails_closed_when_injected_context_was_removed(provider_factory, monkeypatch):
+    provider = provider_factory()
+    monkeypatch.setattr(provider, "_emotion_manager_factory", FakeEmotionManager)
+    memory = "<pcltm_context>\n【selected_records】\n- [user] selected\n</pcltm_context>"
+    monkeypatch.setattr(provider, "_load_memory_context", lambda **kwargs: memory)
+
+    provider.on_turn_start(6, "检查缺失", session_id="s1")
+    provider.prefetch("检查缺失", session_id="s1")
+    provider.on_before_model_forward([{"role": "user", "content": "context removed"}])
+    capture = json.loads(provider._runtime_capture_path.read_text(encoding="utf-8"))
+
+    assert capture["forwarded_model_boundary"]["status"] == "unavailable"
+    assert capture["memory_selection"] == {
+        "status": "unavailable",
+        "reason": "injected_memory_context_not_present_in_final_messages",
+        "selected_records": [],
+        "candidate_records": {"status": "unavailable"},
+        "judgment_workset": {"status": "unavailable"},
+    }

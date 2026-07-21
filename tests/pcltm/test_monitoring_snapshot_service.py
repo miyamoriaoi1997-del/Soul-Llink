@@ -46,11 +46,12 @@ def test_snapshot_service_keeps_other_sections_when_collector_fails() -> None:
     assert result["ok"] is False
 
 
-def test_snapshot_service_exposes_runtime_capture_and_soul_sections() -> None:
+def test_snapshot_service_exposes_runtime_capture_soul_and_memory_library_sections() -> None:
     service = SnapshotService(
         {
             "capture": lambda: {"runtime_capture": {"source": "exact_host_capture"}},
             "soul": lambda: {"soul": {"source": "runtime_soul_files"}},
+            "library": lambda: {"memory_library_stats": {"persistent_memory_total": 7}},
         },
         ttl_seconds=0,
     )
@@ -59,3 +60,4 @@ def test_snapshot_service_exposes_runtime_capture_and_soul_sections() -> None:
 
     assert result["runtime_capture"]["source"] == "exact_host_capture"
     assert result["soul"]["source"] == "runtime_soul_files"
+    assert result["memory_library_stats"]["persistent_memory_total"] == 7

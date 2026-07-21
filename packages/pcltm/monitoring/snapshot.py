@@ -28,7 +28,7 @@ class SnapshotService:
             result: dict[str, Any] = {
                 "schema_version": 2,
                 "runtime": {}, "context": {}, "memory": {}, "persona": {}, "router": {},
-                "emotion": {}, "memory_bodies": {}, "injection": {},
+                "emotion": {}, "memory_bodies": {}, "memory_library_stats": {}, "injection": {},
                 "runtime_capture": {}, "soul": {},
                 "issues": [],
             }
@@ -38,7 +38,7 @@ class SnapshotService:
                     if isinstance(payload, dict):
                         for section in (
                             "runtime", "context", "memory", "persona", "router",
-                            "emotion", "memory_bodies", "injection",
+                            "emotion", "memory_bodies", "memory_library_stats", "injection",
                             "runtime_capture", "soul",
                         ):
                             if isinstance(payload.get(section), dict):

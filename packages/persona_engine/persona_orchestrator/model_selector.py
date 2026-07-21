@@ -108,20 +108,29 @@ class ModelSelector:
             self._turns_on_current_model = 0
             return candidate
 
+        # The transition manager owns the final active mode. Context-router
+        # selection happens earlier and may still describe a pre-transition
+        # candidate, so a configured final-mode override wins on disagreement.
+        mode_overrides = self.config.get("mode_overrides", {})
+        mode_key = self._build_mode_key(mode, submode)
+        final_mode_model = mode_overrides.get(mode_key)
+        selected = getattr(context_result, "selected_model", None) if context_result else None
+        if final_mode_model and selected != final_mode_model:
+            self._last_model = final_mode_model
+            self._turns_on_current_model = 0
+            return final_mode_model
+
         # Priority 1: Context router already selected a model via adapter.
         # This is the state-machine authority path and must not be blocked by
         # cooldown, otherwise the selector can lag behind a real mode switch.
-        selected = getattr(context_result, "selected_model", None) if context_result else None
         if selected:
             self._last_model = selected
             self._turns_on_current_model = 0
             return selected
 
         # Priority 2: Mode override
-        mode_overrides = self.config.get("mode_overrides", {})
-        mode_key = self._build_mode_key(mode, submode)
-        if mode_key in mode_overrides and mode_overrides[mode_key]:
-            candidate = mode_overrides[mode_key]
+        if final_mode_model:
+            candidate = final_mode_model
             return self._apply_cooldown(candidate)
 
         # Priority 3: Emotion intensity override

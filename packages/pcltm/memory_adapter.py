@@ -61,6 +61,7 @@ DEFAULT_TOP_K = {"USER.md": 10, "MEMORY.md": 8}
 # Module-level state for post-response citation tracking
 _last_injected_ids: list[int] = []
 _last_live_context_telemetry: dict[str, Any] = {}
+_last_memory_selection_observation: dict[str, Any] = {}
 MAX_ENTRY_CHARS = {"USER.md": 260, "MEMORY.md": 320}
 LIVE_CONTEXT_MIN_TOTAL_CHARS = 900
 LIVE_CONTEXT_MAX_TOTAL_CHARS = 3600
@@ -245,6 +246,11 @@ def _live_context_policy(memory_limit: int, user_limit: int) -> ContextBudgetPol
 def last_live_context_telemetry() -> dict[str, Any]:
     """Return telemetry from the most recent governed prompt-context render."""
     return dict(_last_live_context_telemetry)
+
+
+def last_memory_selection_observation() -> dict[str, Any]:
+    """Return a detached read-only observation of the latest real selection pass."""
+    return json.loads(json.dumps(_last_memory_selection_observation)) if _last_memory_selection_observation else {}
 
 
 def _compact_entries(entries: list[str], limit: int) -> tuple[str, int]:
@@ -1086,6 +1092,8 @@ def _select_entry_rows(
     rows: Iterable[sqlite3.Row],
     mode: str | None,
     policy: ViewPolicy = DEFAULT_VIEW_POLICY,
+    *,
+    decisions: dict[int, str] | None = None,
 ) -> list[tuple[str, sqlite3.Row]]:
     """Select prompt entries while preserving their source DB rows.
 
@@ -1095,7 +1103,10 @@ def _select_entry_rows(
     the source row attached lets context snapshots explain exactly *which* PCLTM
     records won recall and why, without changing prompt text semantics.
     """
+    materialized = list(rows)
     top_k = DEFAULT_TOP_K.get(target_file, 8)
+    if decisions is not None:
+        decisions.update({int(row["record_id"]): "top_k_excluded" for row in materialized})
     if top_k <= 0:
         return []
     quotas = _bucket_quotas(target_file, mode, policy)
@@ -1105,20 +1116,33 @@ def _select_entry_rows(
     deferred: list[sqlite3.Row] = []
 
     def add_row(row: sqlite3.Row, *, ignore_quota: bool = False) -> bool:
+        record_id = int(row["record_id"])
         if not _mode_allowed(row, target_file, mode, policy):
+            if decisions is not None and decisions.get(record_id) != "selected":
+                decisions[record_id] = "mode_excluded"
             return False
         bucket = _bucket_for(row, target_file, policy)
         if not ignore_quota and bucket_counts.get(bucket, 0) >= quotas.get(bucket, 0):
+            if decisions is not None and decisions.get(record_id) != "selected":
+                decisions[record_id] = "quota_excluded"
             return False
         entry = _fit_entry(row["content"], target_file)
-        if entry is None or entry in selected_texts:
+        if entry is None:
+            if decisions is not None and decisions.get(record_id) != "selected":
+                decisions[record_id] = "invalid_entry"
+            return False
+        if entry in selected_texts:
+            if decisions is not None and decisions.get(record_id) != "selected":
+                decisions[record_id] = "duplicate_excluded"
             return False
         selected.append((entry, row))
         selected_texts.add(entry)
         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        if decisions is not None:
+            decisions[record_id] = "selected"
         return True
 
-    for row in rows:
+    for row in materialized:
         if len(selected) >= top_k:
             break
         if not _mode_allowed(row, target_file, mode, policy):
@@ -1919,6 +1943,8 @@ def load_prompt_context(
     budgets = {"USER.md": user_limit, "MEMORY.md": memory_limit}
     recall_intent = classify_recall_intent(query)
     selected: dict[str, list[str]] = {"SYSTEM.md": _load_system_core_entries(mode=mode, query=query)}
+    candidate_records: list[dict[str, Any]] = []
+    judgment_records: list[dict[str, Any]] = []
     all_injected_ids: list[int] = []
     for target_file in ("USER.md", "MEMORY.md"):
         eligible_rows = _rows_allowed_by_recall_intent(
@@ -1932,9 +1958,36 @@ def load_prompt_context(
             target_file, eligible_rows, mode, query=query,
             policy=active_policy, use_default_semantic_index=True,
         )
-        entries, record_ids = _select_entries(target_file, rows, mode, active_policy)
+        decisions: dict[int, str] = {}
+        selected_rows = _select_entry_rows(target_file, rows, mode, active_policy, decisions=decisions)
+        entries = [entry for entry, _row in selected_rows]
+        record_ids = [int(row["record_id"]) for _entry, row in selected_rows]
         all_injected_ids.extend(record_ids)
-        content, _ = _compact_entries(entries, budgets[target_file])
+        content, _omitted_count = _compact_entries(entries, budgets[target_file])
+        admitted_entries = {entry for entry in content.split(ENTRY_DELIMITER) if entry in entries}
+        selected_entry_by_id = {int(row["record_id"]): entry for entry, row in selected_rows}
+        for rank, row in enumerate(rows, 1):
+            record_id = int(row["record_id"])
+            record = {
+                "record_id": record_id,
+                "target_file": target_file,
+                "bucket": _bucket_for(row, target_file, active_policy),
+                "rank": rank,
+                "content": redact_secrets(str(row["content"] or "")),
+                "content_sha256": hashlib.sha256(str(row["content"] or "").encode("utf-8")).hexdigest(),
+            }
+            candidate_records.append(record)
+            selection_decision = decisions.get(record_id, "top_k_excluded")
+            selected_entry = selected_entry_by_id.get(record_id)
+            judgment_records.append({
+                **record,
+                "selection_decision": selection_decision,
+                "budget_decision": (
+                    "admitted" if selected_entry in admitted_entries
+                    else "budget_omitted" if selection_decision == "selected"
+                    else "not_applicable"
+                ),
+            })
         selected[target_file] = [e.strip() for e in content.split(ENTRY_DELIMITER) if e.strip()]
     # Update retrieval stats for scoring feedback loop
     _update_retrieval_stats(all_injected_ids)
@@ -1950,8 +2003,24 @@ def load_prompt_context(
         recall_intent=recall_intent,
         outer_tag="pcltm_context",
     )
-    global _last_live_context_telemetry
+    global _last_live_context_telemetry, _last_memory_selection_observation
     _last_live_context_telemetry = {**governed.telemetry, "recall_intent": recall_intent.to_dict()}
+    _last_memory_selection_observation = {
+        "status": "captured",
+        "source": "pcltm_selection_pass",
+        "context_sha256": hashlib.sha256(governed.rendered.encode("utf-8")).hexdigest(),
+        "candidate_records": {
+            "status": "captured", "count": len(candidate_records), "records": candidate_records,
+        },
+        "judgment_workset": {
+            "status": "captured", "count": len(judgment_records), "records": judgment_records,
+        },
+        "governor_result": {
+            "within_budget": governed.telemetry.get("within_budget") is True,
+            "omitted_chars": int(governed.telemetry.get("omitted_chars") or 0),
+            "actions": list(governed.telemetry.get("actions") or []),
+        },
+    }
     return governed.rendered
 
 
