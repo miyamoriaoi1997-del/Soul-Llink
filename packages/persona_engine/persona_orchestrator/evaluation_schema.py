@@ -120,7 +120,6 @@ class SequenceTurnCase:
     expected_switch_turn: Optional[int]  # When mode should change
     max_allowed_delay: Optional[int]  # Maximum stale hold turns
     expected_selected_layer: Optional[str]
-    expected_selected_model: Optional[str]
 
     # Classification
     evidence_class: Optional[str]
@@ -147,7 +146,6 @@ class SequenceTurnCase:
             expected_switch_turn=data.get('expected_switch_turn'),
             max_allowed_delay=data.get('max_allowed_delay'),
             expected_selected_layer=data.get('expected_selected_layer'),
-            expected_selected_model=data.get('expected_selected_model'),
             evidence_class=data.get('evidence_class'),
             risk_class=risk_class,
         )

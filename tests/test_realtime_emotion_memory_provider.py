@@ -187,8 +187,6 @@ def test_request_overrides_expose_only_current_state_machine_route(provider_fact
         "extra_body": {
             "metadata": {
                 "hermes_route_bucket": "task",
-                "hermes_model_hint": "technical",
-                "hermes_selected_model": "work-model",
                 "hermes_turn_correlation_id": "turn-id",
             }
         }

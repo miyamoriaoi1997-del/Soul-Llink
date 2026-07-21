@@ -94,10 +94,6 @@ class ContextRouteResult:
     signals: ContextSignals | None = None
     belief: BeliefScores | None = None
 
-    # Model selection mapping (filled by adapter after routing)
-    selected_model: str | None = None
-    model_reason: str | None = None
-
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a flat dict for logging and shadow reports."""
         return {
@@ -109,8 +105,6 @@ class ContextRouteResult:
                 "secondary_candidate": self.secondary_candidate,
                 "transition_type": self.transition_type,
                 "confidence": self.confidence,
-                "selected_model": self.selected_model,
-                "model_reason": self.model_reason,
             },
             "reasons": list(self.reasons),
             "signals": vars(self.signals) if self.signals else {},

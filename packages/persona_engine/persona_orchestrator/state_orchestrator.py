@@ -1,21 +1,16 @@
-"""High-level shadow pipeline for persona state orchestration.
-
-v2: Context Router + Model Selector fully integrated.
-"""
+"""High-level shadow pipeline for persona state orchestration."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from soul_link.contracts import resolve_persona_engine_base_dir
 
 from .context_router import AbstractStateAdapter, ContextRouter, ContextRouterConfig, ContextRouteResult, IntegrationLevel
 from .memory_selector import MemorySelector
 from .mode_classifier import ModeClassifier
-from .model_selector import ModelSelector
+
 from .observability import OrchestratorLogger
 from .prompt_composer import PromptComposer
 from .semantic_classifier import SemanticModeClassifier
@@ -29,7 +24,6 @@ class StateOrchestrator:
 
     v2 additions:
     - Context Router as primary routing authority (DIRECT_SWITCH)
-    - Dynamic Model Selector based on mode/context
     - Anti-flap state tracking
     """
 
@@ -45,9 +39,7 @@ class StateOrchestrator:
         sentiment_analyzer=None,
         core_source: str = "orchestrator_core",
         enable_context_router: bool = True,
-        enable_model_selector: bool = True,
         context_router_config: ContextRouterConfig | None = None,
-        model_router_config_path: str | Path | None = None,
     ):
         if core_source not in {"orchestrator_core", "host_core"}:
             raise ValueError(f"invalid core_source: {core_source}")
@@ -55,7 +47,6 @@ class StateOrchestrator:
         self.enable_active_sex = enable_active_sex
         self.enable_semantic_shadow = enable_semantic_shadow
         self.enable_context_router = enable_context_router
-        self.enable_model_selector = enable_model_selector
         self.core_source = core_source
 
         # Legacy components
@@ -83,10 +74,6 @@ class StateOrchestrator:
             self.context_router = None
             self.adapter = None
 
-        # v2: Model Selector
-        self._model_config = self._load_model_config(model_router_config_path)
-        self.model_selector = ModelSelector(config_dict=self._model_config) if self._model_config else None
-
         # v2: Anti-flap state
         # Start high so the first turn is never blocked by anti-flapping
         self._turns_since_last_switch = 99
@@ -101,52 +88,6 @@ class StateOrchestrator:
     def _resolve_base_dir(base_dir: Path) -> Path:
         return resolve_persona_engine_base_dir(base_dir)
 
-    def _load_model_config(self, config_path: str | Path | None) -> dict:
-        """Load and normalize model router config from yaml.
-
-        The production proxy config uses ``routing.sex_model`` while the
-        in-process ModelSelector consumes ``mode_overrides.active_layer``.
-        Normalize both shapes here so the state machine and proxy share one
-        routing source instead of drifting.
-        """
-        if not self.enable_model_selector:
-            return {}
-        if config_path:
-            candidates = [Path(config_path)]
-        else:
-            candidates = [
-                self.base_dir.parent / "model_router" / "config.yaml",
-                (Path.home() / "soul-link" / "config" / "model-router.example.yaml"),
-                self.base_dir / "config" / "model-router.example.yaml",
-                self.base_dir / ".." / "model_router" / "config.example.yaml",
-                self.base_dir.parent / "model_router" / "config.example.yaml",
-            ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    return self._normalize_model_config(yaml.safe_load(f) or {})
-        return {}
-
-    @staticmethod
-    def _normalize_model_config(raw: dict) -> dict:
-        """Normalize proxy/scaffold model config into ModelSelector shape."""
-        if not isinstance(raw, dict):
-            return {}
-        if "routing" not in raw:
-            return raw
-
-        routing = raw.get("routing") or {}
-        return {
-            "default_model": routing.get("default_model") or "persona-auto",
-            "mode_overrides": {
-                "work": routing.get("work_model"),
-                "daily": None,
-                "active_layer": routing.get("sex_model"),
-            },
-            "platform_overrides": raw.get("platform_overrides") or {},
-            "emotion_overrides": raw.get("emotion_overrides") or {},
-            "model_switch_cooldown": raw.get("model_switch_cooldown", 3),
-        }
 
     # ─── Public API ─────────────────────────────────────────────────────────
 
@@ -386,15 +327,6 @@ class StateOrchestrator:
         safety_flags = self._merge_flags(transition.safety_flags, memory.safety_flags, extra_safety_flags)
         memory_notes = f"profile={memory.profile}; candidates={','.join(memory.candidate_files)}"
 
-        # Layer 8: Model selector
-        model_override = self._select_model(
-            mode=transition.active_mode,
-            submode=final_submode or mode_decision.submode,
-            platform=platform,
-            emotion_score=emotion_score,
-            context_result=context_result,
-        )
-
         route_metadata = self._route_metadata(transition.active_mode)
         route_metadata["decision_audit"] = self._decision_audit(
             previous_mode=previous_mode,
@@ -408,10 +340,7 @@ class StateOrchestrator:
             selected_layers=selected_layers,
             extra_safety_flags=extra_safety_flags,
         )
-        if model_override:
-            route_metadata["hermes_selected_model"] = model_override
-
-        # Layer 9: Build packet
+        # Layer 8: Build packet
         packet = StatePacket(
             mode=transition.active_mode,
             submode=final_submode or mode_decision.submode,
@@ -431,8 +360,6 @@ class StateOrchestrator:
             prompt_hash=None,
             shadow_only=shadow_only,
             semantic_shadow=semantic_shadow,
-            model_override=model_override,
-            selected_model=model_override,
             route_metadata=route_metadata,
         )
 
@@ -468,11 +395,6 @@ class StateOrchestrator:
                 recent_decisions=self._recent_decisions,
             )
             result = self.context_router.analyze(abstract_input.to_dict())
-
-            # Apply model selection via adapter
-            if self.enable_model_selector and self._model_config:
-                model_map = self._model_config.get("model_map") or self._build_model_map()
-                self.adapter.apply_model_selection(result, model_map=model_map)
 
             return result
         except Exception:
@@ -571,64 +493,16 @@ class StateOrchestrator:
         # ─── Default: trust legacy ──────────────────────────────────────
         return mode_decision.mode, mode_decision.submode, None, []
 
-    # ─── Layer 8: Model Selector ────────────────────────────────────────────
-
-    def _select_model(
-        self,
-        mode: str,
-        submode: str | None,
-        platform: str,
-        emotion_score: float | None,
-        context_result: ContextRouteResult | None,
-    ) -> str | None:
-        """Dynamic model selection based on mode/context. Returns model name or None.
-
-        Delegates to ModelSelector instance if available, otherwise falls back
-        to inline config lookup for backward compatibility.
-        """
-        if not self.enable_model_selector or not self._model_config:
-            return None
-
-        # Prefer ModelSelector class (has cooldown logic)
-        if self.model_selector:
-            return self.model_selector.select(
-                mode=mode,
-                submode=submode,
-                platform=platform,
-                emotion_score=emotion_score,
-                context_result=context_result,
-            )
-
-        # Fallback: inline logic (backward compat if ModelSelector not instantiated)
-        if context_result and context_result.selected_model:
-            return context_result.selected_model
-
-        mode_overrides = self._model_config.get("mode_overrides", {})
-        mode_key = self._build_mode_key(mode, submode)
-        if mode_key in mode_overrides and mode_overrides[mode_key]:
-            return mode_overrides[mode_key]
-
-        intensity = self._emotion_intensity(emotion_score)
-        emotion_overrides = self._model_config.get("emotion_overrides", {})
-        if intensity and intensity in emotion_overrides and emotion_overrides[intensity]:
-            return emotion_overrides[intensity]
-
-        platform_overrides = self._model_config.get("platform_overrides", {})
-        if platform in platform_overrides and platform_overrides[platform]:
-            return platform_overrides[platform]
-
-        return None
-
     # ─── Helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
     def _route_metadata(mode: str) -> dict[str, Any]:
         if mode == MODE_SEX:
-            return {"hermes_route_bucket": "sex", "hermes_model_hint": "sex"}
+            return {"hermes_route_bucket": "sex"}
         if mode == MODE_WORK:
-            return {"hermes_route_bucket": "task", "hermes_model_hint": "technical"}
+            return {"hermes_route_bucket": "task"}
         if mode == MODE_DAILY:
-            return {"hermes_route_bucket": "relationship", "hermes_model_hint": "default"}
+            return {"hermes_route_bucket": "relationship"}
         return {}
 
     def _decision_audit(
@@ -741,31 +615,6 @@ class StateOrchestrator:
         self._last_top_mode = current_mode
         self._last_submode = current_submode
 
-    def _build_model_map(self) -> dict[str, str]:
-        """Build model map from config for adapter.apply_model_selection.
-
-        Delegates to ModelSelector if available; otherwise falls back to inline logic.
-        """
-        if self.model_selector:
-            return self.model_selector.build_model_map()
-        # Fallback: inline (backward compat)
-        if not self._model_config:
-            return {}
-        mode_overrides = self._model_config.get("mode_overrides", {})
-        default = self._model_config.get("default_model", "")
-        result: dict[str, str] = {"default": default}
-        for key, model in mode_overrides.items():
-            if model:
-                if key == "active_layer":
-                    result["relationship:confirmed_intimacy"] = model
-                    result["relationship:intimacy_candidate"] = model
-                elif key == "work":
-                    result["work"] = model
-                elif key == "daily":
-                    result["relationship"] = model
-                    result["relationship:daily"] = model
-                    result["relationship:affectionate"] = model
-        return result
 
     def _selected_layers(
         self,

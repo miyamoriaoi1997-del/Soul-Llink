@@ -106,8 +106,8 @@ class TestSequenceTurnCase:
         assert case.expected_switch_turn == 2
         assert case.max_allowed_delay == 3
 
-    def test_sequence_with_model_expectations(self):
-        """Sequence can specify expected layer and model."""
+    def test_sequence_with_layer_expectations(self):
+        """Sequence can specify the expected state layer."""
         data = {
             "sequence_id": "seq_002",
             "turn_index": 1,
@@ -118,12 +118,10 @@ class TestSequenceTurnCase:
             "expected_layers": ["work"],
             "forbidden_layers": [],
             "expected_selected_layer": "work",
-            "expected_selected_model": "opus",
         }
 
         case = SequenceTurnCase.from_dict(data)
         assert case.expected_selected_layer == "work"
-        assert case.expected_selected_model == "opus"
 
     def test_sequence_frozen(self):
         """Sequence cases are immutable."""
@@ -141,7 +139,6 @@ class TestSequenceTurnCase:
             expected_switch_turn=None,
             max_allowed_delay=None,
             expected_selected_layer=None,
-            expected_selected_model=None,
             evidence_class=None,
             risk_class=None,
         )
@@ -244,7 +241,6 @@ class TestEvaluationDataset:
             expected_switch_turn=None,
             max_allowed_delay=None,
             expected_selected_layer=None,
-            expected_selected_model=None,
             evidence_class=None,
             risk_class=None,
         )
@@ -262,7 +258,6 @@ class TestEvaluationDataset:
             expected_switch_turn=None,
             max_allowed_delay=None,
             expected_selected_layer=None,
-            expected_selected_model=None,
             evidence_class=None,
             risk_class=None,
         )

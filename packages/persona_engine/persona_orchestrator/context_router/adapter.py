@@ -58,28 +58,6 @@ class AbstractStateAdapter:
             affective_state=affective_state,
         )
 
-    # ─── Model Selection Mapping ──────────────────────────────────────────
-
-    def apply_model_selection(
-        self,
-        result: ContextRouteResult,
-        model_map: dict[str, str] | None = None,
-    ) -> ContextRouteResult:
-        """Map routing decision to actual model name."""
-        if not model_map:
-            model_map = self._default_model_map()
-
-        top = result.top_mode
-        sub = result.work_submode or result.relationship_submode or ""
-
-        # Try specific submode first, then top mode
-        key = f"{top}:{sub}" if sub else top
-        model = model_map.get(key) or model_map.get(top) or model_map.get("default", "")
-
-        result.selected_model = model
-        result.model_reason = f"map:{key}" if model_map.get(key) else f"map:{top}"
-        return result
-
     # ─── Internal: Tag Extraction ─────────────────────────────────────────
 
     def _extract_tags_from_decision(self, decision: Any) -> list[str]:

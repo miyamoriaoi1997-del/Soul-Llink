@@ -121,7 +121,7 @@ def test_active_prompt_context_summary_available_via_packet(tmp_path):
     summary = result.packet.route_metadata
 
     assert summary['hermes_route_bucket'] == 'task'
-    assert summary['hermes_model_hint'] == 'technical'
+    assert all('model' not in key for key in summary)
     assert 'memory_context_summary' in summary
     assert summary['memory_context_summary']['active_layers'] == ['system', 'pinned', 'transient']
     assert summary['memory_context_summary']['selected_layers'] == ['system', 'pinned', 'transient']

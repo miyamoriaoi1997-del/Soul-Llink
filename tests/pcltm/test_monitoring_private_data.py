@@ -79,7 +79,7 @@ def test_runtime_turn_capture_uses_latest_router_outcome_for_same_turn_retry(tmp
     audit = tmp_path / "audit.jsonl"
     capture.write_text(
         '{"source":"exact_host_capture","turn_correlation_id":"turn-retry",'
-        '"state_machine":{"route_metadata":{"hermes_selected_model":"work-model"}}}',
+        '"state_machine":{"route_metadata":{"hermes_route_bucket":"task"}}}',
         encoding="utf-8",
     )
     audit.write_text(

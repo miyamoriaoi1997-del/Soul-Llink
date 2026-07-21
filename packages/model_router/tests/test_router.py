@@ -212,7 +212,7 @@ def test_explicit_sex_virtual_routes_sex(cfg):
     assert d.reason == "state_machine:sex"
 
 
-def test_state_machine_selected_model_takes_priority_over_bucket(cfg):
+def test_state_machine_concrete_model_name_is_ignored(cfg):
     d = decide_route(
         {
             "model": "persona-auto",
@@ -225,9 +225,9 @@ def test_state_machine_selected_model_takes_priority_over_bucket(cfg):
         },
         cfg,
     )
-    assert d.route == "selected"
-    assert d.selected_model == "glm-5-turbo"
-    assert d.reason == "state_machine:selected_model"
+    assert d.route == "default"
+    assert d.selected_model == cfg.routing["default_model"]
+    assert d.reason == "state_machine:relationship"
 
 
 def test_explicit_real_model_passthrough(cfg):

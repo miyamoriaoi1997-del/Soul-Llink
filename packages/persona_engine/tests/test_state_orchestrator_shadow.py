@@ -1,9 +1,9 @@
 import json
-from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from persona_engine.emotion_state_manager import EmotionStateManager
-from persona_engine.persona_orchestrator.model_selector import ModelSelector
 from persona_engine.persona_orchestrator.state_orchestrator import StateOrchestrator
 
 
@@ -65,14 +65,38 @@ def test_high_score_sex_message_selects_sex_layer_by_default(tmp_path):
     assert packet.desire_tier == 'uninhibited'
     expected_route_metadata = {
         'hermes_route_bucket': 'sex',
-        'hermes_model_hint': 'sex',
-        'hermes_selected_model': 'glm-5-turbo',
     }
     for key, value in expected_route_metadata.items():
         assert packet.route_metadata[key] == value
     assert 'decision_audit' in packet.route_metadata
-    assert packet.model_override == 'glm-5-turbo'
-    assert packet.selected_model == 'glm-5-turbo'
+    assert not hasattr(packet, 'model_override')
+    assert not hasattr(packet, 'selected_model')
+    assert 'hermes_selected_model' not in packet.route_metadata
+
+
+def test_state_machine_never_emits_concrete_model_names(tmp_path):
+    packet = StateOrchestrator(
+        '.',
+        log_path=tmp_path / 'o.jsonl',
+    ).analyze_turn(
+        user_message='帮我检查 gateway 日志',
+        emotion_state={'emotion_score': 1.0},
+    )
+
+    assert packet.mode == 'work'
+    assert not hasattr(packet, 'model_override')
+    assert not hasattr(packet, 'selected_model')
+    assert 'hermes_selected_model' not in packet.route_metadata
+    assert all('model' not in key for key in packet.route_metadata)
+
+
+def test_state_machine_rejects_model_routing_configuration(tmp_path):
+    with pytest.raises(TypeError, match='model_router_config_path'):
+        StateOrchestrator(
+            '.',
+            log_path=tmp_path / 'o.jsonl',
+            model_router_config_path=tmp_path / 'model-router.yaml',
+        )
 
 
 def test_emotion_state_manager_exposes_emotion_score_and_current_emotion():
@@ -182,78 +206,6 @@ def test_host_core_orchestrator_uses_host_identity_without_core_layer(tmp_path):
     assert '# Work Mode Layer' in managed
     assert result.prompt_text.count('<emotion_modifier>') == 1
     assert result.prompt_text.rstrip().endswith('<emotion_modifier>fresh</emotion_modifier>')
-
-
-def test_selected_model_bypasses_model_switch_cooldown():
-    selector = ModelSelector(
-        config_dict={
-            'default_model': 'persona-auto',
-            'mode_overrides': {
-                'work': 'claude-opus-4-6',
-                'daily': None,
-                'active_layer': 'glm-5-turbo',
-            },
-            'platform_overrides': {},
-            'emotion_overrides': {},
-            'model_switch_cooldown': 3,
-        }
-    )
-    selector._last_model = 'gpt-5.4-pro'
-    selector._turns_on_current_model = 0
-
-    routed = selector.select(
-        mode='sex',
-        context_result=SimpleNamespace(
-            top_mode='relationship',
-            work_submode=None,
-            relationship_submode='confirmed_intimacy',
-            selected_model='glm-5-turbo',
-        ),
-    )
-
-    assert routed == 'glm-5-turbo'
-    assert selector._last_model == 'glm-5-turbo'
-    assert selector._turns_on_current_model == 0
-
-
-def test_final_active_mode_overrides_stale_context_router_model():
-    selector = ModelSelector(
-        config_dict={
-            'default_model': 'default-model',
-            'mode_overrides': {
-                'work': 'work-model',
-                'daily': 'daily-model',
-                'active_layer': 'private-mode-model',
-            },
-            'platform_overrides': {},
-            'emotion_overrides': {},
-            'model_switch_cooldown': 3,
-        }
-    )
-
-    routed = selector.select(
-        mode='work',
-        context_result=SimpleNamespace(selected_model='daily-model'),
-    )
-
-    assert routed == 'work-model'
-    assert selector._last_model == 'work-model'
-
-
-def test_production_router_config_maps_sex_model_to_active_layer(tmp_path):
-    config_path = tmp_path / 'model-router-example.yaml'
-    config_path.write_text(
-        'routing:\n'
-        '  default_model: daily-model\n'
-        '  work_model: work-model\n'
-        '  sex_model: glm-5-turbo\n',
-        encoding='utf-8',
-    )
-
-    orchestrator = StateOrchestrator('.', log_path=tmp_path / 'o.jsonl', model_router_config_path=config_path)
-
-    assert orchestrator._model_config['mode_overrides']['active_layer'] == 'glm-5-turbo'
-    assert orchestrator._model_config['mode_overrides']['work'] == 'work-model'
 
 
 def test_active_prompt_marks_pcltm_load_failure_as_degraded(tmp_path):

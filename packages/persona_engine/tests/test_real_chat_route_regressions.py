@@ -92,7 +92,8 @@ def test_generic_acceptance_phrase_does_not_enter_glm5_without_desire_gate(tmp_p
     )
 
     assert packet.mode == "daily"
-    assert packet.route_metadata["hermes_selected_model"] == "gpt-5.5"
+    assert packet.route_metadata["hermes_route_bucket"] == "relationship"
+    assert all("model" not in key for key in packet.route_metadata)
     assert "sex_desire_gate_restrained" in packet.safety_flags
 
 

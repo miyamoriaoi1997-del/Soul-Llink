@@ -449,9 +449,7 @@ class SoulLink:
             "sentiment_analyzer",
             "core_source",
             "enable_context_router",
-            "enable_model_selector",
             "context_router_config",
-            "model_router_config_path",
         }
         options = {key: value for key, value in self.orchestrator_options.items() if key in allowed_options}
         return StateOrchestrator(self.base_dir, **options)

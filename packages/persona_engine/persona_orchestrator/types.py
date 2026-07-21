@@ -154,8 +154,6 @@ class StatePacket:
     prompt_hash: str | None = None
     shadow_only: bool = True
     semantic_shadow: dict[str, Any] | None = None
-    model_override: str | None = None
-    selected_model: str | None = None
     route_metadata: dict[str, Any] = field(default_factory=dict)
 
 

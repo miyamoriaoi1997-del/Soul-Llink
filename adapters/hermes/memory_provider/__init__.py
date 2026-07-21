@@ -291,7 +291,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
     @staticmethod
     def _route_request_overrides(route_metadata: Dict[str, Any]) -> Dict[str, Any]:
         allowed = (
-            "hermes_route_bucket", "hermes_model_hint", "hermes_selected_model",
+            "hermes_route_bucket",
             "hermes_turn_correlation_id",
         )
         metadata = {key: route_metadata[key] for key in allowed if key in route_metadata}

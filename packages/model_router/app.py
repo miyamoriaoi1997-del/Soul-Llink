@@ -139,12 +139,6 @@ def _state_machine_signal(payload: dict) -> dict:
     for key in (
         "hermes_route_bucket",
         "route_bucket",
-        "hermes_model_hint",
-        "model_hint",
-        "hermes_selected_model",
-        "selected_model",
-        "hermes_model_override",
-        "model_override",
         "hermes_switch_allowed",
         "switch_allowed",
         "hermes_switch_reason",
@@ -162,7 +156,7 @@ def _strip_hermes_routing_metadata(payload: dict) -> dict:
         return payload
     cleaned_metadata = {
         k: v for k, v in metadata.items()
-        if not (isinstance(k, str) and (k.startswith("hermes_") or k in {"route_bucket", "model_hint", "switch_allowed", "switch_reason"}))
+        if not (isinstance(k, str) and (k.startswith("hermes_") or k in {"route_bucket", "switch_allowed", "switch_reason"}))
     }
     cleaned = dict(payload)
     if cleaned_metadata:
@@ -202,23 +196,12 @@ def decide_route(payload: dict, cfg: RouterConfig) -> RouteDecision:
 
     signal = _state_machine_signal(payload)
     route_bucket = str(signal.get("hermes_route_bucket") or signal.get("route_bucket") or "").strip().lower()
-    model_hint = str(signal.get("hermes_model_hint") or signal.get("model_hint") or "").strip().lower()
-    explicit_selected_model = str(
-        signal.get("hermes_selected_model")
-        or signal.get("selected_model")
-        or signal.get("hermes_model_override")
-        or signal.get("model_override")
-        or ""
-    ).strip()
 
-    if explicit_selected_model and explicit_selected_model not in virtual_models:
-        return RouteDecision("selected", explicit_selected_model, "state_machine:selected_model")
-
-    if route_bucket in {"task", "work", "system_maintenance", "technical"} or model_hint in {"work", "technical"}:
+    if route_bucket in {"task", "work", "system_maintenance", "technical"}:
         return RouteDecision("technical", work_model, "state_machine:task")
-    if route_bucket in {"relationship", "daily", "intimacy", "repair", "conflict", "default"} or model_hint == "default":
+    if route_bucket in {"relationship", "daily", "intimacy", "repair", "conflict", "default"}:
         return RouteDecision("default", default_model, f"state_machine:{route_bucket or 'default'}")
-    if route_bucket == "sex" or model_hint == "sex":
+    if route_bucket == "sex":
         sex_model = str(routing.get("sex_model") or default_model)
         return RouteDecision("sex", sex_model, "state_machine:sex")
 
