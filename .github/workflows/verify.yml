@@ -14,7 +14,7 @@ jobs:
           python-version: "3.11"
       - run: uv sync --group dev
       - run: uv run pytest -q
-      - run: PYTHONPATH="packages/persona_engine:packages:adapters" uv run pytest -q packages/persona_engine/tests
+      - run: PYTHONPATH=".:packages/persona_engine:packages:adapters" uv run pytest -q packages/persona_engine/tests
       - run: rm -rf packages/persona_engine/logs
       - run: uv run python scripts/public_release_audit.py --root .
       - run: uv build

@@ -38,6 +38,10 @@ PRIVATE_MARKERS = (
     "Nan" + "agami",
     "miyamori" + "aoi",
 )
+PUBLIC_PROJECT_URLS = (
+    "https://github.com/miyamoriaoi1997-del/Soul-Llink",
+    "https://github.com/miyamoriaoi1997-del/Soul-Llink/issues",
+)
 ABSOLUTE_HOST_PATTERNS = (
     re.compile(r"(?i)[a-z]:[\\/]users[\\/](?!example(?:-user)?(?:[\\/]|$))"),
     re.compile("(?i)/" + "ho" + "me/(?!example(?:-user)?(?:/|$))"),
@@ -72,6 +76,8 @@ def audit(root: Path) -> dict[str, object]:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         categories: set[str] = set()
+        for project_url in PUBLIC_PROJECT_URLS:
+            text = text.replace(project_url, "<PUBLIC_PROJECT_URL>")
         lowered = text.casefold()
         if any(marker.casefold() in lowered for marker in PRIVATE_MARKERS):
             categories.add("private-identity")

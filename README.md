@@ -1,44 +1,65 @@
 # SoulLink Public 2.0
 
-SoulLink Public 2.0 is an open-source reference runtime for long-running persona agents.
-It is designed for agents that need more than a single prompt: stable identity, controllable state,
-auditable memory boundaries, emotion-aware mode routing, and safe model selection across long conversations.
+**Persistent identity, continuous emotion, governed memory, and auditable context for long-running AI personas.**
 
-This repository is the public extraction of the SoulLink runtime architecture. It keeps the reusable engine,
-contracts, and tests, while deliberately excluding private deployment state, private memories, credentials,
-logs, and any concrete private character preset.
+[![verify](https://github.com/miyamoriaoi1997-del/Soul-Llink/actions/workflows/verify.yml/badge.svg)](https://github.com/miyamoriaoi1997-del/Soul-Llink/actions/workflows/verify.yml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## What SoulLink Is
+SoulLink is an open-source runtime for agents that should feel like the **same person over time**, not a fresh prompt on every turn. It combines a layered persona engine, continuous emotional state, governed long-term memory, exact context evidence, and reversible host integration.
 
-SoulLink is a layered persona-agent runtime. Its core idea is simple: a long-running agent should not be
-assembled from one unstructured prompt blob. It should be assembled from explicit layers with clear priority,
-state ownership, memory contracts, and safety boundaries.
+> A memory is not automatically an instruction. An emotion is not only a style adjective. A summary is not the latest user request. SoulLink makes those distinctions executable and auditable.
 
-SoulLink separates the runtime into three major capabilities:
+![SoulLink Observatory showing synthetic demo data](docs/assets/soullink-observatory-demo.png)
 
-- **Persona Engine** — builds the active persona context from layered identity, mode, emotion, task, and style inputs.
-- **PCLTM** — governs memory/context continuity, recall boundaries, compaction semantics, and safe active-context assembly.
-- **Model Router** — routes OpenAI-compatible requests to upstream models based on explicit runtime metadata.
+*The screenshot uses synthetic public demo data rendered by the real read-only SoulLink WebUI. It contains no private persona, memory, or conversation data.*
 
-Together they provide a reference architecture for persona agents that need to stay coherent over time without
-letting stale summaries, tool dumps, deployment artifacts, or unsafe memory records silently take over the current turn.
+## What you can verify
 
-## Why SoulLink Exists
+| Capability | Observable behavior |
+|---|---|
+| **Continuous persona** | Stable identity stays anchored while work, daily, intimate, or crisis posture changes expression without replacing the person. |
+| **Dynamic emotion** | Affection, trust, possessiveness, and patience change tone, distance, initiative, and boundaries with intensity and aftereffects instead of resetting each turn. |
+| **Governed memory** | PCLTM separates the persistent archive, recall candidates, policy judgment, and records that actually influence the final model input. |
+| **Exact evidence** | The WebUI distinguishes exact host capture from sidecar reconstruction; missing evidence is shown as unavailable, never invented. |
+| **Reversible integration** | Host adapters follow detect → backup → apply → verify → receipt → byte-exact rollback. |
 
-Most persona-agent systems fail in predictable ways once conversations become long-lived:
+## Five-minute local start
 
-- identity and behavior are mixed into one prompt and become hard to audit;
-- summaries start acting like instructions instead of background context;
-- tool outputs leak across turns and become stale evidence;
-- memories have unclear priority, provenance, or approval status;
-- compression logic changes the meaning of the current request;
-- model routing is disconnected from runtime state;
-- host-specific deployment details become tangled with reusable agent logic.
+```bash
+git clone https://github.com/miyamoriaoi1997-del/Soul-Llink.git
+cd Soul-Llink
+uv sync --group dev
+uv run soullink init
+uv run soullink doctor
+uv run soullink webui
+```
 
-SoulLink exists to make those boundaries explicit. The runtime treats persona, memory, context, tools, and routing as
-separate layers that can be inspected, tested, and replaced independently.
+The dashboard opens at `http://127.0.0.1:8765/`. Core runtime use does not require Hermes or Codex; both are optional, explicit adapters.
 
-## Architecture Overview
+For a packaged install, download the wheel from the [latest GitHub Release](https://github.com/miyamoriaoi1997-del/Soul-Llink/releases/latest), verify `SHA256SUMS.txt`, then run:
+
+```bash
+python -m pip install soullink_public_2_0-2.0.0-py3-none-any.whl
+soullink init
+soullink doctor
+soullink webui
+```
+
+## Why SoulLink exists
+
+Long-running persona agents commonly fail in ways that short demos hide:
+
+- identity, behavior, and task instructions collapse into one unauditable prompt;
+- retrieved memories and compressed summaries gain accidental authority;
+- tool results leak across turns as stale evidence;
+- emotional state is computed but softened away before the final response;
+- host integration becomes an undocumented, irreversible local patch;
+- model routing cannot be correlated with the state that requested it.
+
+SoulLink treats persona, memory, emotion, context, tools, and routing as separate governed layers. The result is a runtime that can remain expressive without surrendering factual discipline or operator control.
+
+## Architecture overview
 
 ```text
 User / Host Adapter
@@ -184,26 +205,29 @@ The public edition is meant to demonstrate the reusable architecture, not to pub
 
 SoulLink does not require Hermes or Codex for its core runtime. Host support is provided through explicit, optional adapters.
 
-## Quick Start
+## Detailed installation
 
-### Install from a release wheel
+### Isolated wheel installation
+
+Download both the wheel and `SHA256SUMS.txt` from the [latest release](https://github.com/miyamoriaoi1997-del/Soul-Llink/releases/latest), verify the checksum, then install into a fresh environment:
 
 ```bash
 python -m venv .venv
 # Linux/macOS
 . .venv/bin/activate
 # Windows PowerShell
-# .venv\\Scripts\\Activate.ps1
+# .venv\Scripts\Activate.ps1
 
 python -m pip install soullink_public_2_0-2.0.0-py3-none-any.whl
 soullink init
 soullink doctor
+soullink webui
 ```
 
-### Install from source with uv
+### Development checkout
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/miyamoriaoi1997-del/Soul-Llink.git
 cd Soul-Llink
 uv sync --group dev
 uv run pytest -q

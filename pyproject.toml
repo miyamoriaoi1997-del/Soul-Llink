@@ -45,9 +45,9 @@ soullink-codex-mcp = "soul_link.codex_mcp:main"
 soullink-codex-hook = "soul_link.codex_hook:main"
 
 [project.urls]
-Homepage = "https://github.com/soullink-public/soullink-public-2.0"
-Repository = "https://github.com/soullink-public/soullink-public-2.0"
-Issues = "https://github.com/soullink-public/soullink-public-2.0/issues"
+Homepage = "https://github.com/miyamoriaoi1997-del/Soul-Llink"
+Repository = "https://github.com/miyamoriaoi1997-del/Soul-Llink"
+Issues = "https://github.com/miyamoriaoi1997-del/Soul-Llink/issues"
 
 [dependency-groups]
 dev = [
@@ -125,4 +125,4 @@ model_router = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["packages", "adapters"]
+pythonpath = [".", "packages", "adapters"]
