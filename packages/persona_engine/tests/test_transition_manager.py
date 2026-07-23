@@ -8,8 +8,8 @@ from persona_orchestrator import (
 from persona_orchestrator.transition_manager import TransitionManager
 
 
-def decision(mode, confidence=0.9, flags=None, signals=None):
-    return ModeDecision(mode=mode, confidence=confidence, reason="test", safety_flags=flags or [], signals=signals or {})
+def decision(mode, confidence=0.9, flags=None, signals=None, submode=""):
+    return ModeDecision(mode=mode, submode=submode, confidence=confidence, reason="test", safety_flags=flags or [], signals=signals or {})
 
 
 def test_start_transition_accepts_requested_mode():
@@ -50,6 +50,19 @@ def test_sex_uninhibited_can_enter_active_sex_mode():
     assert result.active_mode == MODE_SEX
     assert result.transition == "daily->sex"
     assert "sex_shadow_only" not in result.safety_flags
+
+
+def test_sex_hint_is_held_without_explicit_continuation_signal():
+    result = TransitionManager().transition(
+        MODE_DAILY,
+        decision(MODE_SEX, 0.82, signals={}, submode="hint_progression"),
+        desire_tier="uninhibited",
+        enable_active_sex=True,
+    )
+
+    assert result.active_mode == MODE_DAILY
+    assert result.transition == "hold_sex_candidate"
+    assert "sex_transition_confirmation_pending" in result.safety_flags
 
 
 def test_sex_restrained_blocks_to_daily():
@@ -93,10 +106,30 @@ def test_repair_is_daily_with_repair_flag_not_mode():
 
 
 def test_work_does_not_hold_low_confidence_daily():
-    """Work should not have inertia over relationship/daily modes."""
+    """A configured work-exit boundary applies consistently to daily candidates."""
     result = TransitionManager().transition(
         MODE_WORK,
         decision(MODE_DAILY, confidence=0.55),
+    )
+
+    assert result.active_mode == MODE_WORK
+    assert result.transition == "hold_work_context"
+
+
+def test_work_holds_low_confidence_daily_candidate_to_prevent_reversal():
+    result = TransitionManager().transition(
+        MODE_WORK,
+        decision(MODE_DAILY, confidence=0.60),
+    )
+
+    assert result.active_mode == MODE_WORK
+    assert result.transition == "hold_work_context"
+
+
+def test_work_exits_on_configured_confidence_boundary():
+    result = TransitionManager().transition(
+        MODE_WORK,
+        decision(MODE_DAILY, confidence=0.90, submode="relationship_closeness"),
     )
 
     assert result.active_mode == MODE_DAILY
@@ -104,14 +137,34 @@ def test_work_does_not_hold_low_confidence_daily():
 
 
 def test_work_does_not_hold_low_confidence_relationship_daily():
-    """Technical modes should not have inertia over relationship/daily modes."""
+    """A configured work-exit boundary applies consistently to daily candidates."""
     result = TransitionManager().transition(
         MODE_WORK,
         decision(MODE_DAILY, confidence=0.6),
     )
 
+    assert result.active_mode == MODE_WORK
+    assert result.transition == "hold_work_context"
+
+
+def test_work_exits_immediately_on_existing_boundary_signal():
+    result = TransitionManager().transition(
+        MODE_WORK,
+        decision(MODE_DAILY, confidence=0.55, signals={"sex_scene_close": True}),
+    )
+
     assert result.active_mode == MODE_DAILY
     assert result.transition == "work->daily"
+
+
+def test_explicit_task_request_is_immediate_even_below_confidence_gate():
+    result = TransitionManager().transition(
+        MODE_DAILY,
+        decision(MODE_WORK, confidence=0.55, signals={"explicit_task_request": True}),
+    )
+
+    assert result.active_mode == MODE_WORK
+    assert result.transition == "daily->work"
 
 
 def test_sex_holds_on_daily_without_explicit_exit_signal():

@@ -17,6 +17,8 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
         'data-view="evidence"',
         'id="memory-stories"',
         'id="memory-path"',
+        'id="context-board"',
+        'id="emotion-board"',
         'id="chain-stages"',
         'id="layers"',
         'id="evidence-table"',
@@ -54,6 +56,43 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
     assert ".score-range::-webkit-slider-thumb" in css
     assert "white-space:nowrap" in css
     assert "context.budget_tokens" in js
-    assert "当前用量" in js
+    assert "上下文构成" in js
+    assert "CONTEXT OBSERVATION" in js
+    assert "最近一次宿主用量快照" in js
+    assert "非连续实时计数器" in js
+    assert "上下文架构地图" in js
+    assert "策略容量配置" in js
+    assert "静态/请求配置 · 非实际使用" in js
+    assert "SoulLink 最终载荷证据" in js
+    assert "系统与开发者指令" in js
+    assert "对话与当前消息" in js
+    assert "工具定义" in js
+    assert "连续性层" in js
+    assert "工具证据层" in js
+    assert "核心人格层" in js
+    assert "响应预留" in js
+    assert "存在已确认 · 用量未分层" in js
+    assert "情绪注入层" in js
+    assert "模式人格层" in js
+    assert "记忆召回层" in js
+    assert "turn_injection 容器还含状态机标记和包装文本" in js
+    assert "final model forward 独立边界" in js
+    assert "context.budget_buckets" in js
+    assert "context.stale===true" in js
+    assert "policyCard('continuity','Continuity'" in js
+    assert "policyCard('tool_evidence','Tool evidence'" in js
+    assert "turn_injection" in js
+    assert ".context-composition" in css
+    assert ".usage-grid" in css
+    assert ".architecture-map" in css
+    assert ".policy-grid" in css
+    assert ".payload-grid" in css
+    assert ".emotion-axes{grid-template-columns:1fr" in css
+    assert "$('context-board').innerHTML=renderContextComposition" in js
+    assert "$('emotion-board').innerHTML" in js
+    assert '<details class="context-section' not in js
+    assert '<details class="emotion-copy' not in js
+    assert ".context-board .context-sections" in css
+    assert ".emotion-board{display:grid" in css
     assert "观测冲突" in js
     assert "selectedRecords(capture).length" in js

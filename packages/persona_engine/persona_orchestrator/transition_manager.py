@@ -14,6 +14,7 @@ class TransitionManager:
 
     _ANTI_FLAP_CONFIDENCE = _cfg.threshold("anti_flap_confidence", 0.65)
     _WORK_OVERRIDE_CONFIDENCE = _cfg.threshold("work_override_confidence", 0.75)
+    _WORK_EXIT_CONFIDENCE = _cfg.threshold("work_exit_confidence", 0.75)
     _SHORT_MESSAGE_MAX_CHARS = int(_cfg.threshold("short_message_max_chars", 4))
     _MACHINE_STATUS_TERMS = _cfg.intent_terms("machine_status")
     _WORK_CONTINUATION_EXIT_TERMS = _cfg.intent_terms("contextual_work_exit")
@@ -46,6 +47,20 @@ class TransitionManager:
             )
 
         if requested == MODE_SEX:
+            if (
+                previous != MODE_SEX
+                and decision.submode == "hint_progression"
+                and not decision.signals.get("sex_scene_continue")
+            ):
+                return TransitionDecision(
+                    previous_mode=previous_mode,
+                    requested_mode=requested,
+                    active_mode=previous or MODE_DAILY,
+                    transition="hold_sex_candidate",
+                    confidence=decision.confidence,
+                    reason="sex hint requires explicit progression evidence before mode entry",
+                    safety_flags=self._merge_flags(flags, ["sex_transition_confirmation_pending"]),
+                )
             if (
                 previous == MODE_WORK
                 and decision.submode == "hint_progression"
@@ -186,7 +201,11 @@ class TransitionManager:
                 safety_flags=flags,
             )
 
-        if requested == MODE_WORK and decision.confidence >= self._WORK_OVERRIDE_CONFIDENCE:
+        if requested == MODE_WORK and (
+            decision.signals.get("explicit_task_request")
+            or decision.signals.get("explicit_system_request")
+            or decision.confidence >= self._WORK_OVERRIDE_CONFIDENCE
+        ):
             return TransitionDecision(
                 previous_mode=previous_mode,
                 requested_mode=requested,
@@ -198,6 +217,20 @@ class TransitionManager:
             )
 
         if previous == MODE_WORK and requested == MODE_DAILY:
+            if (
+                decision.signals.get("sex_scene_close")
+                or decision.signals.get("safety_stop")
+                or decision.signals.get("aftercare_request")
+            ):
+                return TransitionDecision(
+                    previous_mode=previous_mode,
+                    requested_mode=requested,
+                    active_mode=MODE_DAILY,
+                    transition=self._transition_label(previous, MODE_DAILY),
+                    confidence=decision.confidence,
+                    reason="explicit boundary or aftercare signal exits work context immediately",
+                    safety_flags=flags,
+                )
             if self._is_machine_status_output(decision):
                 return TransitionDecision(
                     previous_mode=previous_mode,
@@ -206,6 +239,22 @@ class TransitionManager:
                     transition="hold_low_confidence",
                     confidence=decision.confidence,
                     reason="machine/status output inherits previous work mode",
+                    safety_flags=flags,
+                )
+            has_release_signal = bool(
+                decision.signals.get("aftercare_request")
+                or decision.signals.get("sex_scene_close")
+                or decision.signals.get("safety_stop")
+                or decision.submode in {"relationship_closeness", "relationship_rupture", "crisis"}
+            )
+            if decision.confidence < self._WORK_EXIT_CONFIDENCE or not has_release_signal:
+                return TransitionDecision(
+                    previous_mode=previous_mode,
+                    requested_mode=requested,
+                    active_mode=MODE_WORK,
+                    transition="hold_work_context",
+                    confidence=decision.confidence,
+                    reason="daily candidate below configured work-exit confidence; work context held",
                     safety_flags=flags,
                 )
             return TransitionDecision(

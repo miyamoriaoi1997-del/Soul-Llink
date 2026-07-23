@@ -190,6 +190,19 @@ def build_legacy_transition_table() -> TransitionTable:
             priority=1000,
         ),
 
+        TransitionRule(
+            rule_id="HARD.EXPLICIT_TASK.FORCE_WORK",
+            condition=TransitionCondition(
+                previous_mode="any",
+                nominated_mode="work",
+                force_event=ForceEvent.EXPLICIT_TASK,
+            ),
+            active_mode="work",
+            transition_label="any->work",
+            reason="explicit task request enters work immediately",
+            priority=650,
+        ),
+
         # Priority 900: Protected mode (sex) gate enforcement
         TransitionRule(
             rule_id="SEX.WORK_HOLD.AMBIGUOUS_HINT",
@@ -202,6 +215,19 @@ def build_legacy_transition_table() -> TransitionTable:
             active_mode="work",
             transition_label="hold_context_action",
             reason="ambiguous sex hint cannot override an active work context without explicit progression",
+            priority=900,
+        ),
+
+        TransitionRule(
+            rule_id="SEX.HOLD.AMBIGUOUS_HINT",
+            condition=TransitionCondition(
+                previous_mode="any",
+                nominated_mode="sex",
+                submode="hint_progression",
+            ),
+            active_mode="daily",
+            transition_label="hold_sex_candidate",
+            reason="sex hint requires explicit progression evidence before mode entry",
             priority=900,
         ),
 
@@ -325,17 +351,30 @@ def build_legacy_transition_table() -> TransitionTable:
             max_stale_hold_turns=5,
         ),
 
-        # Priority 550: Mid-confidence daily/work transitions (higher than short hold)
+        # Priority 550: Pair-specific daily/work hysteresis.
         TransitionRule(
-            rule_id="WORK.EXIT.MID_CONFIDENCE",
+            rule_id="WORK.EXIT.RELATIONSHIP_CLOSENESS",
+            condition=TransitionCondition(
+                previous_mode="work",
+                nominated_mode="daily",
+                submode="relationship_closeness",
+            ),
+            active_mode="daily",
+            transition_label="work->daily",
+            reason="qualified relationship release exits work",
+            priority=550,
+        ),
+
+        TransitionRule(
+            rule_id="WORK.HOLD.WITHOUT_RELEASE",
             condition=TransitionCondition(
                 previous_mode="work",
                 nominated_mode="daily",
             ),
-            active_mode="daily",
-            transition_label="work->daily",
-            reason="mid-confidence daily nomination exits work",
-            priority=550,
+            active_mode="work",
+            transition_label="hold_work_context",
+            reason="daily nomination without release evidence holds work context",
+            priority=540,
         ),
 
         TransitionRule(
@@ -505,8 +544,20 @@ def apply_legacy_conditions(
             return None
         return rule
 
-    # Mid-confidence transitions: require confidence >= 0.65
-    if rule.rule_id in ("WORK.EXIT.MID_CONFIDENCE", "DAILY.TO_WORK.MID_CONFIDENCE"):
+    if rule.rule_id == "WORK.EXIT.RELATIONSHIP_CLOSENESS":
+        if confidence < 0.90:
+            return TransitionRule(
+                rule_id="WORK.HOLD.RELEASE_BELOW_THRESHOLD",
+                condition=rule.condition,
+                active_mode="work",
+                transition_label="hold_work_context",
+                reason="relationship release below work-exit confidence holds work context",
+                priority=rule.priority,
+            )
+        return rule
+
+    # Daily-to-work confidence fallback; explicit tasks use the force rule above.
+    if rule.rule_id == "DAILY.TO_WORK.MID_CONFIDENCE":
         if confidence < 0.65:
             return None
         return rule

@@ -38,6 +38,7 @@ thresholds:
   work_override_confidence: 0.75
   short_message_max_chars: 4
   sex_hold_work_confidence: 0.75
+  work_exit_confidence: 0.90
 
 # ─── Lexicon: shared domain term groups ───────────────────────────────────────
 lexicon:
@@ -300,6 +301,9 @@ lexicon:
     - 好了吗
     - 行吗
     - 为什么
+    - 到哪一步
+    - 怎么样了
+    - 还在继续吗
 
   context_action:
     - 检查一下
@@ -332,6 +336,7 @@ lexicon:
     - 删除
     - 改掉
     - 清理
+    - 收口
 
   destructive_or_cleanup:
     - 删除
