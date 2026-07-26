@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -202,3 +203,103 @@ def test_outer_prefetch_mode_hint_allows_explicit_adult_boundary_mode():
     provider = _load_provider_class()()
 
     assert provider._prefetch_mode_for_query("我们做爱") == "sex"
+
+
+def test_provider_reuses_only_captured_recall_intent_from_same_session(monkeypatch):
+    provider = _load_provider_class()()
+    provider._active_mode = "work"
+    provider._runtime_capture_payload = None
+    calls = []
+    observations = iter((
+        {"context_sha256": hashlib.sha256(b"memory-1").hexdigest(), "recall_intent": {"intent": "memory_retrieval_diagnostics"}},
+        {"context_sha256": hashlib.sha256(b"memory-2").hexdigest(), "recall_intent": {"intent": "memory_retrieval_diagnostics"}},
+        {"context_sha256": hashlib.sha256(b"memory-3").hexdigest(), "recall_intent": {"intent": "default"}},
+    ))
+
+    def fake_load_memory_context(**kwargs):
+        calls.append(kwargs)
+        return f"memory-{len(calls)}"
+
+    monkeypatch.setattr(provider, "_load_memory_context", fake_load_memory_context)
+    monkeypatch.setattr(provider, "_load_memory_selection_observation", lambda: next(observations))
+
+    provider.prefetch("优化长期记忆检索精准度", session_id="session-a")
+    provider.prefetch("也就是说现在达到预期了吗", session_id="session-a")
+    provider.prefetch("也就是说现在达到预期了吗", session_id="session-b")
+
+    assert calls[0]["continuity_evidence"] is None
+    assert calls[1]["continuity_evidence"].session_id == "session-a"
+    assert calls[1]["continuity_evidence"].prior_intent.value == "memory_retrieval_diagnostics"
+    assert calls[2]["continuity_evidence"] is None
+
+
+def test_provider_rejects_stale_recall_observation(monkeypatch):
+    provider = _load_provider_class()()
+    provider._active_mode = "work"
+    provider._runtime_capture_payload = None
+    monkeypatch.setattr(provider, "_load_memory_context", lambda **kwargs: "current-memory")
+    monkeypatch.setattr(
+        provider,
+        "_load_memory_selection_observation",
+        lambda: {
+            "context_sha256": hashlib.sha256(b"previous-memory").hexdigest(),
+            "recall_intent": {"intent": "memory_retrieval_diagnostics"},
+        },
+    )
+
+    provider.prefetch("普通当前问题", session_id="session-a")
+
+    assert "session-a" not in provider._recall_intents_by_session
+
+
+def test_provider_does_not_advance_continuity_when_load_fails(monkeypatch):
+    provider = _load_provider_class()()
+    provider._active_mode = "work"
+    provider._runtime_capture_payload = None
+    provider._recall_intents_by_session["session-a"] = "memory_retrieval_diagnostics"
+
+    def fail(**kwargs):
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(provider, "_load_memory_context", fail)
+
+    try:
+        provider.prefetch("切换到代码测试", session_id="session-a")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected load failure")
+
+    assert provider._recall_intents_by_session["session-a"] == "memory_retrieval_diagnostics"
+
+
+def test_owner_provider_loaded_by_installed_shim_has_session_recall_continuity(monkeypatch):
+    provider = _load_actual_provider_module().SoulLinkMemoryProvider()
+    provider._active_mode = "work"
+    provider._runtime_capture_payload = None
+    provider._turn_emotion_context = ""
+    calls = []
+
+    def fake_load_memory_context(**kwargs):
+        calls.append(kwargs)
+        return f"owner-memory-{len(calls)}"
+
+    observations = iter((
+        {
+            "context_sha256": hashlib.sha256(b"owner-memory-1").hexdigest(),
+            "recall_intent": {"intent": "memory_retrieval_diagnostics"},
+        },
+        {
+            "context_sha256": hashlib.sha256(b"owner-memory-2").hexdigest(),
+            "recall_intent": {"intent": "memory_retrieval_diagnostics"},
+        },
+    ))
+    monkeypatch.setattr(provider, "_load_memory_context", fake_load_memory_context)
+    monkeypatch.setattr(provider, "_load_memory_selection_observation", lambda: next(observations))
+
+    provider.prefetch("诊断长期记忆召回的准确性", session_id="owner-session")
+    provider.prefetch("也就是说现在达到预期了吗", session_id="owner-session")
+
+    assert calls[0]["continuity_evidence"] is None
+    assert calls[1]["continuity_evidence"].session_id == "owner-session"
+    assert calls[1]["continuity_evidence"].prior_intent.value == "memory_retrieval_diagnostics"

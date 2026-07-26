@@ -26,3 +26,22 @@ def test_context_port_prefers_authoritative_state_machine_mode_over_query_hint()
 
     assert port.prefetch("我爱你", active_mode="work") == "ok"
     assert calls == [{"mode": "work", "query": "我爱你"}]
+
+
+def test_context_port_forwards_session_scoped_continuity_without_inventing_it() -> None:
+    calls = []
+    evidence = object()
+    port = PCLTMContextPort(loader=lambda **kwargs: calls.append(kwargs) or "ok")
+
+    assert port.prefetch(
+        "也就是说现在达到预期了吗",
+        active_mode="work",
+        session_id="session-a",
+        continuity_evidence=evidence,
+    ) == "ok"
+    assert calls == [{
+        "mode": "work",
+        "query": "也就是说现在达到预期了吗",
+        "session_id": "session-a",
+        "continuity_evidence": evidence,
+    }]

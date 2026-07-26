@@ -1,4 +1,4 @@
-# SoulLink Public 2.0
+# SoulLink Public 2.1
 
 **Persistent identity, continuous emotion, governed memory, and auditable context for long-running AI personas.**
 
@@ -40,7 +40,7 @@ The dashboard opens at `http://127.0.0.1:8765/`. Core runtime use does not requi
 For a packaged install, download the wheel from the [latest GitHub Release](https://github.com/miyamoriaoi1997-del/Soul-Llink/releases/latest), verify `SHA256SUMS.txt`, then run:
 
 ```bash
-python -m pip install soullink_public_2_0-2.0.0-py3-none-any.whl
+python -m pip install soullink_public-2.1.0-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -218,7 +218,7 @@ python -m venv .venv
 # Windows PowerShell
 # .venv\Scripts\Activate.ps1
 
-python -m pip install soullink_public_2_0-2.0.0-py3-none-any.whl
+python -m pip install soullink_public-2.1.0-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -560,4 +560,4 @@ python scripts/public_release_audit.py --root .
 
 ## License
 
-SoulLink Public 2.0 is released under the MIT License. See [LICENSE](LICENSE).
+SoulLink Public 2.1 is released under the MIT License. See [LICENSE](LICENSE).

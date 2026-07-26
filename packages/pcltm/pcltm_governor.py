@@ -65,7 +65,7 @@ CANONICAL_PATTERNS = [
     ("intimate_preferences", ["consensual_intimacy_preference", "exclusive_affection_preference"], "user_preference", "USER"),
     ("execution_visibility_preference", ["执行可见性", "目标不漂移", "只读扫描"], "user_preference", "USER"),
     ("pcltm_direct_injection_preference", ["PCLTM direct injection", "active assembly", "selected_records"], "user_preference", "USER"),
-    ("pcltm_dac_role", ["PCLTM-DAC", "短期连续性", "压缩边界审计"], "user_preference", "USER"),
+
     ("state_route_contract", ["状态机精简", "daily/work/sex", "明确退出"], "route_contract", "USER"),
     ("emotion_desire_personalization", ["情绪/欲望系统拟人化", "行为轴", "少硬编码"], "user_preference", "USER"),
     ("state_machine_test_env_isolation", ["env -u HERMES_STATE_PATH", "生产 STATE 污染", "fixture"], "user_preference", "USER"),
@@ -81,8 +81,7 @@ CANONICAL_PATTERNS = [
     ("skill_maintenance_preference", ["class-level umbrella", "references/", "一会话一技能"], "user_preference", "USER"),
     ("public_readme_preference", ["README", "说明文档", "覆盖每个系统和模块"], "user_preference", "USER"),
     ("public_edition_isolation", ["isolated publishable project", "private data removed", "agent integrations"], "user_preference", "USER"),
-    ("pcltm_architecture", ["PCLTM=memory+state governance", "DAC=schema summaries", "semantic compression=reflection"], "architecture_current", "MEMORY"),
-    ("pcltm_migration_cleanup", ["active hermes_persona_lcm imports", "PCLTM DAC support modules now live under", "Soul-Link cleanup 2026-05-13"], "architecture_current", "MEMORY"),
+
     ("public_persona_retirement", ["persona-engine-public", "旧同步/状态脚本", "脱敏发布流水线"], "runtime_boundary", "MEMORY"),
     ("soul_link_scope", ["Hermes itself is not a migration target", "dynamic model router", "thin Hermes adapters"], "architecture_current", "MEMORY"),
     ("pcltm_context_sanitizer", ["orphan/late/duplicate tool-result", "compaction-handoff-as-reference", "context-engine adapter"], "architecture_current", "MEMORY"),

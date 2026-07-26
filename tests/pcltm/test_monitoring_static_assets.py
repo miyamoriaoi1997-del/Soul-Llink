@@ -27,6 +27,16 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
         assert expected in html
     assert "MOCK SNAPSHOT" not in html
     assert "CONCEPT PROTOTYPE" not in html
+    assert "最近一次权威轮次捕获，以及它如何形成。" in html
+    assert "对话处理中代表本轮实时数据；回复完成后代表最近已完成轮次" in html
+    assert "此刻的状态，以及它如何形成。" not in html
+    assert "上一轮对话的真实权威快照，以及它如何形成。" not in html
+    assert "LATEST AUTHORITATIVE TURN" in html
+    assert "LATEST AUTHORITATIVE TURN" in js
+    assert "LAST COMPLETED TURN" not in html
+    assert "LAST COMPLETED TURN" not in js
+    assert "LIVE SNAPSHOT" not in html
+    assert "LIVE SNAPSHOT" not in js
     assert "fetch('/api/v1/snapshot'" in js
     assert "exact_host_capture" in js
     assert "memory_selection" in js

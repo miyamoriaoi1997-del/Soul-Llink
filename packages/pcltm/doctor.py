@@ -36,7 +36,6 @@ class PersonaLCMDoctor:
         issues.extend(self._check_fts_consistency())
         issues.extend(self._check_policy_violations())
         issues.extend(self._check_ingest_links())
-        issues.extend(self._check_dac_integrity())
         return {"ok": not issues, "issues": issues, "schema_version": schema_version}
 
     def _summary_rows(self) -> list[dict[str, Any]]:
@@ -199,12 +198,3 @@ class PersonaLCMDoctor:
                 }
             )
         return issues
-
-    def _check_dac_integrity(self) -> list[dict[str, Any]]:
-        from .dac import DACDoctor, DACStore
-
-        report = DACDoctor(DACStore(self.store)).run_checks()
-        return [
-            {"code": "dac_integrity", "detail": issue}
-            for issue in report.get("issues", [])
-        ]

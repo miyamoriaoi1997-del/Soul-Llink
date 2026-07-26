@@ -193,6 +193,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._mode_sync = None
         self._runtime_capture_payload = None
         self._session_modes: OrderedDict[str, str] = OrderedDict()
+        self._recall_intents_by_session: OrderedDict[str, str] = OrderedDict()
         self._emotion_turn_lock = threading.Lock()
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
@@ -518,6 +519,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._turn_route_overrides = {}
         if reset:
             self._session_modes.pop(new_session_id, None)
+            self._recall_intents_by_session.pop(new_session_id, None)
         self._active_mode = self._session_modes.get(new_session_id)
         self._pcltm_mode = None
         self._mode_sync = None
@@ -542,12 +544,24 @@ class SoulLinkMemoryProvider(MemoryProvider):
 
         return conservative_mode_hint(query)
 
-    def _load_memory_context(self, *, query: str, active_mode: str | None = None) -> str:
+    def _load_memory_context(
+        self,
+        *,
+        query: str,
+        active_mode: str | None = None,
+        session_id: str | None = None,
+        continuity_evidence: object | None = None,
+    ) -> str:
         _ensure_paths()
         from pcltm.host_context import PCLTMContextPort
         from pcltm.memory_adapter import load_prompt_context
 
-        return PCLTMContextPort(loader=load_prompt_context).prefetch(query, active_mode=active_mode)
+        return PCLTMContextPort(loader=load_prompt_context).prefetch(
+            query,
+            active_mode=active_mode,
+            session_id=session_id,
+            continuity_evidence=continuity_evidence,
+        )
 
     def _load_memory_selection_observation(self) -> Dict[str, Any]:
         _ensure_paths()
@@ -557,8 +571,27 @@ class SoulLinkMemoryProvider(MemoryProvider):
 
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        continuity_evidence = None
+        prior_intent = self._recall_intents_by_session.get(session_id) if session_id else None
+        if prior_intent:
+            from pcltm.live_context_governor import RecallContinuityEvidence, RecallIntent
+
+            try:
+                continuity_evidence = RecallContinuityEvidence(
+                    prior_intent=RecallIntent(prior_intent),
+                    confidence=1.0,
+                    source="session_turn",
+                    session_id=session_id,
+                )
+            except ValueError:
+                continuity_evidence = None
         try:
-            memory_context = self._load_memory_context(query=query, active_mode=self._active_mode)
+            memory_context = self._load_memory_context(
+                query=query,
+                active_mode=self._active_mode,
+                session_id=session_id or None,
+                continuity_evidence=continuity_evidence,
+            )
         except Exception:
             self._pcltm_mode = None
             self._mode_sync = "error"
@@ -574,11 +607,21 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._turn_memory_context = memory_context
         observed = self._load_memory_selection_observation()
         expected_sha = hashlib.sha256(memory_context.encode("utf-8")).hexdigest()
-        self._turn_memory_selection_observation = (
-            observed
-            if isinstance(observed, dict) and observed.get("context_sha256") == expected_sha
-            else {}
+        observation_matches = (
+            isinstance(observed, dict)
+            and observed.get("context_sha256") == expected_sha
         )
+        observed_intent = (
+            ((observed.get("recall_intent") or {}).get("intent"))
+            if observation_matches
+            else None
+        )
+        if session_id and isinstance(observed_intent, str):
+            self._recall_intents_by_session[session_id] = observed_intent
+            self._recall_intents_by_session.move_to_end(session_id)
+            while len(self._recall_intents_by_session) > 128:
+                self._recall_intents_by_session.popitem(last=False)
+        self._turn_memory_selection_observation = observed if observation_matches else {}
         self._mode_sync = "consistent" if self._active_mode in {"daily", "work", "sex"} else "fallback_hint"
         if isinstance(self._runtime_capture_payload, dict):
             self._runtime_capture_payload["mode_sync"] = {

@@ -279,19 +279,11 @@ class PCLTMContextCompressionEngine(ContextEngine):
         protect_last_n: int = 0,
         target_ratio: float = 0.20,
         quiet_mode: bool = True,
-        dac_active: bool | None = None,
-        dac_agent_disable: bool | None = None,
-        dac_assembly_disable: bool | None = None,
     ) -> None:
         if _IMPORT_ERROR is not None:
             raise RuntimeError(f"PCLTM-context unavailable: {_IMPORT_ERROR}")
         self.model = model or ""
         self.threshold_percent = threshold_percent
-        self.dac_active = False if dac_active is None else dac_active
-        self.dac_agent_disable = False if dac_agent_disable is None else dac_agent_disable
-        self.dac_assembly_disable = False if dac_assembly_disable is None else dac_assembly_disable
-        self._dac_active_explicit = dac_active is not None
-        self._dac_assembly_disable_explicit = dac_assembly_disable is not None
 
         # Kept as inert compatibility attributes for status/config callers;
         # PCLTM active-frame assembly never uses fixed head/tail retention.
@@ -642,16 +634,6 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self.last_prompt_tokens = estimate_messages_tokens_rough(compressed)
         self.last_completion_tokens = 0
 
-        try:
-            self._write_dac_shadow_snapshot(
-                assembled_messages=compressed,
-                original_messages=messages,
-                session_id=self.session_id,
-                budget_tokens=message_budget,
-            )
-        except Exception:
-            logger.debug("DAC shadow snapshot creation failed", exc_info=True)
-
         return compressed
 
     def _mirror_compression_summary_to_pcltm(self, *, content: str) -> None:
@@ -778,135 +760,6 @@ class PCLTMContextCompressionEngine(ContextEngine):
             logger.debug("PCLTM short-term store mirror failed", exc_info=True)
 
 
-    def _write_dac_shadow_snapshot(
-        self,
-        *,
-        assembled_messages: Sequence[Mapping[str, Any]] | None = None,
-        original_messages: Sequence[Mapping[str, Any]] | None = None,
-        session_id: str | None = None,
-        budget_tokens: int = 0,
-    ) -> None:
-        """Compatibility wrapper for DAC shadow snapshot writes.
-
-        Older tests and callers patch this method directly.  The current DAC
-        implementation builds the snapshot from the PCLTM store, so the message
-        parameters are accepted for API compatibility but are not consumed here.
-        """
-        del assembled_messages, original_messages
-        self._create_dac_shadow_snapshot_if_enabled(
-            session_id=session_id or self.session_id,
-            budget_tokens=budget_tokens,
-        )
-
-    def _create_dac_shadow_snapshot_if_enabled(
-        self, *, session_id: str, budget_tokens: int
-    ) -> None:
-        """Create a DAC shadow snapshot if DAC is active."""
-        try:
-            dac_active = (
-                self.dac_active
-                if self._dac_active_explicit
-                else os.getenv("HERMES_PCLTM_DAC_ACTIVE", "0") == "1"
-            )
-            dac_shadow_only = os.getenv("HERMES_PCLTM_DAC_SHADOW_ONLY", "1") == "1"
-            dac_assembly_disable = (
-                self.dac_assembly_disable
-                if self._dac_assembly_disable_explicit
-                else os.getenv("HERMES_PCLTM_DAC_ASSEMBLY_DISABLE", "0") == "1"
-            )
-
-            if not dac_active or dac_assembly_disable:
-                return
-
-            # Import DAC modules
-            try:
-                pcltm_dac_store = import_pcltm_module("dac.store")
-                pcltm_dac_assembler = import_pcltm_module("dac.assembler")
-            except Exception:
-                logger.debug("DAC modules not available for shadow snapshot", exc_info=True)
-                return
-
-            # Get PCLTM database path from environment or memory adapter
-            db_path = None
-            try:
-                # First try environment variable (used in tests)
-                env_db_path = os.getenv("HERMES_PCLTM_DB")
-                if env_db_path:
-                    db_path = env_db_path
-                else:
-                    # Fall back to memory adapter
-                    pcltm_memory_adapter = import_pcltm_memory_adapter()
-                    db_path_func = getattr(pcltm_memory_adapter, "db_path", None)
-                    if callable(db_path_func):
-                        db_path = db_path_func()
-
-                if not db_path:
-
-                    return
-            except Exception as e:
-                logger.debug("Failed to get PCLTM database path", exc_info=True)
-                return
-
-            # Create DAC store and assembler
-            DACStore = getattr(pcltm_dac_store, "DACStore", None)
-            DACAssembler = getattr(pcltm_dac_assembler, "DACAssembler", None)
-
-            if not DACStore or not DACAssembler:
-                logger.debug("DAC classes not available")
-                return
-
-            # Import EventStore
-            try:
-                pcltm_store = import_pcltm_module("store")
-                EventStore = getattr(pcltm_store, "EventStore", None)
-                if not EventStore:
-                    logger.debug("EventStore class not available")
-                    return
-            except Exception as e:
-                logger.debug("Failed to import EventStore", exc_info=True)
-                return
-
-            # Build and save shadow snapshot
-            # Use a minimal event store wrapper to avoid schema conflicts
-            class MinimalEventStore:
-                def __init__(self, db_path):
-                    import sqlite3
-                    self._conn = sqlite3.connect(db_path)
-                    self._conn.row_factory = sqlite3.Row
-
-            event_store = MinimalEventStore(db_path=db_path)
-            store = DACStore(event_store=event_store)
-            assembler = DACAssembler(store=store)
-
-            snapshot = assembler.build_snapshot(
-                session_id=session_id,
-                budget_tokens=budget_tokens,
-                fresh_tail_limit=16,
-                mode="shadow",
-            )
-
-
-            # Save snapshot to database
-            store.add_context_snapshot(
-                session_id=session_id,
-                turn_id="",
-                mode="shadow",
-                budget_tokens=budget_tokens,
-                selected_node_ids=snapshot.get("used_nodes", []),
-                selected_raw_ids=[],
-                fresh_tail_count=len(snapshot.get("items", [])),
-                metadata={"compression_count": self.compression_count},
-            )
-
-            print("[DAC DEBUG] Snapshot saved successfully")
-
-            logger.debug(
-                f"Created DAC shadow snapshot for session {session_id}, "
-                f"budget={budget_tokens}, items={len(snapshot.get('items', []))}"
-            )
-
-        except Exception as e:
-            logger.debug("Failed to create DAC shadow snapshot", exc_info=True)
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()

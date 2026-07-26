@@ -292,47 +292,6 @@ class ReflectionBuilder:
             metadata={"source": "reflection_builder"},
         )
 
-    def build_from_compression_nodes(
-        self,
-        nodes: list[dict[str, Any]],
-        *,
-        mode_scope: tuple[str, ...] = ("work",),
-        tags: tuple[str, ...] = ("compression", "reflection"),
-        prefix: str = "Compression reflection",
-    ) -> ReflectionCandidate | None:
-        """Create a reviewable reflection from compression/DAC handoff nodes.
-
-        Compression nodes are session-bound handoff evidence.  This method turns
-        them into a pending, retrieve-only candidate so the system can review
-        recurring lessons without injecting them into active USER/MEMORY views.
-        """
-        if not nodes:
-            return None
-        normalized_scope = tuple(sorted({str(mode).lower() for mode in mode_scope if mode}))
-        if not normalized_scope:
-            return None
-        source_ids = tuple(int(node.get("node_id") or 0) for node in nodes if node.get("node_id"))
-        evidence_parts: list[str] = []
-        for node in nodes:
-            summary = (node.get("summary") or "").strip()
-            if not summary:
-                continue
-            evidence_parts.append(self._extract_actionable_summary(summary))
-        evidence = "；".join(part for part in evidence_parts if part)
-        if not evidence:
-            return None
-        summary = f"{prefix}: {evidence}"
-        if len(summary) > self.max_summary_chars:
-            summary = summary[: self.max_summary_chars - 1].rstrip() + "…"
-        candidate_id = self._candidate_id(summary, normalized_scope, source_ids)
-        return ReflectionCandidate(
-            candidate_id=candidate_id,
-            summary=summary,
-            mode_scope=normalized_scope,
-            source_node_ids=source_ids,
-            tags=tuple(sorted({str(tag).lower() for tag in tags if tag})),
-            metadata={"source": "compression_boundary", "source_node_ids": list(source_ids)},
-        )
 
     @staticmethod
     def _extract_actionable_summary(text: str) -> str:

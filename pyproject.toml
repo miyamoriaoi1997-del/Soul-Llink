@@ -3,15 +3,15 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "soullink-public-2-0"
-version = "2.0.0"
+name = "soullink-public"
+version = "2.1.0"
 description = "Open public reference runtime for persona, memory/context governance, and model routing"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "SoulLink Public 2.0 contributors" },
+    { name = "SoulLink Public contributors" },
 ]
 keywords = [
     "agent-runtime",
@@ -68,7 +68,6 @@ packages = [
     "soul_link.hermes_assets.context",
     "soul_link.integration",
     "pcltm",
-    "pcltm.dac",
     "pcltm.injection",
     "pcltm.memory",
     "pcltm.monitoring",
@@ -93,7 +92,6 @@ soul_link = "soul_link"
 "soul_link.hermes_assets.context" = "soul_link/hermes_assets/context"
 "soul_link.integration" = "soul_link/integration"
 pcltm = "packages/pcltm"
-"pcltm.dac" = "packages/pcltm/dac"
 "pcltm.injection" = "packages/pcltm/injection"
 "pcltm.memory" = "packages/pcltm/memory"
 "pcltm.monitoring" = "packages/pcltm/monitoring"

@@ -22,7 +22,14 @@ from typing import TYPE_CHECKING, Iterable
 
 import yaml
 
-from pcltm.live_context_governor import ContextBudgetPolicy, classify_recall_intent, govern_prompt_context
+from pcltm.live_context_governor import (
+    ContextBudgetPolicy,
+    RecallContinuityEvidence,
+    classify_recall_intent,
+    govern_prompt_context,
+    has_memory_retrieval_signal,
+    has_recall_quality_signal,
+)
 from pcltm.secret_policy import evaluate_memory_write, redact_secrets
 
 if TYPE_CHECKING:
@@ -120,7 +127,6 @@ class ViewPolicy:
         "hermes",
         "state.md",
         "pcltm",
-        "dac",
         "active prompt",
         "system_prompt",
         "prompt",
@@ -705,12 +711,35 @@ def _continuity_query_hint(query: str | None) -> str | None:
     )
     base = " ".join(str(query or "").split())
     lower = base.lower()
+    if not _contains_any(lower, ("继续", "恢复", "接着", "续做", "resume", "continue", "recover", "previous task")):
+        return base or None
     missing = [term for term in terms if term.lower() not in lower]
     if not base:
         return " ".join(terms)
     if not missing:
         return base
     return f"{base} {' '.join(missing)}"
+
+
+def _is_memory_retrieval_diagnostics(recall_intent) -> bool:
+    return recall_intent.intent.value == "memory_retrieval_diagnostics"
+
+
+def _is_memory_retrieval_diagnostics_relevant(
+    row: sqlite3.Row,
+    target_file: str,
+    recall_intent,
+    policy: ViewPolicy = DEFAULT_VIEW_POLICY,
+) -> bool:
+    """Use bucket as authority and record-level signals as topical admission."""
+    content = str(row["content"] or "")
+    bucket = _bucket_for(row, target_file, policy)
+    if bucket == "memory_retrieval":
+        return True
+    return (
+        has_memory_retrieval_signal(content)
+        and (bucket in recall_intent.allowed_buckets or has_recall_quality_signal(content))
+    )
 
 
 def _rank_rows(
@@ -726,6 +755,13 @@ def _rank_rows(
     effective_query = _continuity_query_hint(query) if target_file == "MEMORY.md" else query
 
     rows_list = list(rows)
+    recall_intent = classify_recall_intent(query)
+    if _is_memory_retrieval_diagnostics(recall_intent):
+        rows_list = [
+            row
+            for row in rows_list
+            if _is_memory_retrieval_diagnostics_relevant(row, target_file, recall_intent, policy)
+        ]
     metadata_terms: dict[int, set[str]] = {}
     for row in rows_list:
         metadata = _metadata(row)
@@ -1222,10 +1258,19 @@ def _rows_allowed_by_recall_intent(
     if recall_intent is None:
         return materialized
     if target_file == "USER.md":
-        return materialized if recall_intent.allow_user_preferences else []
+        if not recall_intent.allow_user_preferences:
+            return []
+        if not _is_memory_retrieval_diagnostics(recall_intent):
+            return materialized
     allowed = set(recall_intent.allowed_buckets)
     if not allowed:
         return []
+    if _is_memory_retrieval_diagnostics(recall_intent):
+        return [
+            row
+            for row in materialized
+            if _is_memory_retrieval_diagnostics_relevant(row, target_file, recall_intent, policy)
+        ]
     return [
         row
         for row in materialized
@@ -1935,13 +1980,19 @@ def load_prompt_context(
     memory_limit: int = 2200,
     user_limit: int = 1375,
     policy: ViewPolicy | None = None,
+    continuity_evidence: RecallContinuityEvidence | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Return a direct PCLTM semantic prompt block without legacy md headers."""
     if not enabled():
         return ""
     active_policy = policy or DEFAULT_VIEW_POLICY
     budgets = {"USER.md": user_limit, "MEMORY.md": memory_limit}
-    recall_intent = classify_recall_intent(query)
+    recall_intent = classify_recall_intent(
+        query,
+        continuity_evidence=continuity_evidence,
+        session_id=session_id,
+    )
     selected: dict[str, list[str]] = {"SYSTEM.md": _load_system_core_entries(mode=mode, query=query)}
     candidate_records: list[dict[str, Any]] = []
     judgment_records: list[dict[str, Any]] = []
@@ -2008,6 +2059,7 @@ def load_prompt_context(
     _last_memory_selection_observation = {
         "status": "captured",
         "source": "pcltm_selection_pass",
+        "recall_intent": recall_intent.to_dict(),
         "context_sha256": hashlib.sha256(governed.rendered.encode("utf-8")).hexdigest(),
         "candidate_records": {
             "status": "captured", "count": len(candidate_records), "records": candidate_records,

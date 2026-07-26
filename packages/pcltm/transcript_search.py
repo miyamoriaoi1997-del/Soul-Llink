@@ -48,7 +48,8 @@ def search_exact_evidence(
             return []
         rows = conn.execute(
             """
-            SELECT event_id, content, payload_sha256, source_created_at
+            SELECT event_id, content, payload_sha256,
+                   COALESCE(source_created_at, created_at) AS source_created_at
             FROM events
             WHERE instr(content, ?) > 0
               AND COALESCE((

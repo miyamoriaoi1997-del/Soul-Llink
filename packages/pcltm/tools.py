@@ -9,7 +9,6 @@ from .candidates import PersonaCandidateExtractor
 from .retrieval_policy import RetrievalPolicy
 from .ingest import PCLTMIngestAdapter
 from .importer import JSONLTranscriptImporter
-from .dac.memory_linker import DACMemoryCandidateLinker
 
 
 class PersonaLCMTools:
@@ -215,38 +214,6 @@ class PersonaLCMTools:
         )
         return {"ok": True, "record": record}
 
-    def plcm_dac_memory_candidate(
-        self,
-        *,
-        query: str,
-        kind: str,
-        target_file: str,
-        content: str,
-        scope: dict[str, Any] | None = None,
-        tags: list[str] | None = None,
-        importance: float | None = None,
-        limit: int = 5,
-        global_ok: bool = False,
-    ) -> dict[str, Any]:
-        """Propose a pending long-term memory record from DAC recall evidence.
-
-        This intentionally does not approve the record or mutate prompt views.
-        DAC only supplies evidence; the memory_records review path remains the
-        durable MEMORY/USER gate.
-        """
-        if not self._has_scope(scope) and not global_ok:
-            return {"ok": False, "error": "scope_required"}
-        scope = scope or {}
-        return DACMemoryCandidateLinker(self.store).propose_from_query(
-            query,
-            session_id=scope.get("session_id"),
-            kind=kind,
-            target_file=target_file,
-            content=content,
-            tags=tags,
-            importance=importance,
-            limit=limit,
-        )
 
     def plcm_retrieve_for_mode(
         self,

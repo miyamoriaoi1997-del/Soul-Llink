@@ -182,6 +182,7 @@ class ToolEvidenceCapsule:
 
 class RecallIntent(str, Enum):
     CONTEXT_DIAGNOSTICS = "context_diagnostics"
+    MEMORY_RETRIEVAL_DIAGNOSTICS = "memory_retrieval_diagnostics"
     GIT_WORKFLOW = "git_workflow"
     CODING = "coding"
     RUNTIME_MAINTENANCE = "runtime_maintenance"
@@ -206,13 +207,73 @@ class RecallIntentDecision:
 
 
 @dataclass(frozen=True)
+class RecallContinuityEvidence:
+    """Session-scoped intent evidence from an active turn boundary."""
+
+    prior_intent: RecallIntent
+    confidence: float
+    source: str
+    session_id: str
+
+    def __post_init__(self) -> None:
+        confidence = float(self.confidence)
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("continuity confidence must be between 0 and 1")
+        object.__setattr__(self, "confidence", confidence)
+
+    def is_usable(self, *, session_id: str | None = None) -> bool:
+        return (
+            self.prior_intent is not RecallIntent.DEFAULT
+            and self.confidence >= 0.8
+            and self.source in {"session_turn", "active_task", "continuity_capsule"}
+            and bool(self.session_id)
+            and (not session_id or self.session_id == session_id)
+        )
+
+
+@dataclass(frozen=True)
 class GovernedPromptContext:
     rendered: str
     telemetry: dict[str, Any]
 
 
-def classify_recall_intent(query: str | None) -> RecallIntentDecision:
+def has_memory_retrieval_signal(text: str | None) -> bool:
+    normalized = (text or "").lower()
+    return _contains_any(normalized, ("长期记忆", "记忆召回", "召回", "检索", "recall", "retrieval"))
+
+
+def has_recall_quality_signal(text: str | None) -> bool:
+    normalized = (text or "").lower()
+    return _contains_any(
+        normalized,
+        ("精准", "精确", "正确", "优化", "诊断", "准确", "相关性", "相关", "精度", "precision", "relevance", "accuracy"),
+    )
+
+
+def has_elliptical_followup_signal(text: str | None) -> bool:
+    normalized = (text or "").lower()
+    return (
+        _contains_any(normalized, ("这个", "那个", "现在", "也就是说", "this", "that", "now"))
+        and _contains_any(normalized, ("优化", "改进", "预期", "符合", "达到", "效果", "expected", "working"))
+        and _contains_any(normalized, ("吗", "么", "?", "？"))
+    )
+
+
+def classify_recall_intent(
+    query: str | None,
+    *,
+    continuity_evidence: RecallContinuityEvidence | None = None,
+    session_id: str | None = None,
+) -> RecallIntentDecision:
     text = (query or "").lower()
+    if has_memory_retrieval_signal(text) and has_recall_quality_signal(text):
+        return RecallIntentDecision(
+            intent=RecallIntent.MEMORY_RETRIEVAL_DIAGNOSTICS,
+            allowed_buckets=frozenset({"memory_retrieval", "runtime_boundary", "current_task", "tool_evidence"}),
+            allow_user_preferences=True,
+            reason="query asks to diagnose or improve long-term memory retrieval precision",
+        )
+
     if _contains_any(text, ("上下文", "context", "预算", "budget", "剪裁", "compaction", "链路", "pcltm")):
         return RecallIntentDecision(
             intent=RecallIntent.CONTEXT_DIAGNOSTICS,
@@ -220,6 +281,7 @@ def classify_recall_intent(query: str | None) -> RecallIntentDecision:
             allow_user_preferences=False,
             reason="query asks about live context/PCLTM budget chain",
         )
+
     if _contains_any(text, ("git", "commit", "push", "rebase", "fetch", "远端", "分支", "提交")):
         return RecallIntentDecision(
             intent=RecallIntent.GIT_WORKFLOW,
@@ -227,6 +289,7 @@ def classify_recall_intent(query: str | None) -> RecallIntentDecision:
             allow_user_preferences=True,
             reason="query asks about git workflow",
         )
+
     if _contains_any(text, ("代码", "测试", "pytest", "实现", "修复", "文件", "repo", "仓库")):
         return RecallIntentDecision(
             intent=RecallIntent.CODING,
@@ -241,13 +304,29 @@ def classify_recall_intent(query: str | None) -> RecallIntentDecision:
             allow_user_preferences=True,
             reason="query asks about runtime maintenance",
         )
-    if _contains_any(text, ("抱", "亲", "爱你", "喜欢你", "老婆", "想你", "累")):
+    if _contains_any(text, ("关系", "抱", "亲", "爱你", "喜欢你", "老婆", "想你", "累")):
         return RecallIntentDecision(
             intent=RecallIntent.RELATIONSHIP,
             allowed_buckets=frozenset({"relationship", "emotion_boundary", "user_preference"}),
             allow_user_preferences=True,
             reason="query asks for relationship/daily support",
         )
+    if has_elliptical_followup_signal(text):
+        if continuity_evidence and continuity_evidence.is_usable(session_id=session_id):
+            if continuity_evidence.prior_intent is RecallIntent.MEMORY_RETRIEVAL_DIAGNOSTICS:
+                return RecallIntentDecision(
+                    intent=RecallIntent.MEMORY_RETRIEVAL_DIAGNOSTICS,
+                    allowed_buckets=frozenset({"memory_retrieval", "runtime_boundary", "current_task", "tool_evidence"}),
+                    allow_user_preferences=True,
+                    reason="inherited memory retrieval diagnostics from session continuity",
+                )
+        return RecallIntentDecision(
+            intent=RecallIntent.DEFAULT,
+            allowed_buckets=frozenset(),
+            allow_user_preferences=False,
+            reason="ambiguous follow-up lacks session continuity evidence",
+        )
+
     return RecallIntentDecision(
         intent=RecallIntent.DEFAULT,
         allowed_buckets=frozenset({"user_preference", "runtime_boundary", "current_task", "generic"}),

@@ -33,7 +33,17 @@ class PCLTMContextPort:
     def __init__(self, *, loader: Callable[..., str]) -> None:
         self._loader = loader
 
-    def prefetch(self, query: str, *, active_mode: str | None = None) -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        active_mode: str | None = None,
+        session_id: str | None = None,
+        continuity_evidence: object | None = None,
+    ) -> str:
         """Load memory with the state machine mode when the host provides it."""
         mode = active_mode if active_mode in {"daily", "work", "sex"} else conservative_mode_hint(query)
-        return self._loader(mode=mode, query=query) or ""
+        kwargs = {"mode": mode, "query": query}
+        if session_id is not None or continuity_evidence is not None:
+            kwargs.update(session_id=session_id, continuity_evidence=continuity_evidence)
+        return self._loader(**kwargs) or ""

@@ -25,13 +25,25 @@ CURRENT_SCHEMA_VERSION = 9
 class EventStore:
     """Persist raw conversation/tool events with persona-aware metadata."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self.read_only = read_only
+        if read_only:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(self.db_path)
+            self._conn = sqlite3.connect(
+                f"file:{self.db_path.resolve().as_posix()}?mode=ro",
+                uri=True,
+            )
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._bootstrap()
+        if read_only:
+            self._conn.execute("PRAGMA query_only=ON")
+        else:
+            self._bootstrap()
 
     def _bootstrap(self) -> None:
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -56,7 +68,6 @@ class EventStore:
     def _apply_schema(self) -> None:
         self._create_core_tables()
         self._create_short_term_tables()
-        self._create_dac_tables()
         self._ensure_event_classification_columns()
         self._ensure_memory_record_columns()
         ensure_evidence_ledger_schema(self._conn)
@@ -194,97 +205,6 @@ class EventStore:
             "CREATE INDEX IF NOT EXISTS idx_short_term_events_ttl ON short_term_events (created_at, ttl_hours, source, persona_mode)"
         )
 
-    def _create_dac_tables(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dac_raw_messages (
-                raw_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                turn_id TEXT DEFAULT '',
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                persona_mode TEXT DEFAULT '',
-                source_platform TEXT DEFAULT '',
-                sequence INTEGER NOT NULL DEFAULT 0,
-                token_count INTEGER DEFAULT 0,
-                sensitivity TEXT NOT NULL DEFAULT 'normal',
-                inject_policy TEXT NOT NULL DEFAULT 'context_only',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at REAL NOT NULL
-            )
-            """
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dac_raw_session_sequence ON dac_raw_messages (session_id, sequence, raw_id)"
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dac_summary_nodes (
-                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                node_type TEXT NOT NULL DEFAULT 'summary',
-                depth INTEGER NOT NULL DEFAULT 0,
-                summary TEXT NOT NULL,
-                token_count INTEGER DEFAULT 0,
-                source_token_count INTEGER DEFAULT 0,
-                source_type TEXT NOT NULL DEFAULT 'messages',
-                source_ids TEXT NOT NULL DEFAULT '[]',
-                persona_mode TEXT DEFAULT '',
-                inject_policy TEXT NOT NULL DEFAULT 'retrieve_only',
-                sensitivity TEXT NOT NULL DEFAULT 'normal',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at REAL NOT NULL,
-                earliest_at REAL,
-                latest_at REAL,
-                expand_hint TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'active'
-            )
-            """
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dac_nodes_session_depth ON dac_summary_nodes (session_id, depth, created_at)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dac_nodes_status ON dac_summary_nodes (status, inject_policy, sensitivity)"
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dac_context_snapshots (
-                snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                turn_id TEXT DEFAULT '',
-                mode TEXT DEFAULT '',
-                snapshot_type TEXT DEFAULT '',
-                budget_tokens INTEGER DEFAULT 0,
-                selected_node_ids TEXT NOT NULL DEFAULT '[]',
-                selected_raw_ids TEXT NOT NULL DEFAULT '[]',
-                fresh_tail_count INTEGER DEFAULT 0,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at REAL NOT NULL
-            )
-            """
-        )
-        snapshot_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(dac_context_snapshots)")}
-        snapshot_schema = {
-            "turn_id": "TEXT DEFAULT ''",
-            "mode": "TEXT DEFAULT ''",
-            "snapshot_type": "TEXT DEFAULT ''",
-            "budget_tokens": "INTEGER DEFAULT 0",
-            "selected_node_ids": "TEXT NOT NULL DEFAULT '[]'",
-            "selected_raw_ids": "TEXT NOT NULL DEFAULT '[]'",
-            "fresh_tail_count": "INTEGER DEFAULT 0",
-            "metadata": "TEXT NOT NULL DEFAULT '{}'",
-            "created_at": "REAL NOT NULL DEFAULT 0",
-        }
-        for column, definition in snapshot_schema.items():
-            if column not in snapshot_columns:
-                self._conn.execute(f"ALTER TABLE dac_context_snapshots ADD COLUMN {column} {definition}")
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dac_snapshots_session ON dac_context_snapshots (session_id, created_at)"
-        )
-        self._conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS dac_summary_nodes_fts USING fts5(summary)"
-        )
 
     def _ensure_event_classification_columns(self) -> None:
         existing = {
@@ -360,6 +280,12 @@ class EventStore:
         return not any((event_mismatch, extra_event_fts, summary_mismatch, extra_summary_fts))
 
     def rebuild_fts(self) -> dict[str, int]:
+        """Rebuild derived FTS rows inside the caller's transaction.
+
+        Bootstrap and other schema operations must remain all-or-nothing. The
+        caller owns the commit so a later migration failure can roll this work
+        back together with the schema changes.
+        """
         self._conn.execute("DELETE FROM event_fts")
         self._conn.execute("DELETE FROM summary_fts")
         events = self._conn.execute("SELECT event_id, content FROM events ORDER BY event_id ASC").fetchall()
