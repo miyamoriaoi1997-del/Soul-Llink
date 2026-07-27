@@ -4,9 +4,11 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from .memory_authority import unavailable_result
+
 SEARCH_SCHEMA = {
     "name": "soullink_memory_search",
-    "description": "Search SoulLink/PCLTM long-term memory. Returns prompt-safe references/excerpts; use soullink_memory_open for full body.",
+    "description": "Preferred first authority for recall: search SoulLink/PCLTM long-term memory. Returns prompt-safe references/excerpts; use soullink_memory_open for full body. No Hermes memory fallback.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -20,7 +22,7 @@ SEARCH_SCHEMA = {
 
 EXACT_RECALL_SCHEMA = {
     "name": "soullink_memory_recall_exact",
-    "description": "Recall an exact quote from the SoulLink/PCLTM transcript ledger after L1 local-integrity checks (hash, chain, offsets, and current governance). This is not resistant to an attacker who can rewrite all SQLite authority tables.",
+    "description": "Preferred first authority for exact recall: recall a quote from the SoulLink/PCLTM transcript ledger after L1 local-integrity checks (hash, chain, offsets, and current governance). No Hermes memory fallback.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -33,7 +35,7 @@ EXACT_RECALL_SCHEMA = {
 
 OPEN_SCHEMA = {
     "name": "soullink_memory_open",
-    "description": "Open one SoulLink/PCLTM memory returned by soullink_memory_search.",
+    "description": "Preferred first authority for opening recall evidence: open one SoulLink/PCLTM memory returned by soullink_memory_search. No Hermes memory fallback.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -46,7 +48,7 @@ OPEN_SCHEMA = {
 
 REMEMBER_SCHEMA = {
     "name": "soullink_memory_remember",
-    "description": "Write an explicit user preference or durable memory into SoulLink/PCLTM long-term memory.",
+    "description": "Canonical write authority: write an explicit user preference or durable memory into SoulLink/PCLTM long-term memory. No Hermes memory fallback.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -88,12 +90,15 @@ class PCLTMMemoryTools:
             limit = self._bounded_int(args.get("limit"), default=8, minimum=1, maximum=100)
             if limit is None:
                 return self._error("limit must be an integer between 1 and 100")
-            results = self._search(
-                query=query,
-                mode=args.get("mode"),
-                layers=("pinned", "episodic"),
-                limit=limit,
-            )
+            try:
+                results = self._search(
+                    query=query,
+                    mode=args.get("mode"),
+                    layers=("pinned", "episodic"),
+                    limit=limit,
+                )
+            except Exception:
+                return self._unavailable()
             return self._json({"success": True, "results": results})
 
         if tool_name == EXACT_RECALL_SCHEMA["name"]:
@@ -105,7 +110,10 @@ class PCLTMMemoryTools:
             limit = self._bounded_int(args.get("limit"), default=8, minimum=1, maximum=100)
             if limit is None:
                 return self._error("limit must be an integer between 1 and 100")
-            results = self._recall_exact(query=query, limit=limit)
+            try:
+                results = self._recall_exact(query=query, limit=limit)
+            except Exception:
+                return self._unavailable()
             return self._json({"success": True, "evidence_level": "E0", "integrity_scope": "l1_local_consistency", "results": results})
 
         if tool_name == OPEN_SCHEMA["name"]:
@@ -115,10 +123,13 @@ class PCLTMMemoryTools:
             body_limit = self._bounded_int(args.get("body_limit"), default=4000, minimum=1, maximum=20000)
             if body_limit is None:
                 return self._error("body_limit must be an integer between 1 and 20000")
-            opened = self._open_memory(
-                memory_id=memory_id,
-                body_limit=body_limit,
-            )
+            try:
+                opened = self._open_memory(
+                    memory_id=memory_id,
+                    body_limit=body_limit,
+                )
+            except Exception:
+                return self._unavailable()
             return self._json({"success": True, "memory": opened})
 
         if tool_name == REMEMBER_SCHEMA["name"]:
@@ -128,7 +139,10 @@ class PCLTMMemoryTools:
             target = str(args.get("target") or "memory")
             if target not in {"user", "memory"}:
                 return self._error("target must be user or memory")
-            ok = self._remember(target=target, action="add", content=content)
+            try:
+                ok = self._remember(target=target, action="add", content=content)
+            except Exception:
+                return self._unavailable()
             return self._json({"success": bool(ok), "target": target})
 
         return self._error(f"unknown tool: {tool_name}")
@@ -149,3 +163,7 @@ class PCLTMMemoryTools:
     @classmethod
     def _error(cls, message: str) -> str:
         return cls._json({"success": False, "error": message})
+
+    @classmethod
+    def _unavailable(cls) -> str:
+        return cls._json(unavailable_result())

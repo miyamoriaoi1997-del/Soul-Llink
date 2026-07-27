@@ -1,0 +1,1 @@
+adapters/hermes/patches/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

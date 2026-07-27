@@ -1,0 +1,354 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 08cb880a..4dec7eac 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1395,6 +1395,11 @@ def init_agent(
+     # Memory provider plugin (external — one at a time, alongside built-in)
+     # Reads memory.provider from config to select which plugin to activate.
+     agent._memory_manager = None
++    from agent.soullink_memory_authority import state_for_config as _soullink_authority_state
++    agent._soullink_memory_authority_state = _soullink_authority_state(
++        _agent_cfg,
++        provider_available=False,
++    )
+     if not skip_memory:
+         try:
+             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+@@ -1407,6 +1412,10 @@ def init_agent(
+                 if _mp and _mp.is_available():
+                     agent._memory_manager.add_provider(_mp)
+                 if agent._memory_manager.providers:
++                    agent._soullink_memory_authority_state = _soullink_authority_state(
++                        _agent_cfg,
++                        provider_available=True,
++                    )
+                     _init_kwargs = {
+                         "session_id": agent.session_id,
+                         "platform": platform or "cli",
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index c6ed459e..d0e2e3f0 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2193,6 +2193,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+         function_args = {}
+ 
+     _tool_middleware_trace = list(tool_request_middleware_trace or [])
++
++    from agent.soullink_memory_authority import forbidden_result, state_for_agent
++    _memory_authority_block = forbidden_result(
++        function_name,
++        state=state_for_agent(agent),
++    )
++    if _memory_authority_block is not None:
++        return _memory_authority_block
++
+     try:
+         from hermes_cli.middleware import apply_tool_request_middleware
+ 
+diff --git a/agent/soullink_memory_authority.py b/agent/soullink_memory_authority.py
+new file mode 100644
+index 00000000..c80a0ea9
+--- /dev/null
++++ b/agent/soullink_memory_authority.py
+@@ -0,0 +1,57 @@
++from __future__ import annotations
++
++import json
++from collections.abc import Mapping
++from typing import Any
++
++BLOCKED_TOOLS = frozenset({"memory", "session_search"})
++
++
++def configured_provider(config: Mapping[str, Any] | None) -> str | None:
++    if not isinstance(config, Mapping):
++        return None
++    memory = config.get("memory")
++    provider = memory.get("provider") if isinstance(memory, Mapping) else None
++    if not isinstance(provider, str) or not provider.strip():
++        return None
++    return provider.strip().lower()
++
++
++def state_for_config(config: Mapping[str, Any] | None, *, provider_available: bool) -> str:
++    if configured_provider(config) != "soullink":
++        return "inactive"
++    return "active" if provider_available else "unavailable"
++
++
++def state_for_agent(agent: Any) -> str:
++    state = getattr(agent, "_soullink_memory_authority_state", "inactive")
++    return state if state in {"active", "unavailable"} else "inactive"
++
++
++def filter_tool_definitions(
++    tool_definitions: list[dict[str, Any]],
++    *,
++    config: Mapping[str, Any] | None,
++) -> list[dict[str, Any]]:
++    if configured_provider(config) != "soullink":
++        return tool_definitions
++    return [
++        definition
++        for definition in tool_definitions
++        if definition.get("function", {}).get("name") not in BLOCKED_TOOLS
++    ]
++
++
++def forbidden_result(tool_name: str, *, state: str) -> str | None:
++    if tool_name not in BLOCKED_TOOLS or state not in {"active", "unavailable"}:
++        return None
++    return json.dumps(
++        {
++            "success": False,
++            "status": "unavailable" if state == "unavailable" else "forbidden",
++            "authority": "soullink/pcltm",
++            "fallback": "forbidden",
++            "tool": tool_name,
++        },
++        ensure_ascii=False,
++    )
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index a5871442..0330b3b3 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -264,6 +264,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
+     return names
+ 
+ 
++def _memory_authority_block_for_agent(agent, function_name: str) -> str | None:
++    from agent.soullink_memory_authority import forbidden_result, state_for_agent
++
++    return forbidden_result(function_name, state=state_for_agent(agent))
++
++
+ def _apply_tool_request_middleware_for_agent(
+     agent,
+     *,
+@@ -428,12 +434,31 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+             tool_call_id=getattr(tool_call, "id", "") or "",
+         )
+ 
++        _memory_authority_block = _memory_authority_block_for_agent(
++            agent,
++            function_name,
++        )
++
+         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
+         # We must know whether the tool will execute before touching
+         # checkpoint state (dedup slot, real snapshots).
+         block_result = None
+         blocked_by_guardrail = False
+-        if _ts_scope_block is not None:
++        if _memory_authority_block is not None:
++            block_result = _memory_authority_block
++            _emit_terminal_post_tool_call(
++                agent,
++                function_name=function_name,
++                function_args=function_args,
++                result=block_result,
++                effective_task_id=effective_task_id,
++                tool_call_id=getattr(tool_call, "id", "") or "",
++                status="blocked",
++                error_type="memory_authority_block",
++                error_message=block_result,
++                middleware_trace=list(middleware_trace),
++            )
++        elif _ts_scope_block is not None:
+             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
+             block_result = _ts_scope_block
+             _emit_terminal_post_tool_call(
+@@ -1105,10 +1130,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+             tool_call_id=getattr(tool_call, "id", "") or "",
+         )
+ 
++        _memory_authority_block = _memory_authority_block_for_agent(
++            agent,
++            function_name,
++        )
++
+         # Check plugin hooks for a block directive before executing.
+         _block_msg: Optional[str] = None
++        _block_result: Optional[str] = None
+         _block_error_type = "plugin_block"
+-        if _ts_scope_block is not None:
++        if _memory_authority_block is not None:
++            _block_result = _memory_authority_block
++            _block_error_type = "memory_authority_block"
++        elif _ts_scope_block is not None:
+             _block_msg = _ts_scope_block
+             _block_error_type = "tool_scope_block"
+         else:
+@@ -1128,12 +1162,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                 pass
+ 
+         _guardrail_block_decision: ToolGuardrailDecision | None = None
+-        if _block_msg is None:
++        if _block_result is None and _block_msg is None:
+             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+             if not guardrail_decision.allows_execution:
+                 _guardrail_block_decision = guardrail_decision
+ 
+-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
++        _execution_blocked = _block_result is not None or _block_msg is not None or _guardrail_block_decision is not None
+ 
+         if _execution_blocked:
+             # Tool blocked by plugin or guardrail policy — skip counters,
+@@ -1210,7 +1244,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+ 
+         tool_start_time = time.time()
+ 
+-        if _block_msg is not None:
++        if _block_result is not None:
++            function_result = _block_result
++            tool_duration = 0.0
++            _emit_terminal_post_tool_call(
++                agent,
++                function_name=function_name,
++                function_args=function_args,
++                result=function_result,
++                effective_task_id=effective_task_id,
++                tool_call_id=getattr(tool_call, "id", "") or "",
++                status="blocked",
++                error_type=_block_error_type,
++                error_message=function_result,
++                middleware_trace=list(middleware_trace),
++            )
++        elif _block_msg is not None:
+             # Tool blocked by plugin policy — return error without executing.
+             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+             tool_duration = 0.0
+diff --git a/model_tools.py b/model_tools.py
+index c59c189e..e4e5b8fd 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -444,6 +444,20 @@ def _compute_tool_definitions(
+     # Ask the registry for schemas (only returns tools whose check_fn passes)
+     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+ 
++    # SoulLink is the canonical memory authority when explicitly configured.
++    # Hide retired host fallbacks even if provider loading later fails; that
++    # failure is an unavailable authority state, never permission to fallback.
++    try:
++        from agent.soullink_memory_authority import filter_tool_definitions
++        from hermes_cli.config import load_config_readonly
++
++        filtered_tools = filter_tool_definitions(
++            filtered_tools,
++            config=load_config_readonly(),
++        )
++    except Exception as exc:
++        logger.warning("SoulLink memory-authority schema gate unavailable: %s", exc)
++
+     # The set of tool names that actually passed check_fn filtering.
+     # Use this (not tools_to_include) for any downstream schema that references
+     # other tools by name — otherwise the model sees tools mentioned in
+diff --git a/tests/agent/test_soullink_memory_authority_adapter.py b/tests/agent/test_soullink_memory_authority_adapter.py
+new file mode 100644
+index 00000000..bc26587a
+--- /dev/null
++++ b/tests/agent/test_soullink_memory_authority_adapter.py
+@@ -0,0 +1,103 @@
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++from agent.agent_runtime_helpers import invoke_tool
++from agent.soullink_memory_authority import (
++    filter_tool_definitions,
++    forbidden_result,
++    state_for_agent,
++    state_for_config,
++)
++
++
++def _defs(*names: str) -> list[dict]:
++    return [
++        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
++        for name in names
++    ]
++
++
++def test_schema_hides_builtin_memory_but_keeps_soullink_tools() -> None:
++    names = {
++        item["function"]["name"]
++        for item in filter_tool_definitions(
++            _defs("memory", "session_search", "soullink_memory_search", "soullink_memory_remember"),
++            config={"memory": {"provider": "soullink"}},
++        )
++    }
++    assert names == {"soullink_memory_search", "soullink_memory_remember"}
++
++
++def test_non_soullink_provider_is_unchanged() -> None:
++    original = _defs("memory", "session_search", "mem0_search")
++    assert filter_tool_definitions(
++        original,
++        config={"memory": {"provider": "mem0"}},
++    ) is original
++    assert forbidden_result("memory", state="inactive") is None
++
++
++def test_configured_but_unavailable_fails_closed() -> None:
++    assert state_for_config(
++        {"memory": {"provider": "soullink"}},
++        provider_available=False,
++    ) == "unavailable"
++    result = json.loads(forbidden_result("memory", state="unavailable"))
++    assert result == {
++        "success": False,
++        "status": "unavailable",
++        "authority": "soullink/pcltm",
++        "fallback": "forbidden",
++        "tool": "memory",
++    }
++
++
++def test_sequential_and_concurrent_dispatch_gate_blocks_retired_tools() -> None:
++    import ast
++    from pathlib import Path
++
++    source = Path("agent/tool_executor.py").read_text(encoding="utf-8")
++    tree = ast.parse(source)
++    calls = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Name)
++        and node.func.id == "_memory_authority_block_for_agent"
++    ]
++    assert len(calls) == 2
++    assert "execute_tool_calls_concurrent" in source
++    assert "execute_tool_calls_sequential" in source
++
++
++def test_runtime_helper_blocks_direct_memory_without_touching_store() -> None:
++    class ExplodingStore:
++        def __getattribute__(self, name):
++            raise AssertionError(f"built-in store touched: {name}")
++
++    agent = SimpleNamespace(
++        _soullink_memory_authority_state="active",
++        _memory_store=ExplodingStore(),
++        _memory_manager=None,
++    )
++    result = json.loads(invoke_tool(agent, "memory", {"action": "add"}, "task"))
++    assert result["status"] == "forbidden"
++    assert result["fallback"] == "forbidden"
++
++
++def test_runtime_helper_blocks_session_search_without_db_recall() -> None:
++    agent = SimpleNamespace(
++        _soullink_memory_authority_state="active",
++        _get_session_db_for_recall=lambda: (_ for _ in ()).throw(
++            AssertionError("session DB recall must not run")
++        ),
++    )
++    result = json.loads(invoke_tool(agent, "session_search", {"query": "x"}, "task"))
++    assert result["status"] == "forbidden"
++    assert result["fallback"] == "forbidden"
++
++
++def test_invalid_agent_state_is_inactive() -> None:
++    assert state_for_agent(SimpleNamespace(_soullink_memory_authority_state="bogus")) == "inactive"
