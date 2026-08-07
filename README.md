@@ -10,9 +10,26 @@ SoulLink is an open-source runtime for agents that should feel like the **same p
 
 > A memory is not automatically an instruction. An emotion is not only a style adjective. A summary is not the latest user request. SoulLink makes those distinctions executable and auditable.
 
-![SoulLink Observatory showing synthetic demo data](docs/assets/soullink-observatory-demo.png)
+![SoulLink Observatory 2.2 public demo](docs/assets/soullink-observatory-demo.png)
 
-*The screenshot uses synthetic public demo data rendered by the real read-only SoulLink WebUI. It contains no private persona, memory, or conversation data.*
+*SoulLink Public 2.2 WebUI, captured from the production-served frontend after replacing the live values in the browser with an explicit public-demo fixture. The image preserves the shipped layout and rendering, but contains no production turn, timestamp, emotion, relationship, memory, token, conversation, or host data.*
+
+## What changed in 2.2
+
+SoulLink Public 2.2 is not a version-label-only refresh. It synchronizes the public runtime with the production architecture and closes the paths between durable memory, governed retrieval, prompt influence, observability, host updates, and rollback.
+
+| Area | 2.2 behavior |
+|---|---|
+| **Memory authority** | Governed claims and their evidence/provenance are the durable authority; legacy tables, files, and retrieval indexes are migration or projection surfaces, not competing sources of truth. |
+| **Write path** | Candidate records move through explicit validation and policy judgment before promotion. Projection updates follow the authoritative write instead of becoming an independent write channel. |
+| **Retrieval** | SQLite/FTS, MemFS, episodic, and optional semantic signals produce bounded candidates. Retrieval similarity alone cannot authorize a fact or inject it into the model input. |
+| **Final influence evidence** | Selection, governance, and final-forward observations are distinguished. When the host does not expose an exact boundary, SoulLink reports that evidence as unavailable instead of inferring it from the answer. |
+| **Recovery and migration** | Projection rebuild, restore rehearsal, lineage recovery, and legacy-shadow migration preserve provenance and fail closed on ambiguous or unsafe inputs. |
+| **Adaptive semantics** | Local semantic retrieval and rules-based fusion improve candidate ranking while remaining subordinate to configured authority, policy, and deterministic fallback. |
+| **WebUI** | The read-only Neural Observatory now separates exact host capture from sidecar preview and shows freshness, provenance, memory causality, context architecture, and unavailable evidence honestly. |
+| **Hermes lifecycle** | `soullink-hermes-update` provides a lossless update transaction with authenticated recovery points, compatibility checks, receipts, and rollback evidence. |
+| **Codex lifecycle** | The STDIO MCP adapter and lifecycle hooks expose governed tools without claiming a final-model-input boundary that Codex does not provide. |
+| **Windows safety** | Deployment and rollback reject reparse-point escapes and other path redirections that could move mutations outside the selected host root. |
 
 ## What you can verify
 
@@ -169,6 +186,57 @@ the model:
 
 That is why PCLTM is the distinctive architecture inside SoulLink. It gives a persona agent continuity without surrendering
 control of the active prompt to untyped memory retrieval or opaque compression.
+
+## Governed memory lifecycle
+
+PCLTM keeps archive size, retrieval quality, policy authority, and final prompt influence separate:
+
+```text
+conversation / explicit write request
+                 |
+                 v
+        candidate extraction
+                 |
+        validate + classify + scope
+                 |
+                 v
+       governance / promotion gate
+          | approved       | rejected / deferred
+          v                v
+ authoritative claim     audit evidence only
+          |
+          +--> SQLite/FTS projection
+          +--> MemFS projection
+          +--> optional semantic index
+          |
+          v
+ bounded retrieval candidates
+          |
+ selection + conflict + budget policy
+          |
+          v
+ observed final-forward influence (only when the host exposes it)
+```
+
+### Authority and projections
+
+- The governed claim store is authoritative for durable memory state.
+- SQLite FTS, MemFS, vector/semantic indexes, and legacy tables are derived lookup, compatibility, or migration surfaces.
+- Rebuilding a projection must not mint a new authoritative fact or erase provenance.
+- Restore and lineage recovery validate source evidence before rematerializing projections.
+- A candidate may remain searchable or auditable without being eligible for prompt injection.
+
+### Candidate processing and promotion
+
+Conversation-derived material is not written as truth merely because it was mentioned. The runtime can extract a candidate, attach provenance and scope, classify its intended target, resolve conflicts, and run governance before promotion. Rejected, ambiguous, or policy-ineligible records remain non-authoritative. This preserves the distinction between “observed text,” “retrievable candidate,” “approved durable memory,” and “actually influenced this response.”
+
+### Retrieval and semantic fusion
+
+Lexical, episodic, MemFS, and optional local-semantic retrieval can contribute candidates. Adaptive ranking can use feedback and bounded semantic signals, but those signals do not independently approve a record, override the current user request, or become proof that the record reached the model. The deterministic rules path remains available when optional inference is missing, stale, or below its configured threshold.
+
+### Migration, rebuild, and recovery
+
+2.2 includes legacy-shadow migration, projection rebuild, restore rehearsal, and lineage-recovery components. Back up deployment-owned data first, run migration/rebuild in dry-run or isolated mode when available, retain evidence and receipts, and verify both authoritative records and each projection afterward. A clean source checkout is not evidence that a production runtime directory is safe to rewrite.
 
 ## Model Router
 
@@ -427,6 +495,21 @@ python scripts/public_release_audit.py --root . --json
 
 The audit rejects private identity markers, host-local absolute paths, runtime databases, logs, backups, key material, private production reports, and missing release-policy files. Release archives should be scanned independently as well; a clean source tree does not prove a clean wheel or sdist.
 
+## WebUI evidence model
+
+The monitor is an observability surface, not an administrative control plane. It binds to loopback and stays read-only by default. The 2.2 dashboard reports evidence with explicit strength and freshness:
+
+| Evidence label | Meaning |
+|---|---|
+| `exact_host_capture` | Captured at a supported host boundary and attributable to a specific host turn. |
+| `sidecar_reconstruction_preview` | A read-only reconstruction from available runtime state; useful for diagnosis, but not proof of what was forwarded to the model. |
+| `unavailable` / `not observed` | The runtime has no defensible evidence for that stage. The UI leaves the gap visible rather than backfilling a plausible story. |
+| `stale` | A real observation exists but is older than the configured freshness boundary. |
+
+The overview connects posture, decision authority, semantic fusion, memory causality, affective state, causal trace, governance selection, context architecture, and the fact base. Private deployments may expose local memory and emotion details on the loopback page; do not publish a raw production screenshot without reviewing those values. See [`docs/webui-monitoring.md`](docs/webui-monitoring.md) for the API, freshness rules, Windows login-start task, and rollback behavior.
+
+The README image above was captured from the production-served 2.2 frontend, then converted in-browser to an explicit public demo before capture. It is not evidence of the private runtime values and does not contain them.
+
 ## Security Model
 
 SoulLink assumes that retrieved memory, compaction text, host messages, and tool output may be untrusted. Important boundaries include:
@@ -534,6 +617,23 @@ core packages depend on Hermes. Treat host compatibility as version-specific and
 run detect, apply, verify, and rollback against an isolated host before production use.
 
 ## Release and Packaging
+
+Official `v2.2.0` release assets are:
+
+- `soullink_public-2.2.0-py3-none-any.whl`
+- `soullink_public-2.2.0.tar.gz`
+- `SHA256SUMS.txt`
+
+Verify downloads before installation:
+
+```bash
+# Linux/macOS/Git Bash
+sha256sum -c SHA256SUMS.txt
+
+# Windows PowerShell
+Get-FileHash .\soullink_public-2.2.0-py3-none-any.whl -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
 
 This repository builds standard Python source and wheel distributions:
 

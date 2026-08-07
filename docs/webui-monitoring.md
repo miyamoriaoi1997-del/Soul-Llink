@@ -38,6 +38,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/manage-webui
 - Collector 强制使用 `fix=False`、`rebuild=False`、`dry_run=True`、`rebuild_indexes=False`。
 - WebUI 不执行批准、删除、修复、模式切换或索引重建。
 
+## 证据语义
+
+WebUI 不把“能推测”写成“已观察”。主要状态含义：
+
+| 状态 | 含义 |
+|---|---|
+| `exact_host_capture` | 在受支持的宿主边界捕获，可归属于具体宿主轮次。 |
+| `sidecar_reconstruction_preview` | 根据旁路可用状态只读重建的诊断预览；不是最终模型输入证据。 |
+| `unavailable` / `not observed` | 没有足够证据，界面保留缺口，不从最终回答或邻近状态反推。 |
+| `stale` | 观察真实存在，但超过新鲜度阈值。 |
+
+首页把当前姿态、决策权威、语义融合、记忆影响路径、情绪状态、状态轨迹、判断证据、上下文构成与事实底座放在同一证据面。`ARCHIVE → RECALL → GOVERN → FORWARD` 只连接同一轮真实捕获的阶段；其中任一阶段未捕获时，就显示未捕获。
+
+## 公开截图
+
+私有生产页面会直接显示本机情绪/关系值、记忆规模、注入正文、宿主轮次、时间戳和 token 遥测。公开截图前必须逐项审查，不能因为服务只绑定 loopback 就把截图视为无隐私。
+
+仓库的 `docs/assets/soullink-observatory-demo.png` 来自生产提供的 2.2 前端，但在浏览器内先替换为明确的合成 demo 值，并只保留首页首屏结构。图片不包含生产轮次、时间、情绪、关系、记忆、token、对话或宿主数据。
+
 ## API
 
 - `GET /api/v1/health`
