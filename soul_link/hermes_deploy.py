@@ -13,7 +13,12 @@ from uuid import uuid4
 
 import yaml
 
-from soul_link.host_adaptation import AdaptationReceipt, CompatibilityManifest, HostAdapterController
+from soul_link.host_adaptation import (
+    AdaptationReceipt,
+    CompatibilityManifest,
+    HostAdapterController,
+    _reject_reparse_path,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,13 +54,15 @@ class DeploymentReceipt:
     def load(cls, path: Path) -> "DeploymentReceipt":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         paths = {
-            key: Path(data[key]).resolve()
+            key: Path(os.path.abspath(os.fspath(data[key])))
             for key in ("host_root", "hermes_home", "soullink_root", "backup_path")
         }
         raw_host_receipt = str(data.get("host_adaptation_receipt") or "").strip()
         return cls(
             **paths,
-            host_adaptation_receipt=Path(raw_host_receipt).resolve() if raw_host_receipt else None,
+            host_adaptation_receipt=(
+                Path(os.path.abspath(raw_host_receipt)) if raw_host_receipt else None
+            ),
             adapter_version=str(data["adapter_version"]),
             fingerprints=data.get("fingerprints"),
             entries=data.get("entries"),
@@ -75,7 +82,7 @@ class HermesDeployment:
     }
 
     def __init__(self, soullink_root: Path) -> None:
-        self.root = Path(soullink_root).resolve()
+        self.root = _reject_reparse_path(soullink_root, label="SoulLink root")
         self.asset = Path(__file__).resolve().parent / "hermes_assets"
         for required in (
             self.asset / "memory/__init__.py",
@@ -90,8 +97,25 @@ class HermesDeployment:
                 raise RuntimeError(f"SoulLink deployment asset missing: {required}")
 
     def detect(self, host_root: Path, hermes_home: Path) -> dict[str, object]:
-        host = Path(host_root).resolve()
-        home = Path(hermes_home).resolve()
+        try:
+            host = _reject_reparse_path(host_root, label="host root")
+        except FileNotFoundError:
+            missing = list(self.host_contract)
+            return {
+                "classification": "incompatible",
+                "runtime_health": "unavailable",
+                "authority_health": "degraded",
+                "host_source_mutation_required": False,
+                "host_adaptation": {
+                    "classification": "incompatible",
+                    "patch_state": "not_checked",
+                    "missing_paths": missing,
+                },
+                "missing_host_paths": missing,
+                "missing_host_capabilities": [],
+                "installed": False,
+            }
+        home = _reject_reparse_path(hermes_home, label="Hermes home", allow_missing_leaf=True)
         host_adaptation = self._host_controller().detect(host)
         missing: list[str] = []
         drifted: list[str] = []
@@ -129,8 +153,8 @@ class HermesDeployment:
         }
 
     def apply(self, host_root: Path, hermes_home: Path) -> DeploymentReceipt | None:
-        host = Path(host_root).resolve()
-        home = Path(hermes_home).resolve()
+        host = _reject_reparse_path(host_root, label="host root")
+        home = _reject_reparse_path(hermes_home, label="Hermes home", allow_missing_leaf=True)
         state = self.detect(host, home)
         if state["classification"] == "incompatible":
             raise RuntimeError(f"Hermes host is incompatible: {state}")
@@ -204,8 +228,8 @@ class HermesDeployment:
             raise
 
     def verify(self, host_root: Path, hermes_home: Path) -> bool:
-        host = Path(host_root).resolve()
-        home = Path(hermes_home).resolve()
+        host = _reject_reparse_path(host_root, label="host root")
+        home = _reject_reparse_path(hermes_home, label="Hermes home")
         if self.detect(host, home)["classification"] == "incompatible":
             return False
         if not self._host_controller().verify(host):
@@ -245,11 +269,13 @@ class HermesDeployment:
     def rollback(self, receipt: DeploymentReceipt) -> bool:
         if receipt.adapter_version not in self.rollback_compatible_versions:
             raise RuntimeError("deployment receipt version mismatch")
-        home = receipt.hermes_home.resolve()
-        backup = receipt.backup_path.resolve()
+        home = _reject_reparse_path(receipt.hermes_home, label="Hermes home")
+        backup = _reject_reparse_path(receipt.backup_path, label="deployment backup")
         if backup.parent != home or not backup.name.startswith(".soullink-deploy-backup-"):
             raise RuntimeError("invalid deployment backup path")
-        marker_path = backup / ".soullink-deploy.json"
+        marker_path = _reject_reparse_path(
+            backup / ".soullink-deploy.json", label="deployment backup marker"
+        )
         if not marker_path.is_file():
             raise RuntimeError("deployment backup marker missing")
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -257,7 +283,7 @@ class HermesDeployment:
         if receipt.adapter_version == "2" and set(entries) != set(self.managed):
             raise RuntimeError("legacy deployment backup incomplete")
         expected = {
-            "host_root": str(receipt.host_root.resolve()),
+            "host_root": str(_reject_reparse_path(receipt.host_root, label="host root")),
             "hermes_home": str(home), "soullink_root": str(self.root),
             "adapter_version": receipt.adapter_version,
         }
@@ -277,7 +303,9 @@ class HermesDeployment:
                 raise RuntimeError("deployment backup entries mismatch between receipt and marker")
         host_receipt: AdaptationReceipt | None = None
         if receipt.host_adaptation_receipt is not None:
-            host_receipt_path = receipt.host_adaptation_receipt.resolve()
+            host_receipt_path = _reject_reparse_path(
+                receipt.host_adaptation_receipt, label="host adaptation receipt"
+            )
             try:
                 host_receipt_path.relative_to(backup)
             except ValueError as exc:
@@ -476,9 +504,12 @@ class HermesDeployment:
             or ".." in path.parts or ".." in windows_path.parts
         ):
             raise RuntimeError(f"unsafe managed path: {relative}")
-        target = (root / relative).resolve()
+        safe_root = _reject_reparse_path(root, label="managed root", allow_missing_leaf=True)
+        target = _reject_reparse_path(
+            safe_root / relative, label="managed path", allow_missing_leaf=True
+        )
         try:
-            target.relative_to(root.resolve())
+            target.relative_to(safe_root)
         except ValueError as exc:
             raise RuntimeError(f"managed path escapes root: {relative}") from exc
         return target

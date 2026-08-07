@@ -139,8 +139,8 @@ class AdaptationReceipt:
     def load(cls, path: Path) -> "AdaptationReceipt":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(
-            host_root=Path(data["host_root"]).resolve(),
-            backup_path=Path(data["backup_path"]).resolve(),
+            host_root=Path(os.path.abspath(os.fspath(data["host_root"]))),
+            backup_path=Path(os.path.abspath(os.fspath(data["backup_path"]))),
             adapter_version=str(data["adapter_version"]),
             fingerprints=data.get("fingerprints"),
         )
@@ -157,7 +157,13 @@ class HostAdapterController:
         self._run = command_runner or self._run_command
 
     def detect(self, host_root: Path) -> CompatibilityResult:
-        root = Path(host_root).resolve()
+        raw_root = Path(host_root)
+        try:
+            root = _reject_reparse_path(raw_root, label="host root")
+        except FileNotFoundError:
+            return CompatibilityResult(
+                "incompatible", "not_checked", tuple(self.manifest.required_paths)
+            )
         targets = {relative: self._host_path(root, relative) for relative in self.manifest.required_paths}
         missing = tuple(relative for relative, target in targets.items() if not target.is_file())
         if missing:
@@ -175,7 +181,7 @@ class HostAdapterController:
         return CompatibilityResult("incompatible", "mismatch", ())
 
     def verify(self, host_root: Path) -> bool:
-        root = Path(host_root).resolve()
+        root = _reject_reparse_path(host_root, label="host root")
         if self.detect(root).classification != "supported":
             return False
         return all(self._run(self._expand_command(command), root) == 0 for command in self.manifest.verify_commands)
@@ -187,7 +193,7 @@ class HostAdapterController:
         verifier: Callable[[Path], bool],
         backup_root: Path | None = None,
     ) -> tuple[CompatibilityResult, AdaptationReceipt | None]:
-        root = Path(host_root).resolve()
+        root = _reject_reparse_path(host_root, label="host root")
         detected = self.detect(root)
         if detected.classification == "supported":
             if not verifier(root):
@@ -232,19 +238,30 @@ class HostAdapterController:
             raise
 
     def rollback(self, receipt: AdaptationReceipt, *, trusted_backup_root: Path | None = None) -> bool:
-        root = Path(receipt.host_root).resolve()
-        backup = Path(receipt.backup_path).resolve()
+        root = _reject_reparse_path(receipt.host_root, label="host root")
+        backup = _reject_reparse_path(receipt.backup_path, label="adaptation backup")
         if receipt.adapter_version != self.manifest.adapter_version:
             raise RuntimeError("adaptation receipt version does not match manifest")
         marker_path = backup / ".soullink-backup.json"
-        expected_parent = Path(trusted_backup_root).resolve() if trusted_backup_root is not None else root
+        expected_parent = (
+            _reject_reparse_path(trusted_backup_root, label="trusted backup root")
+            if trusted_backup_root is not None
+            else root
+        )
         valid_prefix = ".host-" if trusted_backup_root is not None else ".soullink-adapter-backup-"
         if (
             not backup.is_dir()
             or backup.parent != expected_parent
             or not backup.name.startswith(valid_prefix)
-            or not marker_path.is_file()
         ):
+            raise RuntimeError("invalid or missing adaptation backup")
+        try:
+            marker_path = _reject_reparse_path(
+                marker_path, label="adaptation backup marker"
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise RuntimeError("invalid or missing adaptation backup") from exc
+        if not marker_path.is_file():
             raise RuntimeError("invalid or missing adaptation backup")
         try:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -298,7 +315,10 @@ class HostAdapterController:
 
     @staticmethod
     def _host_path(root: Path, relative: str) -> Path:
-        target = (root / relative).resolve()
+        try:
+            target = _reject_reparse_path(root / relative, label="host path", allow_missing_leaf=True)
+        except RuntimeError as exc:
+            raise RuntimeError(f"host path escapes host root: {relative}: {exc}") from exc
         try:
             target.relative_to(root)
         except ValueError as exc:

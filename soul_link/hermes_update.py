@@ -18,6 +18,8 @@ from uuid import uuid4
 
 import yaml
 
+from soul_link.host_adaptation import _reject_reparse_path
+
 
 @dataclass(frozen=True, slots=True)
 class LosslessUpdateReceipt:
@@ -65,9 +67,17 @@ class LosslessUpdateController:
         allowed_host_deltas: tuple[str, ...] = (),
     ) -> None:
         self._configured_hermes_home = Path(os.path.abspath(os.fspath(hermes_home)))
-        self.soullink_root = Path(soullink_root).resolve()
-        self.host_root = Path(host_root).resolve()
-        self.hermes_home = self._configured_hermes_home.resolve()
+        self.soullink_root = _reject_reparse_path(
+            soullink_root, label="SoulLink root", allow_missing_leaf=True
+        )
+        self.host_root = _reject_reparse_path(
+            host_root, label="host root", allow_missing_leaf=True
+        )
+        self.hermes_home = _reject_reparse_path(
+            self._configured_hermes_home,
+            label="Hermes home",
+            allow_missing_leaf=True,
+        )
         self.sqlite_paths = tuple(Path(path).resolve() for path in sqlite_paths)
         self.allowed_host_deltas = tuple(str(path).replace(chr(92), "/") for path in allowed_host_deltas)
         self._lock_path = self.hermes_home.parent / f".{self.hermes_home.name}.soullink-update.lock"
@@ -724,18 +734,19 @@ class LosslessUpdateController:
 
 
 def build_controller(soullink_root: Path, host_root: Path, hermes_home: Path) -> LosslessUpdateController:
-    root = Path(soullink_root).resolve()
+    root = _reject_reparse_path(soullink_root, label="SoulLink root")
+    safe_home = _reject_reparse_path(hermes_home, label="Hermes home", allow_missing_leaf=True)
     manifest_path = root / "adapters/hermes/compatibility-soullink-runtime.yaml"
     data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
     allowed = [str(path).replace(chr(92), "/") for key in ("required_paths", "created_paths") for path in data.get(key, [])]
     allowed.append("plugins/context_engine/pcltm-context/")
     database = root / "var/pcltm-prod.db"
-    state_db = Path(hermes_home).resolve() / "state.db"
+    state_db = safe_home / "state.db"
     sqlite_paths = (database.resolve(), state_db.resolve())
     return LosslessUpdateController(
         soullink_root=root,
         host_root=host_root,
-        hermes_home=hermes_home,
+        hermes_home=safe_home,
         sqlite_paths=sqlite_paths,
         allowed_host_deltas=tuple(allowed),
     )

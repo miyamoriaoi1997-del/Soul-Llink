@@ -798,14 +798,12 @@ def test_prepare_rejects_symlinked_profile_root(tmp_path: Path) -> None:
     real_home.mkdir()
     soullink.mkdir()
     linked_home.symlink_to(real_home, target_is_directory=True)
-    controller = LosslessUpdateController(
-        soullink_root=soullink, host_root=host, hermes_home=linked_home
-    )
-
     import pytest
 
-    with pytest.raises(RuntimeError, match="root is a symlink or reparse point"):
-        controller.prepare(tmp_path / "recovery/receipt.json")
+    with pytest.raises(RuntimeError, match="symlink or reparse"):
+        LosslessUpdateController(
+            soullink_root=soullink, host_root=host, hermes_home=linked_home
+        )
 
 
 def test_update_lock_treats_uninitialized_lock_as_active(tmp_path: Path) -> None:
