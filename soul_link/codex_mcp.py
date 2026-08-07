@@ -68,6 +68,8 @@ def soullink_memory_recall_exact(query: str, limit: int = 8) -> list[dict[str, A
 @mcp.tool()
 def soullink_memory_remember(content: str, target: str = "memory") -> dict[str, Any]:
     """Persist an explicit durable user preference or memory through governed PCLTM storage."""
+    if os.environ.get("SOULLINK_CODEX_ALLOW_MEMORY_WRITES") != "1":
+        return {"success": False, "error": "write_disabled", "target": target}
     if target not in {"user", "memory"}:
         return {"success": False, "error": "target must be user or memory"}
     return {"success": bool(sync_memory_tool_write(target=target, action="add", content=content)), "target": target}

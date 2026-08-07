@@ -431,6 +431,8 @@ def build_session_summary_chain(
 ) -> SessionSummaryChain:
     if segment_size <= 0:
         raise ValueError("segment_size must be positive")
+    if max_segments <= 0:
+        raise ValueError("max_segments must be positive")
     if not turns:
         return SessionSummaryChain(session_id=session_id, active_dialogue_state=active_dialogue_state, segment_size=segment_size, max_segments=max_segments)
     active_dialogue_state = active_dialogue_state or update_from_turns(turns)
@@ -447,7 +449,7 @@ def build_session_summary_chain(
         built_segments.append(segment)
         prior_task = segment.current_task or prior_task
     segments = tuple(built_segments)
-    if max_segments > 0 and len(segments) > max_segments:
+    if len(segments) > max_segments:
         segments = segments[-max_segments:]
     return _chain_from_segments(
         segments,

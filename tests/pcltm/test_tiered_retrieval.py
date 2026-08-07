@@ -4,7 +4,13 @@ from dataclasses import replace
 import sqlite3
 from pathlib import Path
 
-from pcltm.retrieval_provider import AuthorityReference, Candidate, RetrievalRequest, RetrievalResult
+from pcltm.retrieval_provider import (
+    AuthorityReference,
+    Candidate,
+    RetrievalRequest,
+    RetrievalResult,
+    RetrievalStatus,
+)
 from pcltm.projections.transcript_chunks import TranscriptChunkProjector
 from pcltm.store import EventStore
 from pcltm.tiered_retrieval import retrieve_lexical, retrieve_with_authority
@@ -122,7 +128,9 @@ def test_authority_reopen_rejects_missing_chunk_reference(tmp_path: Path) -> Non
     finally:
         store.close()
 
-    assert result == ()
+    assert isinstance(result, RetrievalResult)
+    assert result.status is RetrievalStatus.UNAVAILABLE
+    assert result.reason == "authority_reopen_failed"
 
 
 def test_authority_reopen_accepts_current_chunk_and_exact_evidence(tmp_path: Path) -> None:
@@ -270,7 +278,9 @@ def test_optional_provider_cannot_cross_requested_authority_scope(tmp_path: Path
     finally:
         store.close()
 
-    assert result == ()
+    assert isinstance(result, RetrievalResult)
+    assert result.status is RetrievalStatus.ABSTAINED
+    assert result.reason == "policy_filtered"
 
 
 def test_authority_reopen_rejects_wrong_chunk_ordinal(tmp_path: Path) -> None:
@@ -307,7 +317,9 @@ def test_authority_reopen_rejects_wrong_chunk_ordinal(tmp_path: Path) -> None:
     finally:
         store.close()
 
-    assert result == ()
+    assert isinstance(result, RetrievalResult)
+    assert result.status is RetrievalStatus.UNAVAILABLE
+    assert result.reason == "authority_reopen_failed"
 
 
 def test_authority_reopen_rejects_stale_reference_and_revoked_governance(tmp_path: Path) -> None:
@@ -343,9 +355,12 @@ def test_authority_reopen_rejects_stale_reference_and_revoked_governance(tmp_pat
             def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
                 return RetrievalResult.ok((stale,))
 
-        assert retrieve_with_authority(
+        stale_result = retrieve_with_authority(
             store, RetrievalRequest("ignored", session_id="s"), StaleProvider()
-        ) == ()
+        )
+        assert isinstance(stale_result, RetrievalResult)
+        assert stale_result.status is RetrievalStatus.UNAVAILABLE
+        assert stale_result.reason == "authority_reopen_failed"
 
         store._conn.execute(
             """INSERT INTO event_governance
@@ -359,11 +374,63 @@ def test_authority_reopen_rejects_stale_reference_and_revoked_governance(tmp_pat
             def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
                 return RetrievalResult.ok((current,))
 
-        assert retrieve_with_authority(
+        revoked_result = retrieve_with_authority(
             store, RetrievalRequest("ignored", session_id="s"), CurrentProvider()
-        ) == ()
+        )
+        assert isinstance(revoked_result, RetrievalResult)
+        assert revoked_result.status is RetrievalStatus.UNAVAILABLE
+        assert revoked_result.reason == "authority_reopen_failed"
     finally:
         store.close()
+
+
+def test_mixed_valid_and_corrupt_provider_candidates_fail_closed(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "core.db")
+    try:
+        candidates = []
+        for index in range(2):
+            content = f"opaque-{index}-needle"
+            event_id = store.append_event(
+                session_id="s", conversation_id="c", platform="desktop", role="user",
+                source="chat", content=content, category="raw_conversation",
+                subcategory="user", inject_policy="retrieve_only",
+            )
+            TranscriptChunkProjector(store, worker_id=f"test-{index}").run_once(
+                now=f"2026-07-17T05:0{index}:00Z",
+                lease_until=f"2026-07-17T05:0{index + 1}:00Z",
+            )
+            event = store.get_event(event_id)
+            chunk = store._conn.execute(
+                "SELECT * FROM event_chunks WHERE event_id = ?", (event_id,),
+            ).fetchone()
+            candidates.append(Candidate(
+                reference=AuthorityReference(
+                    event_id=event_id, chunk_id=int(chunk["chunk_id"]),
+                    chunk_ordinal=int(chunk["chunk_ordinal"]),
+                    source_revision=int(event["source_revision"]), start_char=0,
+                    end_char=len(content), payload_sha256=event["payload_sha256"],
+                    chain_hash=event["chain_hash"], chunk_sha256=chunk["chunk_sha256"],
+                ),
+                score=1.0 - index / 10, provider="fake.neural", quote=content,
+            ))
+        candidates[1] = replace(
+            candidates[1],
+            reference=replace(candidates[1].reference, payload_sha256="0" * 64),
+        )
+
+        class MixedProvider:
+            def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
+                return RetrievalResult.ok(tuple(candidates))
+
+        result = retrieve_with_authority(
+            store, RetrievalRequest("absent-from-core", session_id="s"), MixedProvider(),
+        )
+    finally:
+        store.close()
+
+    assert isinstance(result, RetrievalResult)
+    assert result.status is RetrievalStatus.UNAVAILABLE
+    assert result.reason == "authority_reopen_failed"
 
 
 def test_authority_reopen_is_zero_write(tmp_path: Path) -> None:

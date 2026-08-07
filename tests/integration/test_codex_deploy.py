@@ -77,6 +77,49 @@ def test_detect_rejects_invalid_existing_toml(tmp_path: Path) -> None:
     assert "invalid_config_toml" in state["blockers"]
 
 
+@pytest.mark.parametrize("value", ['"bad"', "[]"])
+def test_detect_rejects_invalid_mcp_server_shape(tmp_path: Path, value: str) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(f"mcp_servers = {value}\n", encoding="utf-8")
+    state = CodexDeployment().detect(codex_home)
+    assert state["classification"] == "incompatible"
+    assert "invalid_config_shape" in state["blockers"]
+
+
+def test_detect_rejects_invalid_soullink_server_shape(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('[mcp_servers]\nsoullink = "bad"\n', encoding="utf-8")
+    state = CodexDeployment().detect(codex_home)
+    assert state["classification"] == "incompatible"
+    assert "invalid_config_shape" in state["blockers"]
+
+
+def test_detect_rejects_invalid_hook_event_group(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    deployment = CodexDeployment()
+    deployment.apply(codex_home, db_path=tmp_path / "runtime/pcltm.db", memfs_root=tmp_path / "runtime/memfs")
+    hooks_path = codex_home / "hooks.json"
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    hooks["hooks"]["SessionStart"] = "damaged"
+    hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
+    state = deployment.detect(codex_home)
+    assert state["classification"] == "incompatible"
+    assert state["installed"] is False
+    assert "invalid_hooks_shape" in state["blockers"]
+
+
+@pytest.mark.parametrize("payload", [{}, {"hooks": {"Stop": [{}]}}])
+def test_detect_rejects_missing_hook_schema_members(tmp_path: Path, payload: dict[str, object]) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text(json.dumps(payload), encoding="utf-8")
+    state = CodexDeployment().detect(codex_home)
+    assert state["classification"] == "incompatible"
+    assert "invalid_hooks_shape" in state["blockers"]
+
+
 def test_apply_rejects_symlinked_managed_directory_without_external_write(tmp_path: Path) -> None:
     codex_home = tmp_path / "codex-home"
     outside = tmp_path / "outside"

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +21,7 @@ import yaml
 
 from .memfs_store import MemFSStore
 from .memfs_types import MemoryFileFrontmatter
+from .secret_policy import redact_secrets
 
 DRAFT_TARGET_LAYERS = {"episodic", "transient", "system"}
 
@@ -158,8 +159,11 @@ class ReflectionCandidateBuilder:
 class ReflectionWriter:
     """Write approved memory drafts to MemFS store."""
 
-    def __init__(self, store: MemFSStore):
+    def __init__(self, store: MemFSStore, *, max_body_chars: int = 4000):
+        if max_body_chars <= 0:
+            raise ValueError("max_body_chars must be positive")
         self.store = store
+        self.max_body_chars = max_body_chars
 
     def write_draft(self, draft: MemoryDraft, *, allow_system: bool = False) -> bool:
         """Write a single draft. Reject system/ writes unless allow_system=True."""
@@ -168,9 +172,20 @@ class ReflectionWriter:
         if draft.relative_path.split("/", 1)[0] != draft.target_layer:
             raise ValueError("draft relative_path must begin with target_layer")
 
-        path = self.store._safe_resolve(draft.relative_path)  # noqa: SLF001 - store owns root safety.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self._render_draft(draft), encoding="utf-8")
+        safe_body = redact_secrets(draft.body).rstrip()[: self.max_body_chars]
+        existing_limit = draft.frontmatter.char_limit
+        effective_limit = min(existing_limit, self.max_body_chars) if existing_limit is not None else self.max_body_chars
+        frontmatter = replace(
+            draft.frontmatter,
+            source=draft.source or draft.frontmatter.source,
+            char_limit=effective_limit,
+            extra={
+                **draft.frontmatter.extra,
+                **({"provenance": draft.provenance} if draft.provenance else {}),
+            },
+        )
+        safe_body = safe_body[:effective_limit]
+        self.store.write_file(draft.relative_path, frontmatter, safe_body)
         return True
 
     def write_all(self, drafts: list[MemoryDraft], *, allow_system: bool = False) -> dict:

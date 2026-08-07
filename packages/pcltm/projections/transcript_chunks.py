@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..store import EventStore
+from ..projection_outbox import require_event_projection_authority
 from ..transcript_chunker import CHUNKER_VERSION, chunk_transcript
 
 
@@ -35,19 +36,28 @@ class TranscriptChunkProjector:
         for job in jobs:
             try:
                 self._apply(job, now=now)
-                self.store.ack_projection_job(job["outbox_id"], worker_id=self.worker_id, now=now)
+                acked = self.store.ack_projection_job(
+                    job["outbox_id"], worker_id=self.worker_id,
+                    expected_attempt_count=int(job["attempt_count"]), now=now,
+                )
+                if not acked:
+                    raise RuntimeError("projection lease ownership lost")
                 result["applied"] += 1
             except Exception as exc:
+                if str(exc) == "projection lease ownership lost":
+                    result["failed"] += 1
+                    continue
                 retry_at = (datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(minutes=1)).astimezone(UTC).isoformat().replace("+00:00", "Z")
                 self.store.fail_projection_job(
                     job["outbox_id"], worker_id=self.worker_id, error=str(exc),
+                    expected_attempt_count=int(job["attempt_count"]),
                     now=now, next_retry_at=retry_at,
                 )
                 result["failed"] += 1
         return result
 
     def _apply(self, job: dict[str, Any], *, now: str) -> None:
-        event_id = int(job["event_seq"])
+        event_id = require_event_projection_authority(job)
         event = self.store.get_event(event_id)
         if event["payload_sha256"] != job["payload_sha256"]:
             raise ValueError("projection payload hash is stale")

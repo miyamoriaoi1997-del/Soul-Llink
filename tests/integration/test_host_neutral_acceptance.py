@@ -88,7 +88,6 @@ def test_soul_link_facade_composes_fake_host_prompt_without_hermes_runtime(tmp_p
         before = set(sys.modules)
         soul_link = SoulLink(
             state_path=state_path,
-            log_path=Path("logs/persona_orchestrator_shadow.jsonl").resolve(),
             enable_context_router=False,
         )
         request = soul_link.ingest(

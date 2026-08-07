@@ -42,7 +42,7 @@ caller-selected optional report is its sole write surface.
     {
       "case_id": "resume-active-task-across-session",
       "baseline": {
-        "identity": {"agent_id": "example-persona-rin"},
+        "identity": {"agent_id": "example-persona"},
         "task": {
           "current": "build continuity gate",
           "constraints": ["production-read-only"],
@@ -50,7 +50,7 @@ caller-selected optional report is its sole write surface.
         }
       },
       "candidate": {
-        "identity": {"agent_id": "example-persona-rin"},
+        "identity": {"agent_id": "example-persona"},
         "task": {
           "current": "build continuity gate",
           "constraints": ["production-read-only", "shadow-only"],

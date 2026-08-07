@@ -1,0 +1,11 @@
+host: hermes-agent
+adapter_version: "verification-guidance-v1"
+patch: patches/verification-guidance-host-adapter.patch
+required_paths:
+  - agent/verification_evidence.py
+  - agent/verification_stop.py
+  - tests/agent/test_verification_evidence.py
+  - tests/agent/test_verification_stop.py
+created_paths: []
+verify_commands:
+  - ["{python}", -m, pytest, tests/agent/test_verification_evidence.py, tests/agent/test_verification_stop.py, -q]

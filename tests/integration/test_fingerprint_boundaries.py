@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,9 +31,19 @@ def _host(tmp_path: Path) -> Path:
     return host
 
 
-def _deployment() -> HermesDeployment:
-    """Get HermesDeployment pointing to this repository."""
-    return HermesDeployment(Path(__file__).resolve().parents[2])
+def _deployment(monkeypatch) -> HermesDeployment:
+    """Get a deployment with a supported no-op host adapter seam."""
+    deployment = HermesDeployment(Path(__file__).resolve().parents[2])
+    controller = SimpleNamespace(
+        detect=lambda _host: SimpleNamespace(
+            classification="supported", patch_state="applied", missing_paths=()
+        ),
+        apply=lambda _host, **_kwargs: (SimpleNamespace(classification="supported"), None),
+        verify=lambda _host: True,
+        rollback=lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(deployment, "_host_controller", lambda: controller)
+    return deployment
 
 
 def test_fingerprints_detect_tampered_backup_file_only(tmp_path: Path, monkeypatch) -> None:
@@ -41,7 +52,7 @@ def test_fingerprints_detect_tampered_backup_file_only(tmp_path: Path, monkeypat
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -62,7 +73,7 @@ def test_fingerprints_detect_tampered_marker_only(tmp_path: Path, monkeypatch) -
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -85,7 +96,7 @@ def test_fingerprints_detect_missing_backup_file(tmp_path: Path, monkeypatch) ->
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -107,7 +118,7 @@ def test_receipt_detects_marker_entries_injection_before_rollback(tmp_path: Path
     home.mkdir()
     unmanaged = home / "unmanaged.txt"
     unmanaged.write_text("preserve me\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)

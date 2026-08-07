@@ -50,7 +50,6 @@ def test_fake_host_adapter_runs_turn_through_public_facade_without_hermes_import
         )
         link = SoulLink(
             state_path=Path("native-host-state.md").resolve(),
-            log_path=Path("logs/persona_orchestrator_shadow.jsonl").resolve(),
             enable_context_router=False,
         )
         envelope = adapter.run_turn(

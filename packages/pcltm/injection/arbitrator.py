@@ -9,10 +9,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from .budget_manager import BudgetManager, DEFAULT_BUDGET_FRACTIONS
-from .candidate import CandidateType, InjectionCandidate, normalize_candidate
+from .candidate import (
+    CandidateType,
+    InjectionCandidate,
+    estimate_token_cost,
+    normalize_candidate,
+)
 from .conflict_filter import ConflictFilter
 from .context_packet import ContextPacket, build_context_packet
 
@@ -32,6 +37,7 @@ class InjectionArbitrator:
     total_budget: int = 800
     budget_fractions: Mapping[CandidateType, float] = field(default_factory=lambda: dict(DEFAULT_BUDGET_FRACTIONS))
     allow_conflict_resolution: bool = False
+    token_counter: Callable[[str], int] = estimate_token_cost
 
     def arbitrate(
         self,
@@ -67,6 +73,7 @@ class InjectionArbitrator:
             conflict_decisions=conflict_decisions,
             budget=allocation,
             metadata=metadata,
+            token_counter=self.token_counter,
         )
 
     def replay(self, arbitration_input: ArbitrationInput) -> ContextPacket:

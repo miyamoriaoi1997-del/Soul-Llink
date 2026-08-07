@@ -17,6 +17,9 @@ __pycache__/
 venv/
 node_modules/
 
+# generated local service state (PID, logs, scheduled-task exports)
+packages/model_router/runtime/
+
 # private state and runtime snapshots
 state/*
 !state/.gitkeep

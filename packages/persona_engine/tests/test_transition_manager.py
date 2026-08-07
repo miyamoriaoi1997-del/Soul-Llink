@@ -167,6 +167,16 @@ def test_explicit_task_request_is_immediate_even_below_confidence_gate():
     assert result.transition == "daily->work"
 
 
+def test_work_exits_when_bounded_context_continuation_is_exhausted():
+    result = TransitionManager().transition(
+        MODE_WORK,
+        decision(MODE_DAILY, confidence=0.55, signals={"context_continuation_exhausted": True}),
+    )
+
+    assert result.active_mode == MODE_DAILY
+    assert result.transition == "work->daily"
+
+
 def test_sex_holds_on_daily_without_explicit_exit_signal():
     result = TransitionManager().transition(
         MODE_SEX,

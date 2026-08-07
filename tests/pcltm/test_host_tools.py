@@ -58,7 +58,7 @@ def test_pcltm_memory_tools_are_host_neutral_and_dispatch_injected_backend() -> 
     }
     assert calls == [
         ("search", {"query": "alpha", "mode": None, "layers": ("pinned", "episodic"), "limit": 3}),
-        ("open", {"memory_id": "m1", "body_limit": 4000}),
+        ("open", {"memory_id": "m1", "body_limit": 4000, "mode": None}),
         ("remember", {"target": "user", "action": "add", "content": "stable"}),
     ]
     forbidden_after = {name for name in sys.modules if name.split(".", 1)[0] in {"agent", "gateway", "hermes_cli"}}

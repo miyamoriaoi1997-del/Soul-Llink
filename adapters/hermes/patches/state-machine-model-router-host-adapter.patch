@@ -1,0 +1,386 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 45a88f8de..d2823ef8e 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
+ from __future__ import annotations
+ 
+ import json
++import copy
+ import logging
+ import os
+ import re
+@@ -817,7 +818,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
+ 
+ 
+ def build_api_kwargs(agent, api_messages: list) -> dict:
+-    """Build the keyword arguments dict for the active API mode."""
++    """Build provider API kwargs, including current-turn memory overrides."""
++    # Detach nested config before merging current-turn provider metadata.
++    # A shallow copy would let recursive merges mutate agent.request_overrides
++    # and leak correlation/routing values into later turns.
++    _base_request_overrides = copy.deepcopy(agent.request_overrides or {})
++    _memory_manager = getattr(agent, "_memory_manager", None)
++    if _memory_manager is not None:
++        _turn_request_overrides = _memory_manager.request_overrides()
++        if _turn_request_overrides:
++            from agent.memory_manager import MemoryManager
++            MemoryManager._merge_request_mappings(
++                _base_request_overrides, _turn_request_overrides
++            )
++    _effective_request_overrides = _base_request_overrides
+     tools_for_api = agent.tools
+ 
+     if agent.api_mode == "anthropic_messages":
+@@ -838,7 +852,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
+             preserve_dots=agent._anthropic_preserve_dots(),
+             context_length=ctx_len,
+             base_url=getattr(agent, "_anthropic_base_url", None),
+-            fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
++            fast_mode=(_effective_request_overrides or {}).get("speed") == "fast",
+             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+         )
+ 
+@@ -913,7 +927,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
+             session_id=getattr(agent, "session_id", None),
+             max_tokens=agent.max_tokens,
+             timeout=agent._resolved_api_call_timeout(),
+-            request_overrides=agent.request_overrides,
++            request_overrides=_effective_request_overrides,
+             is_github_responses=is_github_responses,
+             is_codex_backend=is_codex_backend,
+             is_xai_responses=is_xai_responses,
+@@ -1015,7 +1029,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
+             ephemeral_max_output_tokens=_ephemeral_out,
+             max_tokens_param_fn=agent._max_tokens_param,
+             reasoning_config=agent.reasoning_config,
+-            request_overrides=agent.request_overrides,
++            request_overrides=_effective_request_overrides,
+             session_id=getattr(agent, "session_id", None),
+             provider_profile=_profile,
+             ollama_num_ctx=agent._ollama_num_ctx,
+@@ -1047,7 +1061,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
+         ephemeral_max_output_tokens=_ephemeral_out,
+         max_tokens_param_fn=agent._max_tokens_param,
+         reasoning_config=agent.reasoning_config,
+-        request_overrides=agent.request_overrides,
++        request_overrides=_effective_request_overrides,
+         session_id=getattr(agent, "session_id", None),
+         model_lower=(agent.model or "").lower(),
+         is_openrouter=_is_or,
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 420d12670..e88a141e2 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -987,6 +987,14 @@ def run_conversation(
+         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
+         _sanitize_messages_surrogates(api_messages)
+ 
++        # Final host-owned API message array.  Provider observers run after
++        # all host rewrites and before the outbound transport/middleware call;
++        # failures remain observational and must never block a reply.
++        try:
++            agent._memory_manager.on_before_model_forward(api_messages)
++        except Exception:
++            logger.debug("Memory final-forward observers failed", exc_info=True)
++
+         # Calculate approximate request size for logging and pressure checks.
+         # estimate_messages_tokens_rough(api_messages) includes the system
+         # prompt copy but not the tool schema payload, which is sent as a
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 32dd8e288..1badd25c4 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -541,6 +541,17 @@ class MemoryManager:
+ 
+         self._submit_background(_run)
+ 
++    def on_before_model_forward(self, api_messages: List[Dict[str, Any]]) -> None:
++        """Notify providers after final host request rewriting, before outbound I/O."""
++        for provider in self._providers:
++            try:
++                provider.on_before_model_forward(api_messages)
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' final-forward observer failed: %s",
++                    provider.name, e,
++                )
++
+     # -- Sync ----------------------------------------------------------------
+ 
+     @staticmethod
+@@ -757,6 +768,37 @@ class MemoryManager:
+ 
+     # -- Lifecycle hooks -----------------------------------------------------
+ 
++    @staticmethod
++    def _merge_request_mappings(target: Dict[str, Any], source: Dict[str, Any]) -> None:
++        for key, value in source.items():
++            if isinstance(value, dict) and isinstance(target.get(key), dict):
++                MemoryManager._merge_request_mappings(target[key], value)
++            elif isinstance(value, dict):
++                nested: Dict[str, Any] = {}
++                MemoryManager._merge_request_mappings(nested, value)
++                target[key] = nested
++            else:
++                target[key] = value
++
++    def request_overrides(self) -> Dict[str, Any]:
++        """Merge request-scoped overrides from all providers.
++
++        Later providers win on scalar conflicts while nested mappings such as
++        ``extra_body.metadata`` are merged rather than replaced.
++        """
++        merged: Dict[str, Any] = {}
++        for provider in self._providers:
++            try:
++                value = provider.request_overrides()
++                if isinstance(value, dict):
++                    self._merge_request_mappings(merged, value)
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' request_overrides failed: %s",
++                    provider.name, e,
++                )
++        return merged
++
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Notify all providers of a new turn.
+ 
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 4210a4c25..82e3bec44 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -154,6 +154,21 @@ class MemoryProvider(ABC):
+ 
+     # -- Optional hooks (override to opt in) ---------------------------------
+ 
++    def request_overrides(self) -> Dict[str, Any]:
++        """Return request-scoped API kwargs derived from this provider's turn state.
++
++        Providers must return only data for the current turn and clear stale
++        values before computing a new turn. The manager merges nested mappings.
++        """
++        return {}
++
++    def on_before_model_forward(self, api_messages: List[Dict[str, Any]], **kwargs) -> None:
++        """Observe final host API messages immediately before model forwarding.
++
++        Implementations must treat this as observational: exceptions are
++        contained by MemoryManager and never block the outbound request.
++        """
++
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Called at the start of each turn with the user message.
+ 
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index 8d94ecbcb..9bc81801e 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -501,9 +501,19 @@ class ChatCompletionsTransport(ProviderTransport):
+         if extra_body:
+             api_kwargs["extra_body"] = extra_body
+ 
+-        # Request overrides last (service_tier etc.)
++        # Request overrides last (service_tier, request metadata, etc.).
++        # Merge nested extra_body instead of replacing provider additions.
+         overrides = params.get("request_overrides")
+         if overrides:
++            overrides = dict(overrides)
++            override_extra_body = overrides.pop("extra_body", None)
++            if isinstance(override_extra_body, dict):
++                for key, value in override_extra_body.items():
++                    if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
++                        extra_body[key] = {**extra_body[key], **value}
++                    else:
++                        extra_body[key] = value
++                api_kwargs["extra_body"] = extra_body
+             api_kwargs.update(overrides)
+ 
+         return api_kwargs
+@@ -615,12 +625,16 @@ class ChatCompletionsTransport(ProviderTransport):
+         if additions:
+             extra_body.update(additions)
+ 
+-        # Request overrides (user config)
++        # Request overrides (user config and current-turn provider metadata)
+         overrides = params.get("request_overrides")
+         if overrides:
+             for k, v in overrides.items():
+                 if k == "extra_body" and isinstance(v, dict):
+-                    extra_body.update(v)
++                    for body_key, body_value in v.items():
++                        if isinstance(body_value, dict) and isinstance(extra_body.get(body_key), dict):
++                            extra_body[body_key] = {**extra_body[body_key], **body_value}
++                        else:
++                            extra_body[body_key] = body_value
+                 else:
+                     api_kwargs[k] = v
+ 
+diff --git a/tests/agent/test_memory_provider.py b/tests/agent/test_memory_provider.py
+index 1a99977de..9d215b05d 100644
+--- a/tests/agent/test_memory_provider.py
++++ b/tests/agent/test_memory_provider.py
+@@ -345,6 +345,54 @@ class TestMemoryManager:
+         mgr.on_turn_start(3, "hello")
+         assert p.turn_starts == [(3, "hello")]
+ 
++    def test_on_before_model_forward_fans_out_and_contains_failures(self):
++        mgr = MemoryManager()
++        broken = FakeMemoryProvider("builtin")
++        observed = FakeMemoryProvider("observed")
++        broken.on_before_model_forward = MagicMock(side_effect=RuntimeError("observer failure"))
++        observed.on_before_model_forward = MagicMock()
++        mgr.add_provider(broken)
++        mgr.add_provider(observed)
++        final_messages = [{"role": "user", "content": "final outbound"}]
++
++        mgr.on_before_model_forward(final_messages)
++
++        broken.on_before_model_forward.assert_called_once_with(final_messages)
++        observed.on_before_model_forward.assert_called_once_with(final_messages)
++
++    def test_request_overrides_merge_nested_extra_body_metadata(self):
++        mgr = MemoryManager()
++        first = FakeMemoryProvider("builtin")
++        second = FakeMemoryProvider("second")
++        first.request_overrides = lambda: {
++            "extra_body": {"metadata": {"hermes_route_bucket": "task"}}
++        }
++        second.request_overrides = lambda: {
++            "extra_body": {"metadata": {"hermes_model_hint": "technical"}}
++        }
++        mgr.add_provider(first)
++        mgr.add_provider(second)
++
++        assert mgr.request_overrides() == {
++            "extra_body": {
++                "metadata": {
++                    "hermes_route_bucket": "task",
++                    "hermes_model_hint": "technical",
++                }
++            }
++        }
++
++    def test_request_overrides_failure_does_not_block_other_provider(self):
++        mgr = MemoryManager()
++        broken = FakeMemoryProvider("builtin")
++        working = FakeMemoryProvider("working")
++        broken.request_overrides = MagicMock(side_effect=RuntimeError("broken"))
++        working.request_overrides = lambda: {"extra_body": {"metadata": {"ok": True}}}
++        mgr.add_provider(broken)
++        mgr.add_provider(working)
++
++        assert mgr.request_overrides() == {"extra_body": {"metadata": {"ok": True}}}
++
+     def test_on_session_end(self):
+         mgr = MemoryManager()
+         p = FakeMemoryProvider("p")
+diff --git a/tests/agent/transports/test_chat_completions.py b/tests/agent/transports/test_chat_completions.py
+index 487225ac4..fb0682f0c 100644
+--- a/tests/agent/transports/test_chat_completions.py
++++ b/tests/agent/transports/test_chat_completions.py
+@@ -644,6 +644,29 @@ class TestChatCompletionsBuildKwargs:
+         )
+         assert kw["service_tier"] == "priority"
+ 
++    def test_request_override_metadata_merges_with_existing_extra_body(self, transport):
++        msgs = [{"role": "user", "content": "Hi"}]
++        kw = transport.build_kwargs(
++            model="gpt-4o", messages=msgs,
++            extra_body_additions={"metadata": {"existing": "kept"}, "other": 1},
++            request_overrides={
++                "extra_body": {
++                    "metadata": {
++                        "hermes_route_bucket": "task",
++                        "hermes_model_hint": "technical",
++                    }
++                }
++            },
++        )
++        assert kw["extra_body"] == {
++            "metadata": {
++                "existing": "kept",
++                "hermes_route_bucket": "task",
++                "hermes_model_hint": "technical",
++            },
++            "other": 1,
++        }
++
+     def test_fixed_temperature(self, transport):
+         """Fixed temperature is now set via ProviderProfile.fixed_temperature."""
+         from providers.base import ProviderProfile
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index ebe280a9a..c183ff9f0 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -8183,4 +8183,69 @@ class TestMemoryProviderTurnStart:
+         assert forwarded == {
+             "session_id": "agent.session_id",
+             "turn_id": "turn_id",
++            "recent_messages": "recent_messages",
+         }
++
++    def test_current_turn_request_overrides_do_not_mutate_agent_config(self, agent):
++        """Per-turn route metadata must not leak into persistent request config."""
++        agent.request_overrides = {
++            "extra_body": {"metadata": {"configured": "kept"}}
++        }
++        agent._memory_manager = SimpleNamespace(
++            request_overrides=lambda: {
++                "extra_body": {
++                    "metadata": {"hermes_turn_correlation_id": "turn-only"}
++                }
++            }
++        )
++
++        kwargs = agent._build_api_kwargs([{"role": "user", "content": "test"}])
++
++        assert agent.request_overrides == {
++            "extra_body": {"metadata": {"configured": "kept"}}
++        }
++        assert kwargs["extra_body"]["metadata"] == {
++            "configured": "kept",
++            "hermes_turn_correlation_id": "turn-only",
++        }
++
++    def test_visible_history_projection_is_bounded_and_filters_runtime_roles(self):
++        from agent.turn_context import _bounded_visible_history
++
++        messages = [
++            {"role": "system", "content": "system"},
++            {"role": "developer", "content": "developer"},
++            {"role": "tool", "content": "tool"},
++            {"role": "user", "content": "[ASYNC DELEGATION BATCH COMPLETE] runtime"},
++            {"role": "user", "content": "older-" + "x" * 1200},
++            {"role": "assistant", "content": "done"},
++            {"role": "user", "content": "current"},
++        ]
++
++        projected = _bounded_visible_history(messages, current_user_message="current")
++
++        assert [item["role"] for item in projected] == ["user", "assistant"]
++        assert projected[0]["content"].startswith("older-")
++        assert len(projected[0]["content"]) == 1000
++        assert projected[-1]["content"] == "done"
++        assert sum(len(item["content"]) for item in projected) <= 6000
++        assert len(projected) <= 8
++
++    def test_prefetch_forwards_session_identity(self):
++        """AST-level check: prefetch uses the same explicit session scope."""
++        import ast
++        import inspect
++        import textwrap
++        from agent.turn_context import build_turn_context as _btc
++
++        tree = ast.parse(textwrap.dedent(inspect.getsource(_btc)))
++        calls = [
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "prefetch_all"
++        ]
++        assert len(calls) == 1
++        forwarded = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
++        assert forwarded == {"session_id": "agent.session_id"}

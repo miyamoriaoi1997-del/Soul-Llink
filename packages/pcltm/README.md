@@ -8,7 +8,6 @@ Current contents:
 - `memory_adapter.py` — layered recall and memory selection helpers.
 - `runtime_paths.py` — shared public defaults for DB and MemFS runtime paths.
 - `cli.py` — `soullink` / `pcltm` runtime initialization and doctor commands.
-- `pcltm_governor.py` — governance utilities for memory candidates.
 - `pcltm_audit.py` — read-only audit helpers for memory stores.
 - `continuity_baseline.py` — pure normalization of existing identity/continuity/ADS/summary artifacts.
 - `continuity_gate.py` — read-only baseline/candidate shadow comparison and promotion blocking; see `docs/continuity-preservation-gate.md`.

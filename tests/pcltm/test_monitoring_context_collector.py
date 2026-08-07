@@ -168,34 +168,6 @@ def test_context_collector_reads_exact_cross_process_host_usage(tmp_path, monkey
     assert report["session_id"] == "session-live"
 
 
-def test_exact_host_usage_supplies_live_budget_and_model_window_when_config_is_empty(
-    tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setattr(collectors, "last_live_context_telemetry", lambda: {})
-    telemetry_path = tmp_path / "soullink-context-telemetry.json"
-    telemetry_path.write_text(
-        json.dumps({
-            "source": "exact_host_context_usage",
-            "observed_at": (NOW - timedelta(seconds=2)).isoformat(),
-            "session_id": "session-live",
-            "prompt_tokens": 100_000,
-            "completion_tokens": 300,
-            "total_tokens": 100_300,
-            "context_length": 400_000,
-            "budget_tokens": 200_000,
-        }),
-        encoding="utf-8",
-    )
-
-    report = collectors.collect_context_budget(config={}, telemetry_path=telemetry_path, now=NOW)
-
-    assert report["source"] == "exact_host_context_usage"
-    assert report["budget_tokens"] == 200_000
-    assert report["model_context_tokens"] == 400_000
-    assert report["usage_ratio"] == 0.5
-    assert sum(report["budget_buckets"].values()) == 200_000
-
-
 def test_exact_host_usage_supplies_live_budget_and_model_window_when_sidecar_config_is_empty(
     tmp_path, monkeypatch
 ) -> None:

@@ -9,8 +9,6 @@ from scripts.state_machine_self_eval import (
     apply_audit_gate,
     apply_feedback_labels,
     append_manual_feedback,
-    build_continuous_sample,
-    build_labeled_runtime_report,
     build_shadow_report,
     extract_audit_candidates,
     load_jsonl,
@@ -53,6 +51,46 @@ def test_human_truth_report_is_read_only_and_blocks_on_any_regression(tmp_path: 
     assert report["failures"][0]["id"] == "bad"
     assert "confusion_matrix" in report["metrics"]
     assert "high_risk_false_positive_count" in report["metrics"]
+    assert report["metrics"]["mode_accuracy"] == 0.5
+    assert report["metrics"]["transition_accuracy"] == 0.5
+    assert report["metrics"]["timeliness"] == {
+        "decisive_switch_case_count": 2,
+        "same_turn_switch_count": 1,
+        "same_turn_switch_rate": 0.5,
+        "stale_mode_hold_count": 1,
+        "unexpected_switch_count": 0,
+    }
+
+
+def test_timeliness_metrics_detect_unexpected_switch_without_counting_stays() -> None:
+    cases = [
+        {
+            "id": "unexpected",
+            "message": "我想你",
+            "previous_mode": "work",
+            "emotion_score": 1.0,
+            "expected_mode": "work",
+            "expected_transition": "stay:work",
+            "expected_layers": [],
+            "source": "human_labeled_real_chat",
+        },
+        {
+            "id": "stay",
+            "message": "我想你",
+            "previous_mode": "daily",
+            "emotion_score": 1.0,
+            "expected_mode": "daily",
+            "expected_transition": "stay:daily",
+            "expected_layers": ["daily"],
+            "source": "human_labeled_real_chat",
+        },
+    ]
+
+    report = build_shadow_report(cases)
+
+    assert report["metrics"]["timeliness"]["decisive_switch_case_count"] == 0
+    assert report["metrics"]["timeliness"]["same_turn_switch_rate"] is None
+    assert report["metrics"]["timeliness"]["unexpected_switch_count"] == 1
 
 
 def test_audit_candidate_extraction_flags_disagreement_and_mode_jump(tmp_path: Path) -> None:
@@ -242,38 +280,6 @@ def test_runtime_derived_snapshot_cannot_masquerade_as_human_truth() -> None:
         assert "human-labeled" in str(error)
     else:
         raise AssertionError("runtime-derived snapshots must not become accuracy truth")
-
-
-def test_continuous_sample_ids_do_not_collide_when_provenance_is_missing() -> None:
-    records = [
-        {"packet": {"mode": "work", "transition": "start:work", "selected_layers": ["work"]}},
-        {"packet": {"mode": "daily", "transition": "start:daily", "selected_layers": ["daily"]}},
-    ]
-
-    sample = build_continuous_sample(records, sample_size=12, sampling_key="public")
-
-    assert len(sample) == 2
-    assert len({row["candidate_id"] for row in sample}) == 2
-    assert {row["previous_mode_status"] for row in sample} == {"unavailable"}
-    assert all(row["timeliness_eligible"] is False for row in sample)
-
-
-def test_labeled_runtime_report_counts_timeliness_evidence_eligibility() -> None:
-    sample = [
-        {"candidate_id": "eligible", "previous_mode": "daily", "actual_mode": "work", "actual_transition": "daily->work", "timeliness_eligible": True},
-        {"candidate_id": "missing", "previous_mode": None, "actual_mode": "work", "actual_transition": "start:work", "timeliness_eligible": False},
-    ]
-    labels = [
-        {"candidate_id": "eligible", "reviewer": "human", "source": "manual_feedback", "expected_mode": "work", "expected_transition": "daily->work"},
-        {"candidate_id": "missing", "reviewer": "human", "source": "manual_feedback", "expected_mode": "work", "expected_transition": "start:work"},
-    ]
-
-    report = build_labeled_runtime_report(sample, labels)
-    timeliness = report["metrics"]["timeliness"]
-
-    assert timeliness["timeliness_eligible_count"] == 1
-    assert timeliness["timeliness_ineligible_count"] == 1
-    assert timeliness["same_turn_switch_rate"] == 1.0
 
 
 def test_cli_invalid_truth_replaces_stale_candidate_report_with_blocked_sentinel(tmp_path: Path) -> None:

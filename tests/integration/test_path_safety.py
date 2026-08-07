@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from soul_link.hermes_deploy import HermesDeployment
+from soul_link.host_adaptation import CompatibilityManifest
 
 
 def test_inside_rejects_empty_path(tmp_path: Path) -> None:
@@ -52,3 +53,18 @@ def test_inside_accepts_safe_relative_path(tmp_path: Path) -> None:
     result = HermesDeployment._inside(tmp_path, "plugins/soullink")
     assert result.is_relative_to(tmp_path)
     assert result == (tmp_path / "plugins/soullink").resolve()
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ("C:\\Windows\\System32", "\\\\server\\share\\file", "plugins\\..\\outside.py"),
+)
+def test_manifest_rejects_windows_paths_cross_platform(tmp_path: Path, unsafe: str) -> None:
+    """Manifest paths are checked with Windows semantics on every build platform."""
+    with pytest.raises(ValueError, match="unsafe host path"):
+        CompatibilityManifest(
+            host="hermes",
+            adapter_version="test",
+            required_paths=(unsafe,),
+            patch_path=(tmp_path / "adapter.patch").resolve(),
+        )

@@ -151,6 +151,22 @@ def test_writer_writes_transient_draft(tmp_path: Path) -> None:
     assert "Transient draft body." in body
 
 
+def test_writer_redacts_secrets_and_bounds_body(tmp_path: Path) -> None:
+    store = MemFSStore(tmp_path / "memfs")
+    writer = ReflectionWriter(store, max_body_chars=40)
+    draft = make_draft(
+        relative_path="episodic/2026/safe.md",
+        body="API_KEY=super-secret-value " + "x" * 80,
+    )
+
+    assert writer.write_draft(draft) is True
+    frontmatter, body = store.read_file("episodic/2026/safe.md")
+    assert "super-secret-value" not in body
+    assert "[REDACTED_SECRET]" in body
+    assert len(body.rstrip("\n")) <= 40
+    assert frontmatter.char_limit == 40
+
+
 def test_write_all_returns_stats(tmp_path: Path) -> None:
     store = MemFSStore(tmp_path / "memfs")
     writer = ReflectionWriter(store)

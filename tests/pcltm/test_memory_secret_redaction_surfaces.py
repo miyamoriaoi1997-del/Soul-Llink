@@ -65,18 +65,14 @@ def test_db_backed_memory_outputs_are_redacted(dirty_memory_db: Path) -> None:
     fake_secret = "PASSWORD=hunter2"
 
     entries = load_entries("memory")
+    assert entries == []
     assert fake_secret not in "\n".join(entries)
-    assert "[REDACTED_SECRET]" in "\n".join(entries)
 
     prompt = load_prompt_context(mode="work", query="dirty record testing")
-    assert fake_secret not in prompt
-    assert "[REDACTED_SECRET]" in prompt
+    assert prompt == ""
 
     results = search_archival_memories("dirty record", mode="work", layers=["episodic"], limit=3)
-    assert results
-    assert fake_secret not in str(results)
-    assert "[REDACTED_SECRET]" in str(results)
+    assert results == []
 
-    opened = open_archival_memory("db/MEMORY.md/1")
-    assert fake_secret not in str(opened)
-    assert "[REDACTED_SECRET]" in str(opened)
+    with pytest.raises(ValueError, match="legacy_db_memory_id_retired"):
+        open_archival_memory("db/MEMORY.md/1")

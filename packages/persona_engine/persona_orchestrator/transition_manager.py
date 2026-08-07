@@ -217,6 +217,26 @@ class TransitionManager:
             )
 
         if previous == MODE_WORK and requested == MODE_DAILY:
+            if decision.signals.get("semantic_explicit_daily_intent"):
+                return TransitionDecision(
+                    previous_mode=previous_mode,
+                    requested_mode=requested,
+                    active_mode=MODE_DAILY,
+                    transition=self._transition_label(previous, MODE_DAILY),
+                    confidence=decision.confidence,
+                    reason="high-confidence semantic daily intent releases work context",
+                    safety_flags=flags,
+                )
+            if decision.signals.get("context_continuation_exhausted"):
+                return TransitionDecision(
+                    previous_mode=previous_mode,
+                    requested_mode=requested,
+                    active_mode=MODE_DAILY,
+                    transition=self._transition_label(previous, MODE_DAILY),
+                    confidence=decision.confidence,
+                    reason="bounded ambiguous work continuation expired",
+                    safety_flags=flags,
+                )
             if (
                 decision.signals.get("sex_scene_close")
                 or decision.signals.get("safety_stop")

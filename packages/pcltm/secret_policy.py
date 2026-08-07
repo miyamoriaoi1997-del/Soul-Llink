@@ -10,6 +10,7 @@ memory write/read surface can share one boundary:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -49,6 +50,25 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _SECRET_VALUE_PLACEHOLDER = "[REDACTED_SECRET]"
 _REJECTED_SECRET_PLACEHOLDER = "[REJECTED_SECRET_MEMORY: raw secret value omitted]"
 
+_STRUCTURED_SECRET_KEYS = frozenset(
+    {
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "private_key",
+        "password",
+        "passwd",
+        "authorization",
+        "cookie",
+        "session",
+        "session_id",
+    }
+)
+
 _ENV_REF_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}(?:SECRET|TOKEN|API_KEY|APIKEY|PASSWORD|PASS|COOKIE|SESSION|DATABASE_URL)[A-Z0-9_]*\b")
 _SECRET_REF_RE = re.compile(r"\b(?:secret|op|bw|vault)://[^\s,;]+", re.I)
 _HOST_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
@@ -57,12 +77,65 @@ _PORT_RE = re.compile(r"(?i)\bport\s*=\s*(\d{1,5})\b|\b端口\s*(\d{1,5})\b")
 _PATH_RE = re.compile(r"(?<!\w)(/(?:root|srv|opt|var|home|mnt|data|www|app)[^\s,;，。]*)")
 
 
+def _is_structured_secret_key(key: object) -> bool:
+    normalized = re.sub(r"[-\s]+", "_", str(key).strip().lower())
+    return normalized in _STRUCTURED_SECRET_KEYS or normalized.endswith(
+        ("_token", "_secret", "_password", "_passwd", "_private_key", "_api_key")
+    )
+
+
+def _transform_structured_secrets(value: Any) -> tuple[Any, bool]:
+    found = False
+    if isinstance(value, dict):
+        transformed: dict[Any, Any] = {}
+        for key, child in value.items():
+            if _is_structured_secret_key(key):
+                transformed[key] = _SECRET_VALUE_PLACEHOLDER
+                found = True
+            else:
+                transformed[key], child_found = _transform_structured_secrets(child)
+                found = found or child_found
+        return transformed, found
+    if isinstance(value, list):
+        transformed_list = []
+        for child in value:
+            transformed_child, child_found = _transform_structured_secrets(child)
+            transformed_list.append(transformed_child)
+            found = found or child_found
+        return transformed_list, found
+    if isinstance(value, str):
+        transformed_value = value
+        for category, pattern in _SECRET_PATTERNS:
+            if category == "password_bearing_url":
+                transformed_value = pattern.sub(
+                    lambda match: match.group(0).replace(
+                        f":{match.group(2)}@", f":{_SECRET_VALUE_PLACEHOLDER}@",
+                    ),
+                    transformed_value,
+                )
+            else:
+                transformed_value = pattern.sub(_SECRET_VALUE_PLACEHOLDER, transformed_value)
+        return transformed_value, transformed_value != value
+    return value, False
+
+
+def _parse_structured_text(text: str) -> Any | None:
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
 def detect_secret_categories(text: str) -> list[str]:
     """Return categories of secret-like values found in text."""
     found: list[str] = []
     for category, pattern in _SECRET_PATTERNS:
         if pattern.search(text or ""):
             found.append(category)
+    structured = _parse_structured_text(text or "")
+    if structured is not None and _transform_structured_secrets(structured)[1]:
+        found.append("structured_secret_field")
     return found
 
 
@@ -74,6 +147,11 @@ def redact_secrets(text: str) -> str:
     """Mask secret-like values before content reaches model-visible surfaces."""
     if not text:
         return text
+    structured = _parse_structured_text(text)
+    if structured is not None:
+        transformed, found = _transform_structured_secrets(structured)
+        if found:
+            return json.dumps(transformed, ensure_ascii=False)
     redacted = text
     for category, pattern in _SECRET_PATTERNS:
         if category == "password_bearing_url":

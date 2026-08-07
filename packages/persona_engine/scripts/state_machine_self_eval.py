@@ -104,6 +104,23 @@ def build_shadow_report(cases: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     total = len(rows)
     failed = len(failures)
+    mode_passed = sum(row["checks"]["mode"] for row in rows)
+    transition_passed = sum(row["checks"]["transition"] for row in rows)
+    decisive_switches = [
+        row for case, row in zip(cases, rows)
+        if case.get("previous_mode") in {"daily", "work", "sex"}
+        and case.get("previous_mode") != case.get("expected_mode")
+    ]
+    same_turn_switches = [
+        row for row in decisive_switches
+        if row["checks"]["mode"] and row["checks"]["transition"]
+    ]
+    unexpected_switches = [
+        row for case, row in zip(cases, rows)
+        if case.get("previous_mode") in {"daily", "work", "sex"}
+        and case.get("previous_mode") == case.get("expected_mode")
+        and row["actual_mode"] != case.get("previous_mode")
+    ]
     status = "manual_review_candidate" if total and failed == 0 else "blocked"
     return {
         "schema_version": 1,
@@ -115,6 +132,18 @@ def build_shadow_report(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "passed": total - failed,
             "failed": failed,
             "accuracy": (total - failed) / total if total else 0.0,
+            "mode_accuracy": mode_passed / total if total else 0.0,
+            "transition_accuracy": transition_passed / total if total else 0.0,
+            "timeliness": {
+                "decisive_switch_case_count": len(decisive_switches),
+                "same_turn_switch_count": len(same_turn_switches),
+                "same_turn_switch_rate": (
+                    len(same_turn_switches) / len(decisive_switches)
+                    if decisive_switches else None
+                ),
+                "stale_mode_hold_count": len(decisive_switches) - len(same_turn_switches),
+                "unexpected_switch_count": len(unexpected_switches),
+            },
             "confusion_matrix": {
                 f"{expected}->{actual}": count
                 for (expected, actual), count in sorted(confusion.items())
@@ -186,51 +215,98 @@ def extract_audit_candidates(records: Iterable[dict[str, Any]]) -> list[dict[str
                 session_modes.setdefault(session_id, []).append(mode)
     return candidates
 
+
 def build_continuous_sample(
-    records: Iterable[dict[str, Any]], *, sample_size: int = 12, sampling_key: str,
+    records: Iterable[dict[str, Any]],
+    *,
+    sample_size: int = 12,
+    sampling_key: str,
 ) -> list[dict[str, Any]]:
-    """Select a stable bounded runtime sample without manufacturing labels."""
+    """Select a stable bounded production sample without manufacturing labels."""
     candidates: list[tuple[str, dict[str, Any]]] = []
-    for line_number, record in enumerate(records, start=1):
+    for record_index, record in enumerate(records):
         packet = record.get("packet") if isinstance(record.get("packet"), dict) else {}
         extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
-        route_metadata = packet.get("route_metadata") if isinstance(packet.get("route_metadata"), dict) else {}
-        decision_audit = route_metadata.get("decision_audit") if isinstance(route_metadata.get("decision_audit"), dict) else {}
-        previous_mode = decision_audit.get("previous_mode")
-        status = "captured" if previous_mode in {"daily", "work", "sex"} else "unavailable"
         identity = "|".join(str(value or "") for value in (
-            sampling_key, record.get("timestamp"), extra.get("session_id"), extra.get("turn_number"), line_number,
+            sampling_key,
+            record.get("timestamp"),
+            extra.get("session_id"),
+            extra.get("turn_number"),
+            record_index,
         ))
         candidate_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        previous_mode = ((packet.get("route_metadata") or {}).get("decision_audit") or {}).get("previous_mode")
         candidates.append((candidate_id, {
-            "candidate_id": candidate_id, "source_line_number": line_number,
-            "timestamp": record.get("timestamp"), "session_id": extra.get("session_id"),
-            "turn_number": extra.get("turn_number"), "previous_mode": previous_mode,
-            "previous_mode_status": status, "timeliness_eligible": status == "captured",
-            "actual_mode": packet.get("mode"), "actual_transition": packet.get("transition"),
+            "candidate_id": candidate_id,
+            "timestamp": record.get("timestamp"),
+            "session_id": extra.get("session_id"),
+            "turn_number": extra.get("turn_number"),
+            "previous_mode": previous_mode,
+            "previous_mode_status": "captured" if previous_mode in {"daily", "work", "sex"} else "unavailable",
+            "timeliness_eligible": previous_mode in {"daily", "work", "sex"},
+            "actual_mode": packet.get("mode"),
+            "actual_transition": packet.get("transition"),
             "actual_layers": list(packet.get("selected_layers") or []),
-            "needs_manual_label": True, "source": "production_runtime_sample",
+            "needs_manual_label": True,
+            "source": "production_runtime_sample",
         }))
-    return [row for _key, row in sorted(candidates, key=lambda item: item[0])[:max(0, int(sample_size))]]
+    limit = max(0, int(sample_size))
+    return [row for _key, row in sorted(candidates, key=lambda item: item[0])[:limit]]
 
 
-def build_labeled_runtime_report(sample: Iterable[dict[str, Any]], labels: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def build_labeled_runtime_report(
+    sample: Iterable[dict[str, Any]],
+    labels: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
     """Measure correctness and same-turn timeliness from explicit human labels."""
-    trusted = {str(x.get("candidate_id")): x for x in labels if x.get("candidate_id") and x.get("reviewer") and x.get("source") == "manual_feedback"}
-    rows = [(item, trusted[str(item.get("candidate_id"))]) for item in sample if str(item.get("candidate_id")) in trusted]
+    trusted = {
+        str(label.get("candidate_id")): label
+        for label in labels
+        if label.get("candidate_id")
+        and label.get("reviewer")
+        and label.get("source") == "manual_feedback"
+    }
+    rows = []
+    for item in sample:
+        label = trusted.get(str(item.get("candidate_id")))
+        if not label:
+            continue
+        rows.append((item, label))
     total = len(rows)
-    eligible = [(item, label) for item, label in rows if item.get("timeliness_eligible") is True]
-    decisive = [(item, label) for item, label in eligible if item.get("previous_mode") != label.get("expected_mode")]
-    same_turn = [(item, label) for item, label in decisive if item.get("actual_mode") == label.get("expected_mode") and item.get("actual_transition") == label.get("expected_transition")]
-    return {"authority": "human_labeled_production_sample", "metrics": {
-        "labeled_count": total,
-        "mode_accuracy": sum(i.get("actual_mode") == l.get("expected_mode") for i, l in rows) / total if total else None,
-        "transition_accuracy": sum(i.get("actual_transition") == l.get("expected_transition") for i, l in rows) / total if total else None,
-        "timeliness": {"timeliness_eligible_count": len(eligible), "timeliness_ineligible_count": total - len(eligible),
-            "decisive_switch_case_count": len(decisive), "same_turn_switch_count": len(same_turn),
-            "same_turn_switch_rate": len(same_turn) / len(decisive) if decisive else None,
-            "stale_mode_hold_count": len(decisive) - len(same_turn)},
-    }}
+    mode_correct = sum(item.get("actual_mode") == label.get("expected_mode") for item, label in rows)
+    transition_correct = sum(
+        item.get("actual_transition") == label.get("expected_transition") for item, label in rows
+    )
+    decisive = [
+        (item, label) for item, label in rows
+        if item.get("previous_mode") in {"daily", "work", "sex"}
+        and item.get("previous_mode") != label.get("expected_mode")
+    ]
+    same_turn = [
+        (item, label) for item, label in decisive
+        if item.get("actual_mode") == label.get("expected_mode")
+        and item.get("actual_transition") == label.get("expected_transition")
+    ]
+    timeliness_eligible_count = sum(
+        item.get("previous_mode") in {"daily", "work", "sex"}
+        for item, _label in rows
+    )
+    return {
+        "authority": "human_labeled_production_sample",
+        "metrics": {
+            "labeled_count": total,
+            "mode_accuracy": mode_correct / total if total else None,
+            "transition_accuracy": transition_correct / total if total else None,
+            "timeliness": {
+                "decisive_switch_case_count": len(decisive),
+                "same_turn_switch_count": len(same_turn),
+                "same_turn_switch_rate": len(same_turn) / len(decisive) if decisive else None,
+                "stale_mode_hold_count": len(decisive) - len(same_turn),
+                "timeliness_eligible_count": timeliness_eligible_count,
+                "timeliness_ineligible_count": total - timeliness_eligible_count,
+            },
+        },
+    }
 
 
 def apply_feedback_labels(
@@ -341,7 +417,8 @@ def main() -> int:
     truth_path = ROOT / args.truth if not Path(args.truth).is_absolute() else Path(args.truth)
     report = build_shadow_report(load_jsonl(truth_path))
     if args.audit_log and args.candidates:
-        candidates = extract_audit_candidates(load_jsonl(args.audit_log))
+        audit_rows = load_jsonl(args.audit_log)
+        candidates = extract_audit_candidates(audit_rows)
         if args.feedback and Path(args.feedback).exists():
             candidates = apply_feedback_labels(candidates, load_jsonl(args.feedback))
         report = apply_audit_gate(report, candidates)
@@ -350,8 +427,17 @@ def main() -> int:
             "candidates": candidates,
         })
     if args.audit_log and args.sample and args.sampling_key:
-        sample = build_continuous_sample(load_jsonl(args.audit_log), sample_size=args.sample_size, sampling_key=args.sampling_key)
-        _write_json(args.sample, {"authority": "production_runtime_sample_for_manual_labeling", "sampling_key": args.sampling_key, "sample": sample})
+        audit_rows = load_jsonl(args.audit_log)
+        sample = build_continuous_sample(
+            audit_rows,
+            sample_size=args.sample_size,
+            sampling_key=args.sampling_key,
+        )
+        _write_json(args.sample, {
+            "authority": "production_runtime_sample_for_manual_labeling",
+            "sampling_key": args.sampling_key,
+            "sample": sample,
+        })
         if args.sample_report:
             feedback = load_jsonl(args.feedback) if args.feedback and Path(args.feedback).exists() else []
             _write_json(args.sample_report, build_labeled_runtime_report(sample, feedback))

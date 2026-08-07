@@ -174,56 +174,12 @@ class MemFSStore:
         limit: int = 8,
         excerpt_chars: int = 240,
     ) -> list[dict[str, Any]]:
-        """Search archival MemFS entries with progressive disclosure.
-
-        Results intentionally contain short excerpts and safe descriptive
-        metadata only.  Full bodies require ``open_memory()`` / ``read_file()``.
-        """
-        selected_layers = [layer for layer in layers if layer in MEMFS_LAYERS]
-        results: list[dict[str, Any]] = []
-        for layer in selected_layers:
-            candidates = self._filter_by_buckets(self._load_layer_candidates(layer), buckets)
-            candidates = [item for item in candidates if self._mode_matches(item.mode_scope, mode)]
-            scored = [self._with_score(item, query) for item in candidates]
-            for item in scored:
-                if query and item.score <= 0:
-                    continue
-                results.append(
-                    {
-                        "memory_id": item.path,
-                        "layer": item.authority,
-                        "description": item.description,
-                        "buckets": list(item.buckets),
-                        "memory_type": item.memory_type,
-                        "lifecycle_state": item.lifecycle_state,
-                        "score": item.score,
-                        "excerpt": self._excerpt(redact_secrets(item.body or item.description), excerpt_chars),
-                        "reference_only": True,
-                    }
-                )
-        results.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("memory_id") or "")))
-        return results[: max(0, limit)]
+        """Retired: unbound MemFS roots are not a recall authority."""
+        return []
 
     def open_memory(self, memory_id: str, *, body_limit: int = 4000) -> dict[str, Any]:
-        """Open one MemFS memory by id/path with prompt-safe metadata."""
-        frontmatter, body = self.read_file(memory_id)
-        text = redact_secrets(body.strip())
-        truncated = False
-        if body_limit >= 0 and len(text) > body_limit:
-            text = text[:body_limit].rstrip() + "…"
-            truncated = True
-        return {
-            "memory_id": memory_id,
-            "layer": frontmatter.authority,
-            "description": frontmatter.description,
-            "buckets": list(frontmatter.buckets),
-            "mode_scope": list(frontmatter.mode_scope),
-            "memory_type": frontmatter.memory_type,
-            "lifecycle_state": frontmatter.lifecycle_state,
-            "reference_only": True,
-            "body": text,
-            "truncated": truncated,
-        }
+        """Retired: governed claim open is the only durable body surface."""
+        raise RuntimeError("legacy_memfs_open_retired")
 
     def ensure_git_repo(self) -> bool:
         """Initialize a git repo at self.root if one doesn't exist. Return True if repo is ready."""
@@ -374,19 +330,37 @@ class MemFSStore:
         """Safely write a MemFS markdown file with YAML frontmatter."""
         path = self._safe_resolve(relative_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
+        normalized_body = str(body or "").rstrip()
+        if frontmatter.char_limit is not None and len(normalized_body) > frontmatter.char_limit:
+            raise ValueError(
+                f"body exceeds char_limit ({len(normalized_body)} > {frontmatter.char_limit})"
+            )
+        data = dict(frontmatter.extra)
+        data.update({
             "description": frontmatter.description,
             "authority": frontmatter.authority,
             "mode_scope": list(frontmatter.mode_scope),
             "buckets": list(frontmatter.buckets),
             "source": frontmatter.source,
+            "last_reviewed": frontmatter.last_reviewed,
+            "char_limit": frontmatter.char_limit,
+            "read_only": frontmatter.read_only,
             "metadata": dict(frontmatter.metadata),
+            "updated_at": frontmatter.updated_at,
             "memory_type": frontmatter.memory_type,
             "lifecycle_state": frontmatter.lifecycle_state,
             "ttl": frontmatter.ttl,
+            "conflict_policy": frontmatter.conflict_policy,
             "injection_policy": frontmatter.injection_policy,
-        }
-        text = "---\n" + yaml.safe_dump(data, allow_unicode=True, sort_keys=False) + "---\n" + str(body or "").rstrip() + "\n"
+            "evidence_refs": [dict(ref) for ref in frontmatter.evidence_refs],
+        })
+        text = (
+            "---\n"
+            + yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+            + "---\n"
+            + normalized_body
+            + "\n"
+        )
         atomic_write_text(path, text)
 
     def _safe_resolve(self, relative_path: str) -> Path:
@@ -453,6 +427,32 @@ class MemFSStore:
         raw_metadata = data.get("metadata", {})
         if not isinstance(raw_metadata, dict):
             raw_metadata = {"value": raw_metadata}
+        raw_memory_type = str(
+            data.get("memory_type")
+            or raw_metadata.get("memory_type")
+            or raw_metadata.get("type")
+            or "UserPreference"
+        )
+        # Governed claim vocabulary predates the Letta-style MemFS view types.
+        # Normalize only at this read boundary; preserve the original value in
+        # ``extra`` so the filesystem projection remains an auditable view of
+        # the canonical claim rather than a second authority.
+        memory_type_aliases = {
+            "preference": "UserPreference",
+            "user_preference": "UserPreference",
+            "memory_note": "WorkflowConvention",
+            "system_convention": "WorkflowConvention",
+            "architecture_current": "RuntimeInvariant",
+            "relationship": "RelationshipAnchor",
+            "runtime_invariant": "RuntimeInvariant",
+            "persona_boundary": "PersonaBoundary",
+            "tool_quirk": "ToolQuirk",
+            "project_path": "ProjectPath",
+            "workflow_convention": "WorkflowConvention",
+            "risk_policy": "RiskPolicy",
+            "temporary_task_state": "TemporaryTaskState",
+        }
+        normalized_memory_type = memory_type_aliases.get(raw_memory_type, raw_memory_type)
         kwargs = {
             "description": str(data.get("description", "")),
             "authority": str(data.get("authority", "pinned")),
@@ -464,13 +464,20 @@ class MemFSStore:
             "read_only": bool(data.get("read_only", False)),
             "metadata": raw_metadata,
             "updated_at": str(data.get("updated_at", "")),
-            "memory_type": str(data.get("memory_type") or raw_metadata.get("memory_type") or raw_metadata.get("type") or "UserPreference"),
+            "memory_type": normalized_memory_type,
             "lifecycle_state": str(data.get("lifecycle_state") or raw_metadata.get("lifecycle_state") or raw_metadata.get("status") or "active"),
             "ttl": str(data.get("ttl") or raw_metadata.get("ttl") or "none"),
             "conflict_policy": str(data.get("conflict_policy") or raw_metadata.get("conflict_policy") or ""),
             "injection_policy": str(data.get("injection_policy") or raw_metadata.get("injection_policy") or raw_metadata.get("inject_policy") or ""),
             "evidence_refs": tuple(data.get("evidence_refs") or raw_metadata.get("evidence_refs") or ()),
-            "extra": {k: v for k, v in data.items() if k not in known},
+            "extra": {
+                **{k: v for k, v in data.items() if k not in known},
+                **(
+                    {"governed_memory_type": raw_memory_type}
+                    if normalized_memory_type != raw_memory_type
+                    else {}
+                ),
+            },
         }
         return MemoryFileFrontmatter(**kwargs)
 

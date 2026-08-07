@@ -33,7 +33,7 @@ def _db(path: Path) -> None:
             """
         )
         conn.execute("INSERT INTO memory_records VALUES (1,?,?,?,?,?,?,?)", (
-            "用户偏好数据库优先保存完整历史记录", "approved", "normal",
+            "老师偏好数据库优先保存完整历史记录", "approved", "normal",
             "2026-01-03T00:00:00Z", "[]", "[]", "{}",
         ))
         conn.execute("INSERT INTO memory_records VALUES (2,?,?,?,?,?,?,?)", (
@@ -70,7 +70,7 @@ def test_recovers_user_lineage_with_summary_chain_without_exposing_bodies(tmp_pa
     assert evidence["memory_sha256"]
     assert evidence["evidence_sha256"]
     serialized = json.dumps(result, ensure_ascii=False)
-    assert "用户偏好" not in serialized
+    assert "老师偏好" not in serialized
     assert "我希望数据库" not in serialized
 
 
@@ -97,7 +97,7 @@ def test_user_corroborated_requires_high_score_and_unambiguous_margin(tmp_path: 
     assert row["evidence_level"] == "user_corroborated"
     assert row["status"] == "pending_human_review"
     serialized = json.dumps(result, ensure_ascii=False)
-    assert "用户偏好" not in serialized
+    assert "老师偏好" not in serialized
     assert "我希望数据库" not in serialized
 
 

@@ -12,7 +12,17 @@ Purpose:
 Files:
 
 - `app.py` — proxy server.
+- `service.py` — Windows user-scoped lifecycle and login-autostart manager.
 - `config.example.yaml` — routing config example.
 - `tests/test_router.py` — local tests.
+
+Production lifecycle commands:
+
+```bash
+python service.py start
+python service.py status
+python service.py install-autostart
+python service.py stop
+```
 
 This public edition ships example configuration only. Deployment credentials and route logs are intentionally excluded.

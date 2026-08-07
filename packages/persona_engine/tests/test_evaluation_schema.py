@@ -1,7 +1,7 @@
 """Tests for Phase 4 Task 4.1: Extended evaluation schema."""
 
 import pytest
-from packages.persona_engine.persona_orchestrator.evaluation_schema import (
+from persona_orchestrator.evaluation_schema import (
     SingleTurnCase,
     SequenceTurnCase,
     EvaluationDataset,

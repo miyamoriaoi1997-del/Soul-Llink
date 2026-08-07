@@ -1,4 +1,4 @@
-"""L1 integrity-checked exact transcript retrieval.
+"""L1 integrity-checked and policy-governed exact transcript retrieval.
 
 This module detects accidental corruption and inconsistent local projections. It
 is not a tamper-evident security boundary against an attacker who can rewrite
@@ -11,6 +11,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .evidence_chain import sha256_text
+from .memory_contracts import (
+    AccessSurface,
+    AuthoritySnapshot,
+    LifecycleState,
+    MemoryAccessRequest,
+    PersonaMode,
+    Sensitivity,
+)
+from .memory_policy import admit_access
 from .store import EventStore
 
 
@@ -34,8 +43,12 @@ def search_exact_evidence(
     query: str,
     *,
     limit: int = 10,
+    persona_mode: PersonaMode = PersonaMode.DEFAULT,
+    sensitivity_ceiling: Sensitivity = Sensitivity.RESTRICTED,
 ) -> list[RecallEvidence]:
-    """Return E0 quotes whose current local DB evidence is internally consistent."""
+    """Return E0 quotes whose authority and access policy are both valid."""
+    if type(persona_mode) is not PersonaMode or type(sensitivity_ceiling) is not Sensitivity:
+        raise TypeError("exact recall policy inputs are invalid")
     if not query:
         return []
     conn = store._conn
@@ -48,17 +61,20 @@ def search_exact_evidence(
             return []
         rows = conn.execute(
             """
-            SELECT event_id, content, payload_sha256,
-                   COALESCE(source_created_at, created_at) AS source_created_at
+            SELECT event_id, content, payload_sha256, sensitivity, persona_mode,
+                   COALESCE(source_created_at, created_at) AS source_created_at,
+                   COALESCE((
+                       SELECT g.new_state FROM event_governance g
+                       WHERE g.event_id = events.event_id
+                       ORDER BY g.governance_id DESC LIMIT 1
+                   ), evidence_state) AS lifecycle_state,
+                   COALESCE((
+                       SELECT g.governance_id FROM event_governance g
+                       WHERE g.event_id = events.event_id
+                       ORDER BY g.governance_id DESC LIMIT 1
+                   ), event_id) AS governance_id
             FROM events
             WHERE instr(content, ?) > 0
-              AND COALESCE((
-                  SELECT g.new_state
-                  FROM event_governance g
-                  WHERE g.event_id = events.event_id
-                  ORDER BY g.governance_id DESC
-                  LIMIT 1
-              ), evidence_state) = 'active'
             ORDER BY event_id DESC
             LIMIT ?
             """,
@@ -69,6 +85,32 @@ def search_exact_evidence(
             content = str(row["content"])
             payload_sha256 = str(row["payload_sha256"])
             if sha256_text(content) != payload_sha256:
+                continue
+            try:
+                lifecycle = LifecycleState(str(row["lifecycle_state"]))
+                sensitivity = Sensitivity(str(row["sensitivity"]))
+                event_mode = PersonaMode(str(row["persona_mode"] or "default"))
+                snapshot = AuthoritySnapshot(
+                    authority_kind="event",
+                    object_id=str(int(row["event_id"])),
+                    object_version=1,
+                    payload_sha256=payload_sha256,
+                    governance_id=int(row["governance_id"]),
+                    governance_state=lifecycle,
+                    sensitivity=sensitivity,
+                    lifecycle_state=lifecycle,
+                    source_refs=(),
+                    projection_generation=None,
+                    mode_scope=(event_mode,),
+                    injection_policy="retrieve_only",
+                )
+            except (TypeError, ValueError):
+                continue
+            decision = admit_access(
+                snapshot,
+                MemoryAccessRequest(AccessSurface.EXACT, persona_mode, sensitivity_ceiling),
+            )
+            if not decision.allowed:
                 continue
             start = content.find(query)
             if start < 0:
@@ -106,20 +148,17 @@ def search_exact_evidence(
                     break
             if not chunks_valid or first_chunk_id is None or covered_until < end:
                 continue
-            chunk_id = first_chunk_id
-            results.append(
-                RecallEvidence(
-                    evidence_level="E0",
-                    event_id=int(row["event_id"]),
-                    chunk_id=chunk_id,
-                    quote=query,
-                    start_char=start,
-                    end_char=end,
-                    source_created_at=row["source_created_at"],
-                    payload_sha256=payload_sha256,
-                    verified=True,
-                )
-            )
+            results.append(RecallEvidence(
+                evidence_level="E0",
+                event_id=int(row["event_id"]),
+                chunk_id=first_chunk_id,
+                quote=query,
+                start_char=start,
+                end_char=end,
+                source_created_at=row["source_created_at"],
+                payload_sha256=payload_sha256,
+                verified=True,
+            ))
             if len(results) >= limit:
                 break
         return results

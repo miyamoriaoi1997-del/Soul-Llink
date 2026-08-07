@@ -36,25 +36,9 @@ def test_safe_memfs_record_path_rejects_relative_escape(tmp_path, monkeypatch):
 
 
 
-def test_memfs_record_file_path_matches_materialized_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(memory_adapter, "MEMFS_ROOT", tmp_path / "memfs")
-    row = {
-        "record_id": 42,
-        "target_file": "USER.md",
-        "content": "Stable literal memory",
-        "reviewed_at": "2026-01-01T00:00:00Z",
-        "created_at": "2026-01-01T00:00:00Z",
-        "metadata_json": "{}",
-        "kind": "user_preference",
-    }
-
-    assert memory_adapter._materialize_memfs_record(row)
-    path = memory_adapter._memfs_record_file_path(row)
-    assert path.exists()
-
-    memory_adapter._remove_memfs_record_file(row)
-
-    assert not path.exists()
+def test_legacy_record_materialization_private_backdoor_is_removed() -> None:
+    assert not hasattr(memory_adapter, "_materialize_memfs_record")
+    assert memory_adapter.materialize_memfs_from_approved_records() == 0
 
 
 def test_superseded_lookup_treats_like_wildcards_literally(tmp_path):

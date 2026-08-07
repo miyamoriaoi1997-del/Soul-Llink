@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 
 from pcltm import memory_adapter
+from pcltm.memory_contracts import PersonaMode, Sensitivity
+from pcltm.memory_retrieval import GovernedMemorySearchRequest, MemoryRetrievalStatus, search_governed_memories
+from pcltm.memory_write_service import MemoryWriteRequest, MemoryWriteService
+from pcltm.projections.memory_fts import MemoryFtsProjector
+from pcltm.store import EventStore
 from pcltm.live_context_governor import (
     RecallContinuityEvidence,
     RecallIntent,
@@ -66,19 +71,6 @@ def test_recall_precision_intent_has_dedicated_non_relationship_bucket(query: st
     assert not {"relationship", "emotion_boundary"} & decision.allowed_buckets
 
 
-def test_recall_precision_gates_unrelated_user_preferences(recall_db: Path) -> None:
-    con = sqlite3.connect(recall_db)
-    insert_record(con, 1, "USER.md", "用户偏好蓝色界面。", {"bucket": "user_preference"})
-    insert_record(con, 2, "USER.md", "用户要求检索精准正确时宁可少召回。", {"bucket": "user_preference"})
-    con.commit()
-    con.close()
-
-    rendered = memory_adapter.load_prompt_context(
-        mode="work", query="优化长期记忆检索的精准和正确性", memory_limit=1000, user_limit=1000
-    )
-
-    assert "检索精准正确时宁可少召回" in rendered
-    assert "蓝色界面" not in rendered
 
 
 def test_unrelated_high_governor_score_cannot_outrank_or_fill_recall_precision_query(recall_db: Path) -> None:
@@ -98,31 +90,6 @@ def test_unrelated_high_governor_score_cannot_outrank_or_fill_recall_precision_q
     assert [row["record_id"] for row in ranked] == [2]
 
 
-def test_allowed_bucket_does_not_admit_unrelated_high_score_runtime_record(recall_db: Path) -> None:
-    con = sqlite3.connect(recall_db)
-    insert_record(
-        con,
-        1,
-        "MEMORY.md",
-        "Hermes Telegram gateway 使用本机代理。",
-        {"bucket": "runtime_boundary", "gov_score": 100},
-    )
-    insert_record(
-        con,
-        2,
-        "MEMORY.md",
-        "长期记忆检索必须按相关性保障精准正确召回。",
-        {"bucket": "memory_retrieval", "gov_score": 1},
-    )
-    con.commit()
-    con.close()
-
-    rendered = memory_adapter.load_prompt_context(
-        mode="work", query="优化长期记忆检索的精准和正确性", memory_limit=2000, user_limit=1000
-    )
-
-    assert "精准正确召回" in rendered
-    assert "Telegram gateway" not in rendered
 
 
 def test_continuity_hint_requires_explicit_resume_signal() -> None:
@@ -132,25 +99,6 @@ def test_continuity_hint_requires_explicit_resume_signal() -> None:
     assert "continuity capsule" in memory_adapter._continuity_query_hint("继续恢复之前的任务")
 
 
-def test_load_prompt_context_recall_precision_excludes_unrelated_domains(recall_db: Path) -> None:
-    con = sqlite3.connect(recall_db)
-    insert_record(con, 1, "MEMORY.md", "PCLTM 长期记忆检索需用相关性门禁保障精准正确召回。", {"bucket": "memory_retrieval", "gov_score": 1})
-    insert_record(con, 2, "USER.md", "用户要求召回不相关时宁可留空。", {"bucket": "user_preference", "gov_score": 1})
-    insert_record(con, 3, "MEMORY.md", "关系互动的偏好记录。", {"bucket": "relationship", "gov_score": 100})
-    insert_record(con, 4, "MEMORY.md", "AI 创作的分级验证流程。", {"bucket": "workflow", "gov_score": 100})
-    insert_record(con, 5, "MEMORY.md", "漫画模型的训练参数。", {"bucket": "generic", "gov_score": 100})
-    con.commit()
-    con.close()
-
-    rendered = memory_adapter.load_prompt_context(
-        mode="work", query="需要优化，目标是，精准召回，正确召回", memory_limit=2000, user_limit=1000
-    )
-
-    assert "相关性门禁保障精准正确召回" in rendered
-    assert "不相关时宁可留空" in rendered
-    assert "关系互动" not in rendered
-    assert "AI 创作" not in rendered
-    assert "漫画模型" not in rendered
 
 
 def test_elliptical_followup_inherits_diagnostic_intent_only_with_session_evidence() -> None:
@@ -213,34 +161,6 @@ def test_explicit_topic_overrides_diagnostic_continuity(query: str, expected: Re
     ).intent is expected
 
 
-def test_raw_followup_retrieval_keeps_only_quality_related_records(recall_db: Path) -> None:
-    con = sqlite3.connect(recall_db)
-    insert_record(con, 1, "MEMORY.md", "长期记忆召回优化的相关性和精准度已通过测试。", {"bucket": "memory_retrieval"})
-    insert_record(con, 2, "USER.md", "安全复审、宿主安装和运行维护记录。", {"bucket": "runtime_boundary"})
-    insert_record(con, 3, "MEMORY.md", "关系互动和成人创作偏好。", {"bucket": "relationship"})
-    insert_record(con, 4, "MEMORY.md", "漫画模型和 Cua Driver 的参数。", {"bucket": "generic"})
-    con.commit()
-    con.close()
-
-    evidence = RecallContinuityEvidence(
-        prior_intent=RecallIntent.MEMORY_RETRIEVAL_DIAGNOSTICS,
-        confidence=0.95,
-        source="session_turn",
-        session_id="session-a",
-    )
-    rendered = memory_adapter.load_prompt_context(
-        mode="work",
-        query="也就是说现在达到预期了吗",
-        continuity_evidence=evidence,
-        session_id="session-a",
-        memory_limit=2000,
-        user_limit=1000,
-    )
-
-    assert "长期记忆召回优化" in rendered
-    assert "安全复审" not in rendered
-    assert "关系互动" not in rendered
-    assert "漫画模型" not in rendered
 
 
 def test_default_raw_query_does_not_reinject_unrelated_user_or_memory(recall_db: Path) -> None:
@@ -260,3 +180,78 @@ def test_default_raw_query_does_not_reinject_unrelated_user_or_memory(recall_db:
     assert "安全复审" not in rendered
     assert "关系互动" not in rendered
     assert "漫画模型" not in rendered
+
+def _governed_search(tmp_path: Path, query: str, records: list[tuple[str, str]]) -> list[str]:
+    store = EventStore(tmp_path / "governed.db")
+    try:
+        service = MemoryWriteService(store)
+        for index, (token, content) in enumerate(records, 1):
+            receipt = service.write(MemoryWriteRequest(
+                idempotency_key=f"precision:{index}:{token}",
+                content=f"{token} {content}", canonical_key=f"precision:{index}",
+                target="profile", memory_type="preference",
+                sensitivity=Sensitivity.NORMAL, mode_scope=(PersonaMode.WORK,),
+                injection_policy="allow",
+            ))
+            assert receipt.success is True
+        applied = 0
+        for index in range(len(records)):
+            projected = MemoryFtsProjector(store, worker_id="precision").run_once(
+                now=f"2026-07-31T02:00:{index:02d}Z",
+                lease_until=f"2026-07-31T02:01:{index:02d}Z",
+            )
+            applied += int(projected["applied"])
+        assert applied == len(records)
+        result = search_governed_memories(store, GovernedMemorySearchRequest(
+            query=query, persona_mode=PersonaMode.WORK, limit=8,
+        ))
+        if result.status is MemoryRetrievalStatus.ABSTAINED:
+            return []
+        assert result.status is MemoryRetrievalStatus.OK
+        return [item.content for item in result.items]
+    finally:
+        store.close()
+
+
+def test_governed_recall_precision_gates_unrelated_user_preferences(tmp_path: Path) -> None:
+    bodies = _governed_search(tmp_path, "precision-token", [
+        ("ui-token", "用户偏好蓝色界面。"),
+        ("precision-token", "用户要求检索精准正确时宁可少召回。"),
+    ])
+    assert any("检索精准正确时宁可少召回" in body for body in bodies)
+    assert all("蓝色界面" not in body for body in bodies)
+
+
+def test_governed_query_does_not_admit_unrelated_runtime_record(tmp_path: Path) -> None:
+    bodies = _governed_search(tmp_path, "quality-token", [
+        ("gateway-token", "Hermes Telegram gateway 使用本机代理。"),
+        ("quality-token", "长期记忆检索必须按相关性保障精准正确召回。"),
+    ])
+    assert any("精准正确召回" in body for body in bodies)
+    assert all("Telegram gateway" not in body for body in bodies)
+
+
+def test_governed_recall_precision_excludes_unrelated_domains(tmp_path: Path) -> None:
+    bodies = _governed_search(tmp_path, "recall-quality", [
+        ("recall-quality", "PCLTM 长期记忆检索需用相关性门禁保障精准正确召回。"),
+        ("recall-quality", "用户要求召回不相关时宁可留空。"),
+        ("relationship-token", "关系互动的偏好记录。"),
+        ("creative-token", "AI 创作的分级验证流程。"),
+        ("comic-token", "漫画模型的训练参数。"),
+    ])
+    joined = "\n".join(bodies)
+    assert "相关性门禁保障精准正确召回" in joined
+    assert "不相关时宁可留空" in joined
+    assert "关系互动" not in joined and "AI 创作" not in joined and "漫画模型" not in joined
+
+
+def test_governed_followup_query_keeps_only_quality_related_records(tmp_path: Path) -> None:
+    bodies = _governed_search(tmp_path, "followup-quality", [
+        ("followup-quality", "长期记忆召回优化的相关性和精准度已通过测试。"),
+        ("runtime-token", "安全复审、宿主安装和运行维护记录。"),
+        ("relationship-token", "关系互动和成人创作偏好。"),
+        ("comic-token", "漫画模型和 Cua Driver 的参数。"),
+    ])
+    joined = "\n".join(bodies)
+    assert "长期记忆召回优化" in joined
+    assert "安全复审" not in joined and "关系互动" not in joined and "漫画模型" not in joined

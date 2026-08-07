@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 from pcltm import memory_adapter
 from pcltm.memfs_store import MemFSStore
@@ -16,40 +15,63 @@ def _rows(records):
     return con, con.execute("SELECT * FROM rows").fetchall()
 
 
-def test_query_aliases_are_data_driven_for_db_recall():
-    policy = memory_adapter.ViewPolicy(query_alias_groups=(("revise", "edit", "polish"),))
+def test_query_aliases_are_data_driven_and_improve_work_preference_recall():
+    policy = memory_adapter.ViewPolicy(query_alias_groups=(("改稿", "修订", "精修"), ("写作", "小说", "创作")))
     con, rows = _rows([
-        (1, "General preference.", json.dumps({"gov_score": 0.95})),
-        (2, "Prefers careful editing and revision.", json.dumps({"gov_score": 0.40})),
+        (1, "用户偏好普通简洁回复。", json.dumps({"gov_score": 0.95})),
+        (2, "用户在小说创作中偏好专项修订并保持人物一致性。", json.dumps({"gov_score": 0.40})),
     ])
     try:
-        ranked = memory_adapter._rank_rows("USER.md", rows, "work", query="polish", policy=policy)
+        ranked = memory_adapter._rank_rows("USER.md", rows, "work", query="写作时怎么改稿", policy=policy)
     finally:
         con.close()
+
     assert ranked[0]["record_id"] == 2
 
 
-def test_structured_fact_projection_ranks_without_mutating_body():
+def test_structured_fact_projection_participates_in_recall_without_mutating_body():
     con, rows = _rows([
-        (1, "General preference.", json.dumps({"gov_score": 0.90})),
-        (2, "Specific preference.", json.dumps({"gov_score": 0.35, "facts": {"workflow": "scene continuity"}})),
+        (1, "用户偏好普通简洁回复。", json.dumps({"gov_score": 0.90})),
+        (2, "用户有一条具体工作偏好。", json.dumps({
+            "gov_score": 0.35,
+            "facts": {"workflow": "角色一致性 场景连续性 专项修订"},
+        }, ensure_ascii=False)),
     ])
     try:
-        ranked = memory_adapter._rank_rows("USER.md", rows, "work", query="scene continuity")
+        ranked = memory_adapter._rank_rows("USER.md", rows, "work", query="场景连续性", policy=memory_adapter.ViewPolicy())
     finally:
         con.close()
+
     assert ranked[0]["record_id"] == 2
-    assert ranked[0]["content"] == "Specific preference."
+    assert ranked[0]["content"] == "用户有一条具体工作偏好。"
 
 
-def test_memfs_alias_and_fact_projection_match_db_contract(tmp_path: Path):
-    path = tmp_path / "pinned" / "workflow.md"
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        "---\ndescription: workflow\nauthority: pinned\nmode_scope: [work]\n"
-        "buckets: [project]\nfacts: {workflow: scene continuity}\n---\nSpecific preference.\n",
-        encoding="utf-8",
-    )
-    store = MemFSStore(tmp_path, query_alias_groups=(("revise", "polish"),))
-    results = store.search("scene continuity", layers=("pinned",), mode="work")
-    assert results[0]["memory_id"] == "pinned/workflow.md"
+def test_memfs_query_aliases_and_fact_projection_match_db_recall_semantics(tmp_path):
+    root = tmp_path / "memfs"
+    for name, description, body, facts in (
+        ("generic.md", "普通偏好", "用户偏好简洁回复。", {}),
+        ("work.md", "具体工作偏好", "用户有一条具体工作偏好。", {"workflow": "角色一致性 场景连续性 专项修订"}),
+    ):
+        path = root / "pinned" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "---\n"
+            f"description: {description}\n"
+            "authority: pinned\n"
+            "mode_scope: [work]\n"
+            "buckets: [user_preference]\n"
+            "memory_type: UserPreference\n"
+            "lifecycle_state: active\n"
+            f"metadata: {json.dumps({'facts': facts}, ensure_ascii=False)}\n"
+            "---\n\n"
+            f"{body}\n",
+            encoding="utf-8",
+        )
+
+    store = MemFSStore(root, query_alias_groups=(("改稿", "修订", "精修"),))
+    alias_view = store.load_layer("pinned", mode="work", query="怎么改稿", budget_chars=1000)
+    facts_view = store.load_layer("pinned", mode="work", query="场景连续性", budget_chars=1000)
+
+    assert alias_view.items[0].path == "pinned/work.md"
+    assert facts_view.items[0].path == "pinned/work.md"
+    assert facts_view.items[0].body.strip() == "用户有一条具体工作偏好。"

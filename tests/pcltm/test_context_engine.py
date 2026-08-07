@@ -23,7 +23,7 @@ def test_top_level_exports_use_unified_pcltm_context_name():
 
 def test_continuity_context_does_not_publish_a_persona_mode():
     context = PCLTMContextEngine(mode="work").build_shadow_context(
-        [{"role": "user", "content": "continue the current task"}]
+        [{"role": "user", "content": "继续当前任务"}]
     )
 
     rendered = context.render()

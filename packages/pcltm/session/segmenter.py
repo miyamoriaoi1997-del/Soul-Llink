@@ -89,7 +89,12 @@ def segment_turns(
     token_count = 0
 
     for index, turn in enumerate(turns):
-        token_count += _rough_token_count(turn)
+        turn_tokens = _rough_token_count(turn)
+        if max_tokens_per_segment is not None and turn_tokens > max_tokens_per_segment:
+            raise ValueError(
+                f"single turn exceeds max_tokens_per_segment ({turn_tokens} > {max_tokens_per_segment})"
+            )
+        token_count += turn_tokens
         turn_limit_hit = index + 1 - start >= max_turns_per_segment
         token_limit_hit = max_tokens_per_segment is not None and token_count >= max_tokens_per_segment
         event_hit = event_boundaries and index > start and _looks_like_event_boundary(turn)

@@ -10,8 +10,9 @@ required_paths:
   - plugins/context_engine/pcltm-context/__init__.py
   - tests/hermes_cli/test_plugins_cmd.py
   - tests/run_agent/test_plugin_context_engine_init.py
+  - tests/run_agent/test_run_agent.py
 created_paths:
   - tests/agent/test_context_request_budget.py
   - tests/agent/test_pcltm_context_budget.py
 verify_commands:
-  - ["{python}", -m, pytest, tests/agent/test_context_request_budget.py, tests/agent/test_pcltm_context_budget.py, tests/hermes_cli/test_plugins_cmd.py, tests/run_agent/test_plugin_context_engine_init.py, -q]
+  - ["{python}", -m, pytest, tests/agent/test_context_request_budget.py, tests/agent/test_pcltm_context_budget.py, tests/hermes_cli/test_plugins_cmd.py, tests/run_agent/test_plugin_context_engine_init.py, "tests/run_agent/test_run_agent.py::TestMemoryProviderTurnStart::test_on_turn_start_forwards_turn_context", -q]

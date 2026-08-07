@@ -3,8 +3,8 @@
 Uses character n-gram BM25 for Chinese text — no external tokenizer needed.
 For 76 records this is instant; scales to ~10K without issues.
 
-The index is rebuilt on each governor run and cached in-memory during
-prompt assembly. No persistent vector store needed at this scale.
+The index is rebuilt for each legacy diagnostic adapter run and cached
+in-memory during that operation. No persistent vector store is used.
 """
 
 from __future__ import annotations
@@ -143,6 +143,18 @@ class SemanticIndex:
                 scores[rec.record_id] = score
 
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+    def related(self, record_id: int, *, top_k: int = 3) -> list[tuple[int, float]]:
+        """Return records lexically related to ``record_id``, excluding itself."""
+        if top_k <= 0:
+            return []
+        if not self._built:
+            self.build()
+        source = next((record for record in self.records if record.record_id == record_id), None)
+        if source is None:
+            return []
+        matches = self.query(source.content, top_k=top_k + 1)
+        return [(related_id, score) for related_id, score in matches if related_id != record_id][:top_k]
 
     def _bm25_score(self, query_terms: Counter, rec: IndexedRecord) -> float:
         if self.avg_dl <= 0:

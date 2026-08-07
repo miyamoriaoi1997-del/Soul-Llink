@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pcltm.memory_contracts import PersonaMode
 from pcltm.projections.transcript_chunks import TranscriptChunkProjector
 from pcltm.store import EventStore
 from pcltm.transcript_search import search_exact_evidence
+
 
 
 def test_exact_recall_returns_verified_e0_quote_and_offsets(tmp_path: Path) -> None:
@@ -181,3 +183,39 @@ def test_exact_recall_finds_phrase_crossing_chunk_boundary(tmp_path: Path) -> No
     assert hits[0].event_id == event_id
     assert hits[0].verified is True
     assert text[hits[0].start_char:hits[0].end_char] == hits[0].quote
+
+
+def test_exact_recall_applies_event_sensitivity_and_persona_mode_policy(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    try:
+        private_id, _ = store.ingest_external_event(
+            external_id="source:private", source_hash="hash-private", kind="chat_message",
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="私密精确原文",
+            sensitivity="private", persona_mode="daily",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        restricted_id, _ = store.ingest_external_event(
+            external_id="source:restricted", source_hash="hash-restricted", kind="chat_message",
+            session_id="s", conversation_id="c", platform="desktop",
+            role="user", source="test", content="受限精确原文",
+            sensitivity="restricted", persona_mode="daily",
+            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
+        )
+        projector = TranscriptChunkProjector(store, worker_id="worker")
+        projector.run_once(now="2026-07-17T05:01:00Z", lease_until="2026-07-17T05:02:00Z")
+        projector.run_once(now="2026-07-17T05:03:00Z", lease_until="2026-07-17T05:04:00Z")
+
+        assert search_exact_evidence(
+            store, "私密精确原文", limit=5, persona_mode=PersonaMode.WORK,
+        ) == []
+        private_daily = search_exact_evidence(
+            store, "私密精确原文", limit=5, persona_mode=PersonaMode.DAILY,
+        )
+        assert [item.event_id for item in private_daily] == [private_id]
+        assert search_exact_evidence(
+            store, "受限精确原文", limit=5, persona_mode=PersonaMode.DAILY,
+        ) == []
+        assert restricted_id > private_id
+    finally:
+        store.close()

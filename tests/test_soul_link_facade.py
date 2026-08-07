@@ -54,8 +54,8 @@ def _install_structured_memory_view(monkeypatch):
     monkeypatch.setattr(memory_adapter, "load_layered_prompt_context", lambda **_: _FakeLayeredMemoryView())
 
 
-def test_soullink_facade_exports_and_resolves_minimally(tmp_path):
-    link = SoulLink(log_path=tmp_path / "facade.jsonl")
+def test_soullink_facade_exports_and_resolves_minimally():
+    link = SoulLink()
     request = link.ingest(
         "继续做收口",
         recent_context=[{"role": "user", "content": "前文"}],
@@ -83,14 +83,14 @@ def test_persona_engine_base_dir_falls_back_from_non_soullink_cwd(tmp_path, monk
     assert resolve_persona_engine_base_dir(Path(".")) == PERSONA_ACTIVE
 
 
-def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch, tmp_path):
+def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch):
     _install_structured_memory_view(monkeypatch)
     monkeypatch.setattr(
         "persona_engine.emotion_state_manager.EmotionStateManager",
         FakeEmotionStateManager,
     )
     FakeEmotionStateManager.calls = []
-    link = SoulLink(log_path=tmp_path / "compose.jsonl")
+    link = SoulLink()
 
     resolution = link.compose_active_prompt(
         host_system_prompt=(
@@ -110,7 +110,7 @@ def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch, tmp_p
     assert prompt_text.count("\n</pcltm_context>") == 1
     assert "stale active memory" not in prompt_text
     assert "host active memory" not in prompt_text
-    assert "runtime boundary" in prompt_text
+    assert "runtime boundary" not in prompt_text
     assert "<pcltm_memory_view>" not in prompt_text
     assert "<memory_profile_notes>" not in prompt_text
     request = resolution.audit_packet["request"]
@@ -127,8 +127,8 @@ def test_soullink_compose_active_prompt_owns_emotion_boundary(monkeypatch, tmp_p
     ]
 
 
-def test_resolve_uses_single_analysis_for_prompt_candidate(monkeypatch, tmp_path):
-    link = SoulLink(log_path=tmp_path / "resolve.jsonl")
+def test_resolve_uses_single_analysis_for_prompt_candidate(monkeypatch):
+    link = SoulLink()
     calls = {"analyze": 0}
     original_analyze = link._orchestrator._analyze
 

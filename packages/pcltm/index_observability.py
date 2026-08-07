@@ -11,7 +11,6 @@ from .runtime_paths import resolve_db_path, resolve_memfs_root
 from .semantic_index import SemanticIndex
 from .store import EventStore
 
-
 _OBSERVABILITY_TABLES = frozenset(
     {"events", "event_fts", "summary_nodes", "summary_fts", "memory_records"}
 )
@@ -19,7 +18,7 @@ _OBSERVABILITY_TABLES = frozenset(
 
 def _count(con: sqlite3.Connection, table: str) -> int:
     if table not in _OBSERVABILITY_TABLES:
-        raise ValueError(f"unsupported observability table: {table!r}")
+        raise ValueError(f"unsupported observability table: {table}")
     try:
         row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
     except sqlite3.Error:
@@ -137,7 +136,6 @@ def index_doctor(
                 store._conn.commit()
             finally:
                 store.close()
-
             issues = [issue for issue in issues if not str(issue.get("code", "")).endswith("_fts_mismatch")]
     missing_layers = [layer for layer in MEMFS_LAYERS if not (memfs / layer).is_dir()]
     if missing_layers:

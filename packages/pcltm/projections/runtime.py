@@ -6,10 +6,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..store import EventStore
+from ..projection_outbox import TRANSCRIPT_PROJECTIONS, require_event_projection_authority
 from .transcript_chunks import TranscriptChunkProjector
-
-
-TRANSCRIPT_PROJECTIONS = ("transcript_chunks", "transcript_fts")
 
 
 def _timestamp_pair() -> tuple[str, str]:
@@ -21,37 +19,22 @@ def _timestamp_pair() -> tuple[str, str]:
 
 
 def _apply_fts_job(store: EventStore, job: dict[str, Any], *, worker_id: str, now: str) -> None:
-    """Repair the rebuildable FTS projection, then leave acknowledgement to caller.
-
-    ``events`` and their baseline ``event_fts`` rows are written together by
-    EventStore's source transaction, so ordinary EventStore search remains
-    immediately compatible.  The outbox is nevertheless authoritative for
-    recovery: this worker rewrites a missing or drifted row from immutable
-    event content before it can acknowledge the job.
-    """
-    event = store.get_event(int(job["event_seq"]))
+    event_id = require_event_projection_authority(job)
+    event = store.get_event(event_id)
     if event["payload_sha256"] != job["payload_sha256"]:
         raise ValueError("projection payload hash is stale")
-    _materialize_fts(store, event_id=int(job["event_seq"]), content=str(event["content"]))
-
-
-def _materialize_fts(store: EventStore, *, event_id: int, content: str) -> None:
-    """Idempotently make one FTS row exactly match its immutable source event."""
-    conn = store._conn
     row = store._conn.execute(
         "SELECT content FROM event_fts WHERE rowid = ?",
         (event_id,),
     ).fetchone()
-    if row is not None and str(row["content"]) == content:
-        return
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
-        conn.execute("INSERT INTO event_fts(rowid, content) VALUES (?, ?)", (event_id, content))
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
+    if row is None or str(row["content"]) != str(event["content"]):
+        raise ValueError("transcript FTS projection is missing or stale")
+    acked = store.ack_projection_job(
+        int(job["outbox_id"]), worker_id=worker_id,
+        expected_attempt_count=int(job["attempt_count"]), now=now,
+    )
+    if not acked:
+        raise RuntimeError("projection lease ownership lost")
 
 
 def drain_transcript_projections(
@@ -91,27 +74,9 @@ def drain_transcript_projections(
         if not jobs:
             break
         for job in jobs:
-            try:
-                _apply_fts_job(store, job, worker_id=worker_id, now=now)
-                acknowledged = store.ack_projection_job(
-                    int(job["outbox_id"]), worker_id=worker_id, now=now
-                )
-                if not acknowledged:
-                    raise RuntimeError("projection acknowledgement ownership lost")
-                result["transcript_fts"] += 1
-                processed += 1
-            except Exception as exc:
-                retry_at = (
-                    datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(minutes=1)
-                ).astimezone(UTC).isoformat().replace("+00:00", "Z")
-                if str(exc) != "projection acknowledgement ownership lost":
-                    store.fail_projection_job(
-                        int(job["outbox_id"]), worker_id=worker_id, error=str(exc),
-                        now=now, next_retry_at=retry_at,
-                    )
-                # A false ACK means the lease may have moved to another worker;
-                # the stale worker must not mutate that worker's ownership.
-                raise RuntimeError(f"transcript FTS projection failed: {exc}") from exc
+            _apply_fts_job(store, job, worker_id=worker_id, now=now)
+            result["transcript_fts"] += 1
+            processed += 1
     if processed >= max_jobs:
         pending = store._conn.execute(
             "SELECT COUNT(*) FROM projection_outbox WHERE status = 'pending'"
@@ -122,9 +87,13 @@ def drain_transcript_projections(
 
 
 def require_transcript_projections_applied(store: EventStore, *, event_id: int) -> None:
-    """Fail the caller while transcript projections are not fully applied."""
+    """Fail closed unless every transcript projection for one event is applied."""
     rows = store._conn.execute(
-        "SELECT projection_kind, status FROM projection_outbox WHERE event_seq = ?",
+        """
+        SELECT projection_kind, status
+        FROM projection_outbox
+        WHERE event_seq = ?
+        """,
         (int(event_id),),
     ).fetchall()
     statuses = {str(row["projection_kind"]): str(row["status"]) for row in rows}

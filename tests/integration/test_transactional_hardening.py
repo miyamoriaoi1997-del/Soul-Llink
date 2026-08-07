@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -36,9 +37,19 @@ def _host(tmp_path: Path) -> Path:
     return host
 
 
-def _deployment() -> HermesDeployment:
-    """Get HermesDeployment pointing to this repository."""
-    return HermesDeployment(Path(__file__).resolve().parents[2])
+def _deployment(monkeypatch) -> HermesDeployment:
+    """Get a deployment with a supported no-op host adapter seam."""
+    deployment = HermesDeployment(Path(__file__).resolve().parents[2])
+    controller = SimpleNamespace(
+        detect=lambda _host: SimpleNamespace(
+            classification="supported", patch_state="applied", missing_paths=()
+        ),
+        apply=lambda _host, **_kwargs: (SimpleNamespace(classification="supported"), None),
+        verify=lambda _host: True,
+        rollback=lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(deployment, "_host_controller", lambda: controller)
+    return deployment
 
 
 def _tree_hash(root: Path) -> str:
@@ -56,7 +67,7 @@ def test_receipt_includes_managed_path_hashes(tmp_path: Path, monkeypatch) -> No
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("custom: preserved\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -90,8 +101,20 @@ def test_main_cli_rollback_on_receipt_write_failure(tmp_path: Path, monkeypatch)
     readonly_dir.mkdir()
     receipt_in_readonly = readonly_dir / "receipt.json"
 
-    # Mock verify to always pass
+    # Keep the CLI test focused on receipt-write rollback rather than host compatibility.
     monkeypatch.setattr(HermesDeployment, "verify", lambda self, *_: True)
+    monkeypatch.setattr(
+        HermesDeployment,
+        "_host_controller",
+        lambda self: SimpleNamespace(
+            detect=lambda _host: SimpleNamespace(
+                classification="supported", patch_state="applied", missing_paths=()
+            ),
+            apply=lambda _host, **_kwargs: (SimpleNamespace(classification="supported"), None),
+            verify=lambda _host: True,
+            rollback=lambda *_args, **_kwargs: True,
+        ),
+    )
 
     # Simulate write failure by making directory read-only after creation
     original_write = DeploymentReceipt.write
@@ -132,7 +155,7 @@ def test_rollback_deletes_absent_before_paths(tmp_path: Path, monkeypatch) -> No
     home.mkdir()
     # Start with no SOUL.md
     assert not (home / "SOUL.md").exists()
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -153,7 +176,7 @@ def test_backup_fingerprints_verified_independently_from_marker(tmp_path: Path, 
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("custom: original\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -180,7 +203,7 @@ def test_end_to_end_isolated_host_rehearsal(tmp_path: Path, monkeypatch) -> None
     home = tmp_path / "home"
     home.mkdir()
     before_host_hash = _tree_hash(host)
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     # Detect phase
@@ -217,7 +240,7 @@ def test_receipt_binds_host_identity_and_versions(tmp_path: Path, monkeypatch) -
     host = _host(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -238,7 +261,7 @@ def test_concurrent_apply_to_same_host_fails_safely(tmp_path: Path, monkeypatch)
     host = _host(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     # First apply

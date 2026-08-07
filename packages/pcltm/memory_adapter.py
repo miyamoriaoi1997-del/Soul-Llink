@@ -18,7 +18,7 @@ import re
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import yaml
 
@@ -843,9 +843,9 @@ def _rank_rows(
 def _render(target_file: str, entries: list[str], *, limit: int) -> str:
     """Legacy USER/MEMORY block rendering is retired.
 
-    PCLTM-context renders prompt-time memory through load_prompt_context(). This
-    compatibility helper intentionally returns an empty string so old call sites
-    cannot resurrect USER PROFILE / MEMORY prompt blocks.
+    Canonical prompt-time memory is rendered by governed injection from
+    ``memory_current``. This helper stays empty so stale callers cannot resurrect
+    USER PROFILE / MEMORY prompt blocks.
     """
     return ""
 
@@ -952,81 +952,9 @@ def _evidence_refs_for_record(row: sqlite3.Row) -> list[dict[str, object]]:
     return refs
 
 
-def _materialize_memfs_record(row: sqlite3.Row, *, policy: ViewPolicy = DEFAULT_VIEW_POLICY) -> bool:
-    """Write one approved memory_records row into the durable MemFS layer.
-
-    DB remains the governance/index store; MemFS becomes the cross-session active
-    context repository that new sessions can read without relying on in-process
-    MemoryStore state.
-    """
-    target_file = str(row["target_file"])
-    if target_file not in {"USER.md", "MEMORY.md"}:
-        return False
-    content = redact_secrets(str(row["content"] or "").strip())
-    if not content:
-        return False
-    record_id = int(row["record_id"])
-    metadata = _metadata(row)
-    bucket = _bucket_for(row, target_file, policy)
-    layer = _memfs_layer_for_target(target_file)
-    rel_path = _memfs_path_for_record(record_id, target_file, content)
-    path = _safe_memfs_record_path(None, rel_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    updated_at = str(row["reviewed_at"] or row["created_at"] or "") if "reviewed_at" in row.keys() else ""
-    frontmatter = {
-        "description": f"PCLTM {target_file} record {record_id}",
-        "authority": layer,
-        "mode_scope": list(_memfs_mode_scope_for_record(row, target_file, policy)),
-        "buckets": [bucket],
-        "source": metadata.get("source") or "pcltm",
-        "last_reviewed": updated_at,
-        "updated_at": updated_at,
-        "char_limit": MAX_ENTRY_CHARS.get(target_file, len(content)),
-        "read_only": True,
-        "memory_type": _memory_type_for_record(row, target_file, metadata, bucket),
-        "lifecycle_state": _lifecycle_state_for_record(row),
-        "ttl": _ttl_for_memory_type(_memory_type_for_record(row, target_file, metadata, bucket)),
-        "conflict_policy": metadata.get("conflict_policy") or "",
-        "injection_policy": metadata.get("injection_policy") or metadata.get("inject_policy") or "",
-        "evidence_refs": _evidence_refs_for_record(row),
-        "metadata": {
-            **metadata,
-            "record_id": record_id,
-            "target_file": target_file,
-            "candidate_id": row["candidate_id"] if "candidate_id" in row.keys() else "",
-            "status": row["status"] if "status" in row.keys() else "approved",
-        },
-    }
-    body = content.rstrip() + "\n"
-    rendered = "---\n" + yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=True) + "---\n" + body
-    from .memfs_store import atomic_write_text
-
-    atomic_write_text(path, rendered)
-    return True
-
-
 def materialize_memfs_from_approved_records() -> int:
-    """Materialize all approved USER/MEMORY DB records into MemFS files."""
-    path = db_path()
-    if not enabled() or not path.exists():
-        return 0
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            """
-            SELECT * FROM memory_records
-            WHERE status = 'approved' AND target_file IN ('USER.md', 'MEMORY.md')
-            ORDER BY record_id ASC
-            """
-        ).fetchall()
-    finally:
-        con.close()
-    written = 0
-    for row in rows:
-        if _materialize_memfs_record(row):
-            written += 1
-    return written
+    """Retired legacy ``memory_records`` → MemFS materialization seam."""
+    return 0
 
 
 def _fetch_record_by_candidate_id(con: sqlite3.Connection, candidate_id: str) -> sqlite3.Row | None:
@@ -1098,9 +1026,9 @@ def _bucket_for(row: sqlite3.Row, target_file: str, policy: ViewPolicy = DEFAULT
     if explicit_bucket:
         return explicit_bucket
 
-    if any(token.lower() in joined or token.lower() in lower for token in policy.emotion_boundary_terms):
-        return "emotion_boundary"
-
+    # Structured legacy signals outrank broad words in free text.  In particular,
+    # terms such as "boundary", "emotion", or "SOUL" can describe runtime
+    # architecture without making the record an emotional/persona boundary.
     for rule in policy.bucket_rules:
         if rule.target_file and rule.target_file != target_file:
             continue
@@ -1109,12 +1037,23 @@ def _bucket_for(row: sqlite3.Row, target_file: str, policy: ViewPolicy = DEFAULT
         if metadata_hit or text_hit:
             return rule.bucket
 
+    # USER.md is structurally a preference/profile store.  Legacy free text can
+    # mention runtime tools (for example "prompt") without changing that type;
+    # runtime USER records must carry an explicit bucket during migration/write.
+    if target_file == "USER.md":
+        if _is_relationship_record(row, metadata, policy) or any(
+            token.lower() in joined for token in policy.emotion_boundary_terms
+        ):
+            return "emotion_boundary"
+        return "user_preference"
+
     if any(token in joined for token in policy.boundary_metadata_terms):
         return "runtime_boundary"
     if _looks_runtime(text, policy) or any(token in joined for token in ("runtime", "hermes", "production", "system_convention")):
         return "runtime_boundary"
-    if target_file == "USER.md":
-        return "user_preference"
+
+    if any(token.lower() in joined or token.lower() in lower for token in policy.emotion_boundary_terms):
+        return "emotion_boundary"
     return "generic"
 
 
@@ -1151,14 +1090,14 @@ def _select_entry_rows(
     bucket_counts: dict[str, int] = {}
     deferred: list[sqlite3.Row] = []
 
-    def add_row(row: sqlite3.Row, *, ignore_quota: bool = False) -> bool:
+    def add_row(row: sqlite3.Row) -> bool:
         record_id = int(row["record_id"])
         if not _mode_allowed(row, target_file, mode, policy):
             if decisions is not None and decisions.get(record_id) != "selected":
                 decisions[record_id] = "mode_excluded"
             return False
         bucket = _bucket_for(row, target_file, policy)
-        if not ignore_quota and bucket_counts.get(bucket, 0) >= quotas.get(bucket, 0):
+        if bucket_counts.get(bucket, 0) >= quotas.get(bucket, 0):
             if decisions is not None and decisions.get(record_id) != "selected":
                 decisions[record_id] = "quota_excluded"
             return False
@@ -1195,14 +1134,6 @@ def _select_entry_rows(
                 break
             add_row(row)
 
-    # If strict quotas produce no usable entries at all, fall back to the best
-    # mode-allowed rows so sparse/legacy DBs do not become empty. Otherwise keep
-    # quota boundaries strict; unused capacity is preferable to prompt bloat.
-    if not selected:
-        for row in deferred:
-            if len(selected) >= min(2, top_k):
-                break
-            add_row(row, ignore_quota=True)
     return selected
 
 
@@ -1303,10 +1234,10 @@ def _sanitize_direct_entry(text: str) -> str:
 def _render_prompt_context(entries_by_target: dict[str, list[str]], *, mode: str | None, query: str | None) -> str:
     lines = [
         "<pcltm_context>",
-        # This host-supplied argument scopes retrieval only.  PCLTM neither
-        # publishes nor derives state-machine mode, and cannot claim sync with
-        # that separate authority in model-facing memory context.
-        f"【retrieval_scope】{mode or 'unscoped'}",
+        f"【mode】{mode or 'default'}",
+        f"【state_machine_mode】{mode or 'default'}",
+        f"【pcltm_mode】{mode or 'default'}",
+        f"【mode_sync】{'consistent' if mode in {'daily', 'work', 'sex'} else 'fallback_hint'}",
         f"【retrieval_policy】{_policy_for_mode(mode)}",
     ]
     if query:
@@ -1335,9 +1266,8 @@ def _load_system_core_entries(*, mode: str | None, query: str | None, budget_cha
     """Load MemFS system/core blocks that must precede selected DB memories.
 
     The system layer is the highest memory authority below the SOUL/runtime
-    state.  Direct prompt rendering historically bypassed MemFS; this helper
-    keeps load_prompt_context() aligned with the layered selector by always
-    attempting system-layer reads first and compacting whole entries only.
+    Retained only for offline layered-view diagnostics; canonical governed
+    injection does not call this helper.
     """
     root = _memfs_root()
     if not root.is_dir():
@@ -1447,106 +1377,13 @@ def track_citations(response_text: str, injected_ids: list[int]) -> list[int]:
 
 
 def get_last_injected_ids() -> list[int]:
-    """Return record IDs injected in the most recent load_prompt_context() call.
+    """Return record IDs from the retired compatibility selector, if invoked.
 
-    Used by post-response hooks to track which memories were actually cited
-    by the model, feeding the citation_count scoring signal.
+    Canonical governed injection does not use this legacy ID surface.
     """
     return list(_last_injected_ids)
 
 
-def _fallback_layered_prompt_context(
-    mode: str | None,
-    query: str | None,
-    budgets: dict[str, int],
-    policy: ViewPolicy,
-    layers: set[str] | None = None,
-    buckets: set[str] | None = None,
-) -> "PromptMemoryView":
-    """Build a valid layered memory view from DB-backed PCLTM records.
-
-    This is intentionally defensive: layered prompt reads must not fail just
-    because the filesystem MemFS repo is missing, empty, or not yet migrated.
-    """
-    from pcltm.memfs_types import MemoryLayerItem, MemoryLayerView, PromptMemoryView
-
-    view = PromptMemoryView()
-    selected_layers = layers or {"system", "pinned", "episodic", "transient"}
-    view.selected_layers = tuple(layer for layer in ("system", "pinned", "episodic", "transient") if layer in selected_layers)
-    selected_buckets = set(buckets or set())
-    if "active_task" in selected_buckets:
-        selected_buckets.add("continuity_capsule")
-    view.selected_buckets = tuple(sorted(selected_buckets))
-    view.selection_source = "db_fallback"
-    view.system = MemoryLayerView(layer="system", budget_chars=budgets.get("system", 1000))
-    view.pinned = MemoryLayerView(layer="pinned", budget_chars=budgets.get("pinned", 1500))
-    view.episodic = MemoryLayerView(layer="episodic", budget_chars=budgets.get("episodic", 1000))
-    view.transient = MemoryLayerView(layer="transient", budget_chars=budgets.get("transient", 500))
-    view.compression = MemoryLayerView(layer="compression", is_reference_only=True)
-
-    def add_db_records(target_file: str, layer: MemoryLayerView) -> list[int]:
-        rows = _rank_rows(
-            target_file, _fetch_rows(target_file), mode, query=query, policy=policy,
-            use_default_semantic_index=True,
-        )
-        selected = _select_entry_rows(target_file, rows, mode, policy)
-        entries = [entry for entry, _row in selected]
-        content, omitted = _compact_entries(entries, layer.budget_chars)
-        layer.omitted_count += omitted
-        included_entries = {e.strip() for e in content.split(ENTRY_DELIMITER) if e.strip()}
-        record_ids: list[int] = []
-        now_iso = sqlite3.connect(":memory:").execute(
-            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-        ).fetchone()[0]
-        for entry, row in ((entry, row) for entry, row in selected if entry in included_entries):
-            metadata = _metadata(row)
-            record_id = int(row["record_id"])
-            record_ids.append(record_id)
-            row_bucket = _bucket_for(row, target_file, policy)
-            memory_type = _memory_type_for_record(row, target_file, metadata, row_bucket)
-            layer.items.append(
-                MemoryLayerItem(
-                    path=_memfs_path_for_record(record_id, target_file, row["content"]),
-                    id=str(record_id),
-                    description=f"DB-backed {target_file} record",
-                    body=_sanitize_direct_entry(entry),
-                    authority=layer.layer,
-                    buckets=(row_bucket,),
-                    mode_scope=_memfs_mode_scope_for_record(row, target_file, policy),
-                    char_count=len(entry),
-                    char_limit=MAX_ENTRY_CHARS[target_file],
-                    read_only=True,
-                    metadata={
-                        **metadata,
-                        "source": "db_fallback",
-                        "target_file": target_file,
-                        "bucket": row_bucket,
-                    },
-                    updated_at=_row_timestamp(row) or now_iso,
-                    score=float(metadata.get("gov_score", metadata.get("importance", 0.0)) or 0.0),
-                    memory_type=memory_type,
-                    lifecycle_state=_lifecycle_state_for_record(metadata),
-                    ttl=_ttl_for_memory_type(memory_type),
-                    injection_policy=_inject_policy(metadata),
-                    evidence_refs=_evidence_refs_for_record(metadata),
-                )
-            )
-        return record_ids
-    injected_ids: list[int] = []
-    try:
-        if "pinned" in selected_layers:
-            injected_ids.extend(add_db_records("USER.md", view.pinned))
-        if "episodic" in selected_layers:
-            injected_ids.extend(add_db_records("MEMORY.md", view.episodic))
-        _update_retrieval_stats(injected_ids)
-    except Exception:
-        # The public contract for load_layered_prompt_context() is best-effort:
-        # return a valid view even if the DB schema/path is unavailable.
-        pass
-
-    global _last_injected_ids
-    _last_injected_ids = list(injected_ids)
-    return view
 
 
 def _memfs_mode_scope(mode: str | None, policy: ViewPolicy = DEFAULT_VIEW_POLICY) -> str | None:
@@ -1562,74 +1399,6 @@ def _memfs_mode_scope(mode: str | None, policy: ViewPolicy = DEFAULT_VIEW_POLICY
     return None
 
 
-def _paths_share_data_boundary(memfs_root: Path, database: Path) -> bool:
-    """Return whether MemFS and SQLite belong to one runtime data tree."""
-    try:
-        return memfs_root.resolve(strict=False).parent == database.resolve(strict=False).parent
-    except OSError:
-        return False
-
-
-def _merge_memfs_with_db_authority(view, mode, query, budgets, policy, layers, buckets, *, memfs_root):
-    """Complete a MemFS projection while applying authoritative DB lifecycle state."""
-    path = db_path()
-    if not _paths_share_data_boundary(Path(memfs_root), path) or not path.exists():
-        return view
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            "SELECT record_id, candidate_id, status FROM memory_records "
-            "WHERE target_file IN ('USER.md', 'MEMORY.md')"
-        ).fetchall()
-    finally:
-        con.close()
-    by_record = {str(row["record_id"]): row for row in rows}
-    by_candidate = {str(row["candidate_id"]): row for row in rows if row["candidate_id"]}
-    fallback = _fallback_layered_prompt_context(mode, query, budgets, policy, layers, buckets)
-    changed = False
-    for layer_name in ("pinned", "episodic"):
-        layer = getattr(view, layer_name)
-        approved_ids = set()
-        kept = []
-        for item in layer.items:
-            record_id = item.metadata.get("record_id")
-            candidate_id = item.metadata.get("candidate_id")
-            record_row = by_record.get(str(record_id)) if record_id is not None else None
-            candidate_row = by_candidate.get(str(candidate_id)) if candidate_id else None
-            if record_id is not None and candidate_id and (record_row is None or candidate_row is None or str(record_row["record_id"]) != str(candidate_row["record_id"])):
-                changed = True
-                continue
-            resolved_row = record_row if record_id is not None else candidate_row
-            status = str(resolved_row["status"]) if resolved_row is not None else None
-            if (record_id is not None or candidate_id) and resolved_row is None:
-                changed = True
-                continue
-            if status is not None and status != "approved":
-                changed = True
-                continue
-            if status == "approved":
-                approved_ids.add(str(resolved_row["record_id"]))
-            kept.append(item)
-        used = sum(item.char_count for item in kept)
-        omitted = layer.omitted_count
-        for item in getattr(fallback, layer_name).items:
-            if item.id in approved_ids:
-                continue
-            if used + item.char_count > layer.budget_chars:
-                omitted += 1
-                continue
-            kept.append(item)
-            used += item.char_count
-            changed = True
-        layer.items = kept
-        layer.used_chars = used
-        layer.omitted_count = omitted
-    if changed:
-        view.selection_source = "memfs+db"
-    return view
-
-
 def load_layered_prompt_context(
     mode: str | None = None,
     query: str | None = None,
@@ -1640,21 +1409,10 @@ def load_layered_prompt_context(
     active_layers: list[str] | tuple[str, ...] | None = None,
     root: Path | None = None,
 ) -> "PromptMemoryView":
-    """Return a layered PromptMemoryView backed by MemFS, with DB fallback.
-
-    The returned view is always structurally valid.  The system layer is always
-    present, and the compression layer is always marked reference-only.
-
-    ``layers`` and ``buckets`` are the PCLTM context-selection contract
-    passed down from the persona MemorySelector. They bound which memory tiers
-    and bucketed facts are allowed into the active prompt; unselected layers stay
-    structurally present but empty.
-    """
-    from pcltm.memfs_store import MemFSStore
+    """Return a fail-closed empty view for the retired legacy MemFS prompt seam."""
     from pcltm.memfs_types import MemoryLayerView, PromptMemoryView
 
-    policy = DEFAULT_VIEW_POLICY
-    profile = policy.mode_profile(mode)
+    del mode, query, layers, buckets, root
     effective_budgets = {
         "system": 1000,
         "pinned": 1500,
@@ -1662,89 +1420,20 @@ def load_layered_prompt_context(
         "transient": 500,
         **(budgets or {}),
     }
-    selected_layers = set(layers or ("system", "pinned", "episodic", "transient"))
-    prompt_active_layers = set(active_layers or selected_layers)
-    selected_buckets = {str(bucket) for bucket in (buckets or []) if str(bucket)}
-    if "active_task" in selected_buckets:
-        selected_buckets.add("continuity_capsule")
-    effective_query = _continuity_query_hint(query) if "continuity_capsule" in selected_buckets else query
-    # Touch the quota profile so layered fallback remains aligned with the
-    # existing mode-aware record-selection policy.
-    policy.quotas_for("USER.md", profile)
-    policy.quotas_for("MEMORY.md", profile)
-
-    memfs_root = _memfs_root(root)
-    try:
-        has_memfs_content = memfs_root.is_dir() and any(path.is_file() for path in memfs_root.rglob("*.md"))
-    except Exception:
-        has_memfs_content = False
-
-    if has_memfs_content:
-        try:
-            store = MemFSStore(
-                memfs_root,
-                query_alias_groups=policy.query_alias_groups,
-            )
-            scope_mode = _memfs_mode_scope(mode, policy)
-            view = PromptMemoryView()
-            view.selected_layers = tuple(layer for layer in ("system", "pinned", "episodic", "transient") if layer in prompt_active_layers)
-            view.selected_buckets = tuple(sorted(selected_buckets))
-            view.selection_source = "memfs"
-            view.system = (
-                store.load_layer(
-                    "system",
-                    mode=scope_mode,
-                    query=effective_query,
-                    budget_chars=effective_budgets.get("system", 1000),
-                    buckets=selected_buckets,
-                )
-                if "system" in selected_layers
-                else MemoryLayerView(layer="system", budget_chars=effective_budgets.get("system", 1000))
-            )
-            view.pinned = (
-                store.load_layer(
-                    "pinned",
-                    mode=scope_mode,
-                    query=effective_query,
-                    budget_chars=effective_budgets.get("pinned", 1500),
-                    buckets=selected_buckets,
-                )
-                if "pinned" in selected_layers
-                else MemoryLayerView(layer="pinned", budget_chars=effective_budgets.get("pinned", 1500))
-            )
-            view.episodic = (
-                store.load_layer(
-                    "episodic",
-                    mode=scope_mode,
-                    query=effective_query,
-                    budget_chars=effective_budgets.get("episodic", 1000),
-                    buckets=selected_buckets,
-                )
-                if "episodic" in selected_layers
-                else MemoryLayerView(layer="episodic", budget_chars=effective_budgets.get("episodic", 1000))
-            )
-            view.transient = (
-                store.load_layer(
-                    "transient",
-                    mode=scope_mode,
-                    query=effective_query,
-                    budget_chars=effective_budgets.get("transient", 500),
-                    buckets=selected_buckets,
-                )
-                if "transient" in selected_layers
-                else MemoryLayerView(layer="transient", budget_chars=effective_budgets.get("transient", 500))
-            )
-            view.compression = MemoryLayerView(layer="compression", is_reference_only=True)
-            if root is not None:
-                return view
-            return _merge_memfs_with_db_authority(
-                view, mode, effective_query, effective_budgets, policy,
-                prompt_active_layers, selected_buckets, memfs_root=memfs_root,
-            )
-        except Exception:
-            pass
-
-    return _fallback_layered_prompt_context(mode, effective_query, effective_budgets, policy, prompt_active_layers, selected_buckets)
+    selected_layers = set(active_layers or ())
+    view = PromptMemoryView()
+    view.selected_layers = tuple(
+        layer for layer in ("system", "pinned", "episodic", "transient")
+        if layer in selected_layers
+    )
+    view.selected_buckets = ()
+    view.selection_source = "retired_legacy_memfs_prompt"
+    view.system = MemoryLayerView(layer="system", budget_chars=effective_budgets["system"])
+    view.pinned = MemoryLayerView(layer="pinned", budget_chars=effective_budgets["pinned"])
+    view.episodic = MemoryLayerView(layer="episodic", budget_chars=effective_budgets["episodic"])
+    view.transient = MemoryLayerView(layer="transient", budget_chars=effective_budgets["transient"])
+    view.compression = MemoryLayerView(layer="compression", is_reference_only=True)
+    return view
 
 
 def select_context_snapshot(
@@ -1831,146 +1520,17 @@ def search_archival_memories(
     limit: int = 8,
     excerpt_chars: int = 240,
 ) -> list[dict[str, object]]:
-    """Progressively disclose archival/reference-only MemFS memories.
-
-    This is the PCLTM archival lookup path inspired by Letta's search/open separation: it returns short references,
-    not full memory bodies, so search results can be safe to show in tool output
-    or active audits without flooding the prompt.
-    """
-    from pcltm.memfs_store import MemFSStore
-
-    root = _memfs_root()
-    results: list[dict[str, object | float]] = []
-    memfs_content_keys: set[str] = set()
-    if root.is_dir():
-        archival_layers = tuple(layers or ("episodic",))
-        selected_buckets = {str(bucket) for bucket in (buckets or []) if str(bucket)} or None
-        store = MemFSStore(root)
-        results = store.search(
-            query,
-            layers=archival_layers,
-            mode=_memfs_mode_scope(mode, DEFAULT_VIEW_POLICY),
-            buckets=selected_buckets,
-            limit=limit,
-            excerpt_chars=excerpt_chars,
-        )
-        for item in results:
-            try:
-                opened = store.open_memory(str(item.get("memory_id") or ""), body_limit=-1)
-            except (FileNotFoundError, OSError, ValueError):
-                continue
-            body = str(opened.get("body") or "").strip()
-            if body:
-                memfs_content_keys.add(hashlib.sha256(body.encode("utf-8")).hexdigest())
-    else:
-        archival_layers = tuple(layers or ("episodic",))
-        selected_buckets = {str(bucket) for bucket in (buckets or []) if str(bucket)} or None
-    if len(results) >= max(0, limit):
-        return results[: max(0, limit)]
-
-    # DB fallback: approved memory_records remain searchable even if their MemFS
-    # materialization is absent or filtered out.  Keep progressive disclosure:
-    # return excerpts and stable db/... memory_ids; full body opens through
-    # open_archival_memory().
-    wanted_targets = []
-    selected_layers_set = set(archival_layers)
-    if "pinned" in selected_layers_set:
-        wanted_targets.append("USER.md")
-    if "episodic" in selected_layers_set:
-        wanted_targets.append("MEMORY.md")
-    if not wanted_targets and selected_layers_set & {"system", "transient"}:
-        wanted_targets.extend(["USER.md", "MEMORY.md"])
-    seen_ids = {str(item.get("memory_id")) for item in results}
-    for target_file in wanted_targets:
-        rows = _rank_rows(
-            target_file, _fetch_rows(target_file), mode, query=query,
-            policy=DEFAULT_VIEW_POLICY, use_default_semantic_index=True,
-        )
-        for row in rows:
-            if query and _query_relevance(str(row["content"]), query, DEFAULT_VIEW_POLICY) <= 0:
-                continue
-            bucket = _bucket_for(row, target_file, DEFAULT_VIEW_POLICY)
-            if selected_buckets and bucket not in selected_buckets:
-                continue
-            if not _mode_allowed(row, target_file, mode, DEFAULT_VIEW_POLICY):
-                continue
-            record_id = int(row["record_id"] if "record_id" in row.keys() else 0)
-            memory_id = f"db/{target_file}/{record_id}"
-            if memory_id in seen_ids:
-                continue
-            text = redact_secrets(str(row["content"] or "").strip())
-            content_key = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
-            if content_key in memfs_content_keys:
-                continue
-            layer = "pinned" if target_file == "USER.md" else "episodic"
-            results.append({
-                "memory_id": memory_id,
-                "layer": layer,
-                "description": f"DB-backed {target_file} record {record_id}",
-                "buckets": [bucket],
-                "memory_type": _memory_type_for_record(row, target_file, _metadata(row), bucket),
-                "lifecycle_state": "active",
-                "score": _query_relevance(text, query, DEFAULT_VIEW_POLICY),
-                "excerpt": text[:max(0, excerpt_chars)].rstrip() + ("…" if len(text) > excerpt_chars else ""),
-                "reference_only": True,
-            })
-            seen_ids.add(memory_id)
-            if len(results) >= max(0, limit):
-                break
-        if len(results) >= max(0, limit):
-            break
-    results.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("memory_id") or "")))
-    return results[: max(0, limit)]
+    """Retired noncanonical MemFS archival-search compatibility seam."""
+    del query, mode, layers, buckets, limit, excerpt_chars
+    return []
 
 
 def open_archival_memory(memory_id: str, *, body_limit: int = 4000) -> dict[str, object]:
-    """Open one archival/reference memory by id with prompt-safe metadata."""
+    """Retired noncanonical MemFS archival-open compatibility seam."""
+    del body_limit
     if memory_id.startswith("db/"):
-        parts = memory_id.split("/")
-        if len(parts) == 3 and parts[1] in {"USER.md", "MEMORY.md"}:
-            target_file = parts[1]
-            try:
-                record_id = int(parts[2])
-            except ValueError as exc:
-                raise ValueError(f"invalid DB memory id: {memory_id!r}") from exc
-            path = db_path()
-            if not path.exists():
-                raise FileNotFoundError(str(path))
-            con = sqlite3.connect(path)
-            con.row_factory = sqlite3.Row
-            try:
-                row = con.execute(
-                    "SELECT * FROM memory_records WHERE status = 'approved' AND target_file = ? AND record_id = ?",
-                    (target_file, record_id),
-                ).fetchone()
-            finally:
-                con.close()
-            if row is None:
-                raise FileNotFoundError(memory_id)
-            text = redact_secrets(str(row["content"] or "").strip())
-            truncated = False
-            if body_limit >= 0 and len(text) > body_limit:
-                text = text[:body_limit].rstrip() + "…"
-                truncated = True
-            bucket = _bucket_for(row, target_file, DEFAULT_VIEW_POLICY)
-            return {
-                "memory_id": memory_id,
-                "layer": "pinned" if target_file == "USER.md" else "episodic",
-                "description": f"DB-backed {target_file} record {record_id}",
-                "buckets": [bucket],
-                "mode_scope": list(_memfs_mode_scope_for_record(row, target_file, DEFAULT_VIEW_POLICY)),
-                "memory_type": _memory_type_for_record(row, target_file, _metadata(row), bucket),
-                "lifecycle_state": "active",
-                "reference_only": True,
-                "body": text,
-                "truncated": truncated,
-            }
-    from pcltm.memfs_store import MemFSStore
-
-    opened = MemFSStore(_memfs_root()).open_memory(memory_id, body_limit=body_limit)
-    if isinstance(opened, dict) and isinstance(opened.get("body"), str):
-        opened = {**opened, "body": redact_secrets(opened["body"])}
-    return opened
+        raise ValueError("legacy_db_memory_id_retired")
+    raise ValueError("legacy_memfs_archival_open_retired")
 
 
 def load_prompt_context(
@@ -1983,97 +1543,24 @@ def load_prompt_context(
     continuity_evidence: RecallContinuityEvidence | None = None,
     session_id: str | None = None,
 ) -> str:
-    """Return a direct PCLTM semantic prompt block without legacy md headers."""
-    if not enabled():
-        return ""
-    active_policy = policy or DEFAULT_VIEW_POLICY
-    budgets = {"USER.md": user_limit, "MEMORY.md": memory_limit}
-    recall_intent = classify_recall_intent(
-        query,
-        continuity_evidence=continuity_evidence,
-        session_id=session_id,
-    )
-    selected: dict[str, list[str]] = {"SYSTEM.md": _load_system_core_entries(mode=mode, query=query)}
-    candidate_records: list[dict[str, Any]] = []
-    judgment_records: list[dict[str, Any]] = []
-    all_injected_ids: list[int] = []
-    for target_file in ("USER.md", "MEMORY.md"):
-        eligible_rows = _rows_allowed_by_recall_intent(
-            target_file,
-            _fetch_rows(target_file),
-            recall_intent,
-            query,
-            active_policy,
-        )
-        rows = _rank_rows(
-            target_file, eligible_rows, mode, query=query,
-            policy=active_policy, use_default_semantic_index=True,
-        )
-        decisions: dict[int, str] = {}
-        selected_rows = _select_entry_rows(target_file, rows, mode, active_policy, decisions=decisions)
-        entries = [entry for entry, _row in selected_rows]
-        record_ids = [int(row["record_id"]) for _entry, row in selected_rows]
-        all_injected_ids.extend(record_ids)
-        content, _omitted_count = _compact_entries(entries, budgets[target_file])
-        admitted_entries = {entry for entry in content.split(ENTRY_DELIMITER) if entry in entries}
-        selected_entry_by_id = {int(row["record_id"]): entry for entry, row in selected_rows}
-        for rank, row in enumerate(rows, 1):
-            record_id = int(row["record_id"])
-            record = {
-                "record_id": record_id,
-                "target_file": target_file,
-                "bucket": _bucket_for(row, target_file, active_policy),
-                "rank": rank,
-                "content": redact_secrets(str(row["content"] or "")),
-                "content_sha256": hashlib.sha256(str(row["content"] or "").encode("utf-8")).hexdigest(),
-            }
-            candidate_records.append(record)
-            selection_decision = decisions.get(record_id, "top_k_excluded")
-            selected_entry = selected_entry_by_id.get(record_id)
-            judgment_records.append({
-                **record,
-                "selection_decision": selection_decision,
-                "budget_decision": (
-                    "admitted" if selected_entry in admitted_entries
-                    else "budget_omitted" if selection_decision == "selected"
-                    else "not_applicable"
-                ),
-            })
-        selected[target_file] = [e.strip() for e in content.split(ENTRY_DELIMITER) if e.strip()]
-    # Update retrieval stats for scoring feedback loop
-    _update_retrieval_stats(all_injected_ids)
-    # Expose injected IDs for post-response citation tracking
-    global _last_injected_ids
-    _last_injected_ids = list(all_injected_ids)
-    raw_context = _render_prompt_context(selected, mode=mode, query=query)
-    if not raw_context:
-        return ""
-    governed = govern_prompt_context(
-        raw_context,
-        policy=_live_context_policy(memory_limit, user_limit),
-        recall_intent=recall_intent,
-        outer_tag="pcltm_context",
-    )
-    global _last_live_context_telemetry, _last_memory_selection_observation
-    _last_live_context_telemetry = {**governed.telemetry, "recall_intent": recall_intent.to_dict()}
-    _last_memory_selection_observation = {
-        "status": "captured",
-        "source": "pcltm_selection_pass",
-        "recall_intent": recall_intent.to_dict(),
-        "context_sha256": hashlib.sha256(governed.rendered.encode("utf-8")).hexdigest(),
-        "candidate_records": {
-            "status": "captured", "count": len(candidate_records), "records": candidate_records,
-        },
-        "judgment_workset": {
-            "status": "captured", "count": len(judgment_records), "records": judgment_records,
-        },
-        "governor_result": {
-            "within_budget": governed.telemetry.get("within_budget") is True,
-            "omitted_chars": int(governed.telemetry.get("omitted_chars") or 0),
-            "actions": list(governed.telemetry.get("actions") or []),
-        },
+    """Retired direct ``memory_records`` → prompt compatibility seam."""
+    del mode, query, memory_limit, user_limit, policy, continuity_evidence, session_id
+    global _last_live_context_telemetry, _last_memory_selection_observation, _last_injected_ids
+    _last_injected_ids = []
+    _last_live_context_telemetry = {
+        "status": "retired",
+        "reason": "legacy_direct_db_prompt_retired",
     }
-    return governed.rendered
+    _last_memory_selection_observation = {
+        "status": "retired",
+        "authority": "pcltm.memory_current",
+        "reason": "legacy_direct_db_prompt_retired",
+        "selected_count": 0,
+        "selected_records": [],
+    }
+    return ""
+
+
 
 
 def load_view(
@@ -2086,31 +1573,17 @@ def load_view(
 ) -> str:
     """Retired compatibility API for legacy USER/MEMORY prompt blocks.
 
-    The only supported prompt-time memory path is load_prompt_context(), which
-    emits <pcltm_context>. Returning empty here prevents old Hermes block
-    injection from reappearing if a stale call site survives.
+    Canonical prompt-time memory uses governed search and injection from
+    ``memory_current``. Returning empty here prevents old Hermes block injection
+    from reappearing if a stale call site survives.
     """
     return ""
 
 
 def load_entries(target: str) -> list[str]:
-    """Return approved PCLTM entries for MemoryStore's live tool view."""
-    target_file = _target_file(target)
-    if target_file is None:
-        return []
-    path = db_path()
-    if not path.exists():
-        return []
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            "SELECT content FROM memory_records WHERE status = 'approved' AND target_file = ? ORDER BY record_id ASC",
-            (target_file,),
-        ).fetchall()
-    finally:
-        con.close()
-    return [redact_secrets(r["content"]) for r in rows]
+    """Retired legacy ``memory_records`` live-view seam; canonical tools use claims."""
+    del target
+    return []
 
 
 def _candidate_id(action: str, target_file: str, content: str) -> str:
@@ -2123,7 +1596,7 @@ def _classify_for_metadata(content: str, target_file: str) -> dict:
     result = {"canonical_key": None, "governor_category": "uncategorized"}
     best_key, best_cat, best_score = None, "uncategorized", 0
     # Inline canonical patterns for write-time classification
-    # (must match CANONICAL_PATTERNS in pcltm_governor.py)
+    # Keep this compatibility classifier local to the retired adapter surface.
     domain = "USER" if target_file == "USER.md" else "MEMORY"
     patterns = [
         ("production_memory_architecture", ["PCLTM-only", "PCLTM primary", "memory_records", "pcltm_context"], "architecture_current", "MEMORY"),
@@ -2196,112 +1669,6 @@ def _check_write_conflict(target_file: str, content: str) -> list[dict]:
 
 
 def sync_memory_tool_write(target: str, action: str, content: str | None = None, old_text: str | None = None) -> bool:
-    """Apply memory-tool mutations to PCLTM approved records.
-
-    Returns False when disabled or unavailable so callers can fall back to legacy md.
-    """
-    target_file = _target_file(target)
-    if target_file is None or not enabled():
-        return False
-    path = db_path()
-    if not path.exists():
-        return False
-    con = sqlite3.connect(path)
-    inserted_candidate_id: str | None = None
-    candidate_row_before_upsert: sqlite3.Row | None = None
-    approved_rows_before_update: list[sqlite3.Row] = []
-    try:
-        if action in {"replace", "remove"} and old_text:
-            approved_rows_before_update = _fetch_approved_records(con, target_file, old_text)
-            con.execute(
-                """
-                UPDATE memory_records
-                SET status = 'superseded', decision_reason = ?, reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    WHERE target_file = ? AND status = 'approved' AND content LIKE ? ESCAPE '\\'
-                """,
-                (f"memory_tool {action}", target_file, _like_contains_literal(old_text)),
-            )
-
-        if action in {"add", "replace"} and content:
-            decision = evaluate_memory_write(content, target_file=target_file)
-            if decision.action == "reject":
-                # Secret-policy handled the write safely. Return True so callers
-                # do not fall back to legacy memory stores that could persist the
-                # raw secret value.
-                return True
-            content = decision.sanitized_content or content
-            # Auto-classify for governance metadata
-            classification = _classify_for_metadata(content, target_file)
-            meta = {"source": "memory_tool", "action": action, **decision.metadata}
-            if classification.get("canonical_key"):
-                meta["canonical_key"] = classification["canonical_key"]
-            if classification.get("governor_category") and classification["governor_category"] != "uncategorized":
-                meta["category"] = classification["governor_category"]
-            inserted_candidate_id = _candidate_id(action, target_file, content)
-            candidate_row_before_upsert = _fetch_record_by_candidate_id(con, inserted_candidate_id)
-            con.execute(
-                """
-                INSERT INTO memory_records (
-                    candidate_id, kind, target_file, content, confidence, sensitivity,
-                    source_event_ids, source_node_ids, status, reviewer, reviewed_at,
-                    decision_reason, patch_suggestion, metadata
-                ) VALUES (?, ?, ?, ?, 1.0, ?, '[]', '[]', 'approved', 'memory_tool',
-                          strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, NULL, ?)
-                ON CONFLICT(candidate_id) DO UPDATE SET
-                    kind = excluded.kind,
-                    target_file = excluded.target_file,
-                    content = excluded.content,
-                    confidence = excluded.confidence,
-                    sensitivity = excluded.sensitivity,
-                    status = 'approved',
-                    reviewer = 'memory_tool',
-                    reviewed_at = excluded.reviewed_at,
-                    decision_reason = excluded.decision_reason,
-                    metadata = excluded.metadata
-                """,
-                (
-                    inserted_candidate_id,
-                    "user_profile" if target_file == "USER.md" else "memory_note",
-                    target_file,
-                    content,
-                    decision.sensitivity,
-                    f"memory_tool {action}",
-                    json.dumps(meta, ensure_ascii=False),
-                ),
-            )
-        inserted: sqlite3.Row | None = None
-        if inserted_candidate_id:
-            inserted = _fetch_record_by_candidate_id(con, inserted_candidate_id)
-        try:
-            # Keep the database transaction open until the durable MemFS view is
-            # updated. Any filesystem failure therefore rolls the authoritative
-            # record mutation back instead of publishing split-brain state.
-            for row in approved_rows_before_update:
-                _remove_memfs_record_file(row)
-            if inserted is not None:
-                _materialize_memfs_record(inserted)
-            con.commit()
-        except Exception:
-            con.rollback()
-            # Compensate filesystem work that may have completed before a later
-            # operation (or SQLite commit) failed. Recovery is best-effort and
-            # must not hide the original failure from the caller/health layer.
-            if candidate_row_before_upsert is not None and candidate_row_before_upsert["status"] == "approved":
-                try:
-                    _materialize_memfs_record(candidate_row_before_upsert)
-                except OSError:
-                    pass
-            elif inserted is not None:
-                try:
-                    _remove_memfs_record_file(inserted)
-                except OSError:
-                    pass
-            for row in approved_rows_before_update:
-                try:
-                    _materialize_memfs_record(row)
-                except OSError:
-                    pass
-            raise
-        return True
-    finally:
-        con.close()
+    """Retired mutation seam; governed writes use ``MemoryWriteService``."""
+    del target, action, content, old_text
+    raise RuntimeError("legacy_memory_tool_sync_retired")

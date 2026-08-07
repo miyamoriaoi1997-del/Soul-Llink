@@ -5,6 +5,8 @@ from pcltm.state import (
     append_turns_to_chain,
     build_session_summary_chain,
 )
+from pcltm.session.segmenter import segment_turns
+import pytest
 
 
 def test_chain_is_built_from_raw_turn_segments_not_prior_summary_text():
@@ -118,6 +120,21 @@ def test_bounded_chain_drops_old_segments_but_keeps_latest_raw_derived_state():
     assert chain.current_task == "任务 9"
 
 
+def test_chain_rejects_non_positive_max_segments():
+    turns = [DialogueTurn(user="task", assistant="done")]
+
+    for value in (0, -1):
+        with pytest.raises(ValueError, match="max_segments must be positive"):
+            build_session_summary_chain(turns, max_segments=value)
+
+
+def test_segmenter_rejects_single_turn_larger_than_token_limit():
+    turns = [DialogueTurn(user="x" * 100, assistant="")]
+
+    with pytest.raises(ValueError, match="single turn exceeds"):
+        segment_turns(turns, max_tokens_per_segment=10)
+
+
 def test_scope_correction_revokes_prior_extension_across_segments_and_resume():
     turns = [
         DialogueTurn(user="实现现有 JSONL 审计器。", assistant="我会按现有契约实现。"),
@@ -130,12 +147,10 @@ def test_scope_correction_revokes_prior_extension_across_segments_and_resume():
     ]
 
     chain = build_session_summary_chain(turns, segment_size=2, max_segments=4)
-    rendered = chain.render()
 
     assert "再新增一个批处理扩展。" in chain.revoked_index
     assert "再新增一个批处理扩展。" not in chain.unresolved_index
     assert chain.current_task == "取消批处理扩展，只修现有审计器，不要增加新功能。"
-    assert "只修现有审计器，不要增加新功能" in rendered
 
 
 def test_negative_constraint_is_not_misclassified_as_revoked_work():

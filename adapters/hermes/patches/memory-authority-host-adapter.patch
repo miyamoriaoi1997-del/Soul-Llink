@@ -1,63 +1,111 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 08cb880a..4dec7eac 100644
+index 6f89ed23..1227b95c 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -1395,6 +1395,11 @@ def init_agent(
-     # Memory provider plugin (external — one at a time, alongside built-in)
+@@ -1679,8 +1679,12 @@ def init_agent(
+     if not skip_memory or _memory_toolset_requested:
+         try:
+             mem_config = _agent_cfg.get("memory", {})
+-            agent._memory_enabled = mem_config.get("memory_enabled", False)
+-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
++            from agent.memory_authority import builtin_memory_flags
++
++            (
++                agent._memory_enabled,
++                agent._user_profile_enabled,
++            ) = builtin_memory_flags(_agent_cfg)
+             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+             if agent._memory_enabled or agent._user_profile_enabled:
+                 from tools.memory_tool import MemoryStore
+@@ -1694,9 +1698,16 @@ def init_agent(
+     
+ 
+ 
+-    # Memory provider plugin (external — one at a time, alongside built-in)
++    # Memory provider plugin. Exclusive providers force the built-in
++    # MEMORY.md/USER.md stores off when selected.
      # Reads memory.provider from config to select which plugin to activate.
      agent._memory_manager = None
-+    from agent.soullink_memory_authority import state_for_config as _soullink_authority_state
-+    agent._soullink_memory_authority_state = _soullink_authority_state(
++    from agent.memory_authority import set_authority_state as _set_memory_authority_state
++    _set_memory_authority_state(
++        agent,
 +        _agent_cfg,
 +        provider_available=False,
 +    )
      if not skip_memory:
          try:
              _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-@@ -1407,6 +1412,10 @@ def init_agent(
+@@ -1709,6 +1720,11 @@ def init_agent(
                  if _mp and _mp.is_available():
                      agent._memory_manager.add_provider(_mp)
                  if agent._memory_manager.providers:
-+                    agent._soullink_memory_authority_state = _soullink_authority_state(
++                    _set_memory_authority_state(
++                        agent,
 +                        _agent_cfg,
 +                        provider_available=True,
 +                    )
                      _init_kwargs = {
                          "session_id": agent.session_id,
                          "platform": platform or "cli",
+@@ -2439,6 +2455,9 @@ def init_agent(
+
+     if _selected_engine is not None:
+         agent.context_compressor = _selected_engine
++        _configure_context_engine = getattr(agent.context_compressor, "configure", None)
++        if callable(_configure_context_engine):
++            _configure_context_engine(_ctx_cfg)
+         # External engines own compaction policy: the host compression
+         # threshold (including the Codex gpt-5.5 autoraise above) only
+         # configures the built-in ContextCompressor and never reaches the
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index c6ed459e..d0e2e3f0 100644
+index 062549ed..0019e0a0 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
-@@ -2193,6 +2193,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+@@ -2816,6 +2816,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
          function_args = {}
- 
+
      _tool_middleware_trace = list(tool_request_middleware_trace or [])
 +
-+    from agent.soullink_memory_authority import forbidden_result, state_for_agent
-+    _memory_authority_block = forbidden_result(
-+        function_name,
-+        state=state_for_agent(agent),
-+    )
++    from agent.memory_authority import forbidden_result_for_agent
++    _memory_authority_block = forbidden_result_for_agent(agent, function_name)
 +    if _memory_authority_block is not None:
 +        return _memory_authority_block
 +
      try:
          from hermes_cli.middleware import apply_tool_request_middleware
- 
-diff --git a/agent/soullink_memory_authority.py b/agent/soullink_memory_authority.py
+
+diff --git a/agent/memory_authority.py b/agent/memory_authority.py
 new file mode 100644
-index 00000000..c80a0ea9
+index 00000000..11581122
 --- /dev/null
-+++ b/agent/soullink_memory_authority.py
-@@ -0,0 +1,57 @@
++++ b/agent/memory_authority.py
+@@ -0,0 +1,146 @@
++"""Generic exclusive-memory authority policy for external providers.
++
++The policy is read from a provider's ``plugin.yaml`` without importing plugin
++code.  This lets the host fail closed when a configured canonical authority is
++missing dependencies or cannot initialize: host memory never becomes an
++implicit fallback merely because the external provider is unavailable.
++"""
++
 +from __future__ import annotations
 +
 +import json
 +from collections.abc import Mapping
++from dataclasses import dataclass
 +from typing import Any
 +
-+BLOCKED_TOOLS = frozenset({"memory", "session_search"})
++
++_DEFAULT_BLOCKED_HOST_TOOLS = frozenset({"memory", "session_search"})
++_VALID_STATES = frozenset({"active", "unavailable", "inactive"})
++
++
++@dataclass(frozen=True)
++class MemoryAuthorityPolicy:
++    provider_name: str | None = None
++    authority: str | None = None
++    exclusive: bool = False
++    blocked_tools: frozenset[str] = frozenset()
 +
 +
 +def configured_provider(config: Mapping[str, Any] | None) -> str | None:
@@ -70,15 +118,76 @@ index 00000000..c80a0ea9
 +    return provider.strip().lower()
 +
 +
-+def state_for_config(config: Mapping[str, Any] | None, *, provider_available: bool) -> str:
-+    if configured_provider(config) != "soullink":
-+        return "inactive"
-+    return "active" if provider_available else "unavailable"
++def authority_policy_for_config(
++    config: Mapping[str, Any] | None,
++) -> MemoryAuthorityPolicy:
++    provider_name = configured_provider(config)
++    if provider_name is None:
++        return MemoryAuthorityPolicy()
++
++    try:
++        from plugins.memory import find_provider_dir
++
++        provider_dir = find_provider_dir(provider_name)
++        manifest_file = provider_dir / "plugin.yaml" if provider_dir else None
++        if manifest_file is None or not manifest_file.is_file():
++            return MemoryAuthorityPolicy(provider_name=provider_name)
++        import yaml
++
++        manifest = yaml.safe_load(manifest_file.read_text(encoding="utf-8-sig")) or {}
++    except Exception:
++        return MemoryAuthorityPolicy(provider_name=provider_name)
++
++    if not isinstance(manifest, Mapping) or str(manifest.get("kind", "")).lower() != "exclusive":
++        return MemoryAuthorityPolicy(provider_name=provider_name)
++
++    raw_blocked = manifest.get("blocked_host_tools", _DEFAULT_BLOCKED_HOST_TOOLS)
++    if isinstance(raw_blocked, (list, tuple, set, frozenset)):
++        blocked = frozenset(
++            str(name).strip() for name in raw_blocked if str(name).strip()
++        )
++    else:
++        blocked = _DEFAULT_BLOCKED_HOST_TOOLS
++    authority = str(manifest.get("authority") or provider_name).strip()
++    return MemoryAuthorityPolicy(
++        provider_name=provider_name,
++        authority=authority,
++        exclusive=True,
++        blocked_tools=blocked,
++    )
++
++
++def builtin_memory_flags(
++    config: Mapping[str, Any] | None,
++) -> tuple[bool, bool]:
++    if authority_policy_for_config(config).exclusive:
++        return False, False
++    memory = config.get("memory") if isinstance(config, Mapping) else None
++    if not isinstance(memory, Mapping):
++        return False, False
++    return bool(memory.get("memory_enabled", False)), bool(
++        memory.get("user_profile_enabled", False)
++    )
++
++
++def set_authority_state(
++    agent: Any,
++    config: Mapping[str, Any] | None,
++    *,
++    provider_available: bool,
++) -> str:
++    policy = authority_policy_for_config(config)
++    state = (
++        "active" if provider_available else "unavailable"
++    ) if policy.exclusive else "inactive"
++    agent._memory_authority_policy = policy
++    agent._memory_authority_state = state
++    return state
 +
 +
 +def state_for_agent(agent: Any) -> str:
-+    state = getattr(agent, "_soullink_memory_authority_state", "inactive")
-+    return state if state in {"active", "unavailable"} else "inactive"
++    state = getattr(agent, "_memory_authority_state", "inactive")
++    return state if state in _VALID_STATES else "inactive"
 +
 +
 +def filter_tool_definitions(
@@ -86,151 +195,133 @@ index 00000000..c80a0ea9
 +    *,
 +    config: Mapping[str, Any] | None,
 +) -> list[dict[str, Any]]:
-+    if configured_provider(config) != "soullink":
++    policy = authority_policy_for_config(config)
++    if not policy.exclusive:
 +        return tool_definitions
 +    return [
 +        definition
 +        for definition in tool_definitions
-+        if definition.get("function", {}).get("name") not in BLOCKED_TOOLS
++        if definition.get("function", {}).get("name") not in policy.blocked_tools
 +    ]
 +
 +
-+def forbidden_result(tool_name: str, *, state: str) -> str | None:
-+    if tool_name not in BLOCKED_TOOLS or state not in {"active", "unavailable"}:
++def forbidden_result_for_agent(agent: Any, tool_name: str) -> str | None:
++    policy = getattr(agent, "_memory_authority_policy", MemoryAuthorityPolicy())
++    state = state_for_agent(agent)
++    if (
++        not isinstance(policy, MemoryAuthorityPolicy)
++        or not policy.exclusive
++        or tool_name not in policy.blocked_tools
++        or state not in {"active", "unavailable"}
++    ):
 +        return None
 +    return json.dumps(
 +        {
 +            "success": False,
 +            "status": "unavailable" if state == "unavailable" else "forbidden",
-+            "authority": "soullink/pcltm",
++            "authority": policy.authority,
++            "provider": policy.provider_name,
 +            "fallback": "forbidden",
 +            "tool": tool_name,
 +        },
 +        ensure_ascii=False,
 +    )
 diff --git a/agent/tool_executor.py b/agent/tool_executor.py
-index a5871442..0330b3b3 100644
+index 6b545f9e..9c38100e 100644
 --- a/agent/tool_executor.py
 +++ b/agent/tool_executor.py
-@@ -264,6 +264,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
-     return names
- 
- 
-+def _memory_authority_block_for_agent(agent, function_name: str) -> str | None:
-+    from agent.soullink_memory_authority import forbidden_result, state_for_agent
+@@ -438,6 +438,27 @@ def _run_agent_tool_execution_middleware(
+     dispatch_lock = threading.Lock()
+
+     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
++        from agent.memory_authority import forbidden_result_for_agent
 +
-+    return forbidden_result(function_name, state=state_for_agent(agent))
-+
-+
- def _apply_tool_request_middleware_for_agent(
-     agent,
-     *,
-@@ -428,12 +434,31 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
-             tool_call_id=getattr(tool_call, "id", "") or "",
-         )
- 
-+        _memory_authority_block = _memory_authority_block_for_agent(
-+            agent,
-+            function_name,
-+        )
-+
-         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
-         # We must know whether the tool will execute before touching
-         # checkpoint state (dedup slot, real snapshots).
-         block_result = None
-         blocked_by_guardrail = False
--        if _ts_scope_block is not None:
-+        if _memory_authority_block is not None:
-+            block_result = _memory_authority_block
++        authority_block = forbidden_result_for_agent(agent, function_name)
++        if authority_block is not None:
++            state["blocked"] = True
++            state["dispatched"] = False
++            state["args"] = final_args
 +            _emit_terminal_post_tool_call(
 +                agent,
 +                function_name=function_name,
-+                function_args=function_args,
-+                result=block_result,
++                function_args=final_args,
++                result=authority_block,
 +                effective_task_id=effective_task_id,
-+                tool_call_id=getattr(tool_call, "id", "") or "",
++                tool_call_id=tool_call_id,
 +                status="blocked",
 +                error_type="memory_authority_block",
-+                error_message=block_result,
-+                middleware_trace=list(middleware_trace),
++                error_message=authority_block,
++                middleware_trace=list(state["middleware_trace"]),
 +            )
-+        elif _ts_scope_block is not None:
-             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
-             block_result = _ts_scope_block
-             _emit_terminal_post_tool_call(
-@@ -1105,10 +1130,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
-             tool_call_id=getattr(tool_call, "id", "") or "",
-         )
- 
-+        _memory_authority_block = _memory_authority_block_for_agent(
-+            agent,
-+            function_name,
-+        )
++            return authority_block
 +
-         # Check plugin hooks for a block directive before executing.
-         _block_msg: Optional[str] = None
-+        _block_result: Optional[str] = None
-         _block_error_type = "plugin_block"
--        if _ts_scope_block is not None:
-+        if _memory_authority_block is not None:
-+            _block_result = _memory_authority_block
-+            _block_error_type = "memory_authority_block"
-+        elif _ts_scope_block is not None:
-             _block_msg = _ts_scope_block
-             _block_error_type = "tool_scope_block"
-         else:
-@@ -1128,12 +1162,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
-                 pass
- 
-         _guardrail_block_decision: ToolGuardrailDecision | None = None
--        if _block_msg is None:
-+        if _block_result is None and _block_msg is None:
-             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-             if not guardrail_decision.allows_execution:
-                 _guardrail_block_decision = guardrail_decision
- 
--        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
-+        _execution_blocked = _block_result is not None or _block_msg is not None or _guardrail_block_decision is not None
- 
-         if _execution_blocked:
-             # Tool blocked by plugin or guardrail policy — skip counters,
-@@ -1210,7 +1244,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
- 
-         tool_start_time = time.time()
- 
--        if _block_msg is not None:
-+        if _block_result is not None:
-+            function_result = _block_result
-+            tool_duration = 0.0
-+            _emit_terminal_post_tool_call(
-+                agent,
-+                function_name=function_name,
-+                function_args=function_args,
-+                result=function_result,
-+                effective_task_id=effective_task_id,
-+                tool_call_id=getattr(tool_call, "id", "") or "",
-+                status="blocked",
-+                error_type=_block_error_type,
-+                error_message=function_result,
-+                middleware_trace=list(middleware_trace),
-+            )
-+        elif _block_msg is not None:
-             # Tool blocked by plugin policy — return error without executing.
-             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
-             tool_duration = 0.0
+         with dispatch_lock:
+             if state["dispatched"]:
+                 raise RuntimeError(
+diff --git a/hermes_cli/memory_setup.py b/hermes_cli/memory_setup.py
+index 887ad149..70d4323d 100644
+--- a/hermes_cli/memory_setup.py
++++ b/hermes_cli/memory_setup.py
+@@ -478,13 +478,15 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
+ def cmd_status(args) -> None:
+     """Show current memory provider config."""
+     from hermes_cli.config import load_config
++    from agent.memory_authority import authority_policy_for_config
+
+     config = load_config()
+     mem_config = config.get("memory", {})
+     provider_name = mem_config.get("provider", "")
++    policy = authority_policy_for_config(config)
+
+-    memory_enabled = mem_config.get("memory_enabled", True)
+-    user_profile_enabled = mem_config.get("user_profile_enabled", True)
++    memory_enabled = mem_config.get("memory_enabled", True) and not policy.exclusive
++    user_profile_enabled = mem_config.get("user_profile_enabled", True) and not policy.exclusive
+
+     mem_mark = "enabled ✓" if memory_enabled else "disabled ✗"
+     user_mark = "enabled ✓" if user_profile_enabled else "disabled ✗"
+@@ -500,7 +502,12 @@ def cmd_status(args) -> None:
+     print("  Built-in (MEMORY.md / USER.md):")
+     print(f"    Memory injection:   {mem_mark}")
+     print(f"    User profile:       {user_mark}")
+-    print(f"    Memory tool:        {tool_mark}")
++    if policy.exclusive:
++        blocked = ", ".join(sorted(policy.blocked_tools))
++        print("    Memory tool:        disabled ✗ (exclusive authority)")
++        print(f"  Authority: {policy.authority} (exclusive; blocks {blocked})")
++    else:
++        print(f"    Memory tool:        {tool_mark}")
+     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+
+     providers = _get_available_providers()
+diff --git a/hermes_cli/subcommands/memory.py b/hermes_cli/subcommands/memory.py
+index 23fe0b85..d9cff01e 100644
+--- a/hermes_cli/subcommands/memory.py
++++ b/hermes_cli/subcommands/memory.py
+@@ -18,8 +18,8 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
+             "Set up and manage external memory provider plugins.\n\n"
+             "Available providers: honcho, openviking, mem0, hindsight,\n"
+             "holographic, retaindb, byterover.\n\n"
+-            "Only one external provider can be active at a time.\n"
+-            "Built-in memory (MEMORY.md/USER.md) is always active."
++            "Only one provider can be active at a time. Providers declared\n"
++            "exclusive (including SoulLink/PCLTM) disable built-in memory and recall."
+         ),
+     )
+     memory_sub = memory_parser.add_subparsers(dest="memory_command")
 diff --git a/model_tools.py b/model_tools.py
-index c59c189e..e4e5b8fd 100644
+index a4ed0c20..ef5ab075 100644
 --- a/model_tools.py
 +++ b/model_tools.py
-@@ -444,6 +444,20 @@ def _compute_tool_definitions(
+@@ -483,6 +483,20 @@ def _compute_tool_definitions(
      # Ask the registry for schemas (only returns tools whose check_fn passes)
      filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
- 
-+    # SoulLink is the canonical memory authority when explicitly configured.
+
++    # An exclusive provider is the canonical memory authority when configured.
 +    # Hide retired host fallbacks even if provider loading later fails; that
 +    # failure is an unavailable authority state, never permission to fallback.
 +    try:
-+        from agent.soullink_memory_authority import filter_tool_definitions
++        from agent.memory_authority import filter_tool_definitions
 +        from hermes_cli.config import load_config_readonly
 +
 +        filtered_tools = filter_tool_definitions(
@@ -238,89 +329,208 @@ index c59c189e..e4e5b8fd 100644
 +            config=load_config_readonly(),
 +        )
 +    except Exception as exc:
-+        logger.warning("SoulLink memory-authority schema gate unavailable: %s", exc)
++        logger.warning("Exclusive memory-authority schema gate unavailable: %s", exc)
 +
      # The set of tool names that actually passed check_fn filtering.
      # Use this (not tools_to_include) for any downstream schema that references
      # other tools by name — otherwise the model sees tools mentioned in
+diff --git a/tests/agent/test_exclusive_memory_authority_contract.py b/tests/agent/test_exclusive_memory_authority_contract.py
+new file mode 100644
+index 00000000..ac7bfc91
+--- /dev/null
++++ b/tests/agent/test_exclusive_memory_authority_contract.py
+@@ -0,0 +1,115 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from agent.memory_authority import (
++    authority_policy_for_config,
++    builtin_memory_flags,
++    filter_tool_definitions,
++    forbidden_result_for_agent,
++    set_authority_state,
++)
++
++
++def _exclusive_plugin(tmp_path: Path, name: str = "canonical") -> Path:
++    plugin = tmp_path / "plugins" / name
++    plugin.mkdir(parents=True)
++    (plugin / "__init__.py").write_text(
++        "def register_memory_provider():\n    raise AssertionError('policy lookup must not import provider')\n",
++        encoding="utf-8",
++    )
++    (plugin / "plugin.yaml").write_text(
++        "manifest_version: 1\n"
++        f"name: {name}\n"
++        "kind: exclusive\n"
++        "authority: Canonical Test Store\n"
++        "blocked_host_tools:\n"
++        "  - memory\n"
++        "  - session_search\n",
++        encoding="utf-8",
++    )
++    return plugin
++
++
++def _config(name: str = "canonical") -> dict:
++    return {
++        "memory": {
++            "provider": name,
++            "memory_enabled": True,
++            "user_profile_enabled": True,
++        }
++    }
++
++
++def test_exclusive_policy_is_manifest_driven_without_importing_provider(tmp_path, monkeypatch):
++    _exclusive_plugin(tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++    policy = authority_policy_for_config(_config())
++
++    assert policy.exclusive is True
++    assert policy.provider_name == "canonical"
++    assert policy.authority == "Canonical Test Store"
++    assert policy.blocked_tools == frozenset({"memory", "session_search"})
++    assert builtin_memory_flags(_config()) == (False, False)
++
++
++def test_nonexclusive_provider_preserves_builtin_flags(tmp_path, monkeypatch):
++    plugin = _exclusive_plugin(tmp_path, "additive")
++    (plugin / "plugin.yaml").write_text(
++        "manifest_version: 1\nname: additive\nkind: standalone\n",
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++    assert authority_policy_for_config(_config("additive")).exclusive is False
++    assert builtin_memory_flags(_config("additive")) == (True, True)
++
++
++@pytest.mark.parametrize("provider_available,state", [(False, "unavailable"), (True, "active")])
++def test_exclusive_state_fails_closed_when_provider_is_unavailable(
++    tmp_path, monkeypatch, provider_available, state
++):
++    _exclusive_plugin(tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = SimpleNamespace()
++
++    set_authority_state(agent, _config(), provider_available=provider_available)
++
++    assert agent._memory_authority_state == state
++    result = json.loads(forbidden_result_for_agent(agent, "memory"))
++    assert result == {
++        "success": False,
++        "status": "forbidden" if provider_available else "unavailable",
++        "authority": "Canonical Test Store",
++        "provider": "canonical",
++        "fallback": "forbidden",
++        "tool": "memory",
++    }
++
++
++def test_exclusive_schema_filter_is_generic(tmp_path, monkeypatch):
++    _exclusive_plugin(tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    definitions = [
++        {"type": "function", "function": {"name": "memory"}},
++        {"type": "function", "function": {"name": "session_search"}},
++        {"type": "function", "function": {"name": "terminal"}},
++    ]
++
++    assert [
++        item["function"]["name"]
++        for item in filter_tool_definitions(definitions, config=_config())
++    ] == ["terminal"]
++
++
++def test_missing_exclusive_plugin_manifest_does_not_guess_from_provider_name(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    config = _config("soullink")
++
++    assert authority_policy_for_config(config).exclusive is False
++    assert builtin_memory_flags(config) == (True, True)
 diff --git a/tests/agent/test_soullink_memory_authority_adapter.py b/tests/agent/test_soullink_memory_authority_adapter.py
 new file mode 100644
-index 00000000..bc26587a
+index 00000000..92e86190
 --- /dev/null
 +++ b/tests/agent/test_soullink_memory_authority_adapter.py
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,110 @@
 +from __future__ import annotations
 +
 +import json
 +from types import SimpleNamespace
 +
 +from agent.agent_runtime_helpers import invoke_tool
-+from agent.soullink_memory_authority import (
++from agent.memory_authority import (
++    MemoryAuthorityPolicy,
++    builtin_memory_flags,
 +    filter_tool_definitions,
-+    forbidden_result,
++    forbidden_result_for_agent,
 +    state_for_agent,
-+    state_for_config,
 +)
 +
 +
-+def _defs(*names: str) -> list[dict]:
-+    return [
-+        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
-+        for name in names
++_POLICY = MemoryAuthorityPolicy(
++    provider_name="soullink",
++    authority="soullink/pcltm",
++    exclusive=True,
++    blocked_tools=frozenset({"memory", "session_search"}),
++)
++
++
++def _agent(**kwargs):
++    return SimpleNamespace(
++        _memory_authority_policy=_POLICY,
++        _memory_authority_state="active",
++        **kwargs,
++    )
++
++
++def test_schema_hides_builtin_memory_but_keeps_soullink_tools(monkeypatch, tmp_path) -> None:
++    plugin = tmp_path / "plugins" / "soullink"
++    plugin.mkdir(parents=True)
++    (plugin / "__init__.py").write_text("def register_memory_provider(): pass\n")
++    (plugin / "plugin.yaml").write_text(
++        "name: soullink\nkind: exclusive\nauthority: soullink/pcltm\n"
++        "blocked_host_tools: [memory, session_search]\n"
++    )
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    definitions = [
++        {"type": "function", "function": {"name": "memory"}},
++        {"type": "function", "function": {"name": "session_search"}},
++        {"type": "function", "function": {"name": "soullink_memory_search"}},
 +    ]
-+
-+
-+def test_schema_hides_builtin_memory_but_keeps_soullink_tools() -> None:
-+    names = {
++    names = [
 +        item["function"]["name"]
 +        for item in filter_tool_definitions(
-+            _defs("memory", "session_search", "soullink_memory_search", "soullink_memory_remember"),
++            definitions,
 +            config={"memory": {"provider": "soullink"}},
 +        )
-+    }
-+    assert names == {"soullink_memory_search", "soullink_memory_remember"}
-+
-+
-+def test_non_soullink_provider_is_unchanged() -> None:
-+    original = _defs("memory", "session_search", "mem0_search")
-+    assert filter_tool_definitions(
-+        original,
-+        config={"memory": {"provider": "mem0"}},
-+    ) is original
-+    assert forbidden_result("memory", state="inactive") is None
-+
-+
-+def test_configured_but_unavailable_fails_closed() -> None:
-+    assert state_for_config(
-+        {"memory": {"provider": "soullink"}},
-+        provider_available=False,
-+    ) == "unavailable"
-+    result = json.loads(forbidden_result("memory", state="unavailable"))
-+    assert result == {
-+        "success": False,
-+        "status": "unavailable",
-+        "authority": "soullink/pcltm",
-+        "fallback": "forbidden",
-+        "tool": "memory",
-+    }
-+
-+
-+def test_sequential_and_concurrent_dispatch_gate_blocks_retired_tools() -> None:
-+    import ast
-+    from pathlib import Path
-+
-+    source = Path("agent/tool_executor.py").read_text(encoding="utf-8")
-+    tree = ast.parse(source)
-+    calls = [
-+        node
-+        for node in ast.walk(tree)
-+        if isinstance(node, ast.Call)
-+        and isinstance(node.func, ast.Name)
-+        and node.func.id == "_memory_authority_block_for_agent"
 +    ]
-+    assert len(calls) == 2
-+    assert "execute_tool_calls_concurrent" in source
-+    assert "execute_tool_calls_sequential" in source
++    assert names == ["soullink_memory_search"]
++
++
++def test_soullink_forces_builtin_memory_and_user_profile_off(monkeypatch, tmp_path) -> None:
++    plugin = tmp_path / "plugins" / "soullink"
++    plugin.mkdir(parents=True)
++    (plugin / "__init__.py").write_text("def register_memory_provider(): pass\n")
++    (plugin / "plugin.yaml").write_text("name: soullink\nkind: exclusive\n")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    assert builtin_memory_flags(
++        {
++            "memory": {
++                "provider": "soullink",
++                "memory_enabled": True,
++                "user_profile_enabled": True,
++            }
++        }
++    ) == (False, False)
 +
 +
 +def test_runtime_helper_blocks_direct_memory_without_touching_store() -> None:
@@ -328,27 +538,37 @@ index 00000000..bc26587a
 +        def __getattribute__(self, name):
 +            raise AssertionError(f"built-in store touched: {name}")
 +
-+    agent = SimpleNamespace(
-+        _soullink_memory_authority_state="active",
-+        _memory_store=ExplodingStore(),
-+        _memory_manager=None,
++    result = json.loads(
++        invoke_tool(
++            _agent(_memory_store=ExplodingStore(), _memory_manager=None),
++            "memory",
++            {"action": "add"},
++            "task",
++        )
 +    )
-+    result = json.loads(invoke_tool(agent, "memory", {"action": "add"}, "task"))
 +    assert result["status"] == "forbidden"
 +    assert result["fallback"] == "forbidden"
 +
 +
 +def test_runtime_helper_blocks_session_search_without_db_recall() -> None:
-+    agent = SimpleNamespace(
-+        _soullink_memory_authority_state="active",
++    agent = _agent(
 +        _get_session_db_for_recall=lambda: (_ for _ in ()).throw(
 +            AssertionError("session DB recall must not run")
-+        ),
++        )
 +    )
 +    result = json.loads(invoke_tool(agent, "session_search", {"query": "x"}, "task"))
 +    assert result["status"] == "forbidden"
 +    assert result["fallback"] == "forbidden"
 +
 +
++def test_unavailable_authority_never_falls_back() -> None:
++    agent = _agent()
++    agent._memory_authority_state = "unavailable"
++    result = json.loads(forbidden_result_for_agent(agent, "memory"))
++    assert result["status"] == "unavailable"
++    assert result["fallback"] == "forbidden"
++
++
 +def test_invalid_agent_state_is_inactive() -> None:
-+    assert state_for_agent(SimpleNamespace(_soullink_memory_authority_state="bogus")) == "inactive"
++    assert state_for_agent(SimpleNamespace(_memory_authority_state="bogus")) == "inactive"
+

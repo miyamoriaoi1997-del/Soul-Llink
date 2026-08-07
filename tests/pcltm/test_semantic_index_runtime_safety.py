@@ -5,7 +5,7 @@ import os
 import sqlite3
 
 import pcltm.memory_adapter as memory_adapter
-from pcltm.semantic_index import SemanticIndex, get_index
+from pcltm.semantic_index import SemanticIndex, find_related_ids, get_index
 from pcltm.store import EventStore
 
 
@@ -39,6 +39,24 @@ def test_semantic_index_query_executes_bm25_and_ranks_match(tmp_path) -> None:
     assert results
     assert results[0][0] == matching_id
     assert results[0][1] > 0
+
+
+def test_find_related_ids_excludes_source_and_ranks_similar_records(tmp_path) -> None:
+    db = tmp_path / "related.db"
+    source_id = _add_memory(db, "pytest verification workflow for project tests")
+    related_id = _add_memory(db, "project pytest workflow and verification checks")
+    _add_memory(db, "persona enjoys watercolor painting")
+
+    results = find_related_ids(source_id, top_k=2, db_path=db)
+
+    assert results == [related_id]
+
+
+def test_find_related_ids_returns_empty_for_missing_record(tmp_path) -> None:
+    db = tmp_path / "missing-related.db"
+    _add_memory(db, "existing memory")
+
+    assert find_related_ids(9999, db_path=db) == []
 
 
 def test_get_index_isolated_by_resolved_database_path(tmp_path) -> None:

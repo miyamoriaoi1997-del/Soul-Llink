@@ -1,0 +1,15 @@
+host: hermes-agent
+adapter_version: "3"
+patch: patches/state-machine-model-router-host-adapter.patch
+required_paths:
+  - agent/chat_completion_helpers.py
+  - agent/conversation_loop.py
+  - agent/memory_manager.py
+  - agent/memory_provider.py
+  - agent/transports/chat_completions.py
+  - tests/agent/test_memory_provider.py
+  - tests/agent/transports/test_chat_completions.py
+  - tests/run_agent/test_run_agent.py
+created_paths: []
+verify_commands:
+  - ["{python}", -m, pytest, tests/agent/test_memory_provider.py, tests/agent/transports/test_chat_completions.py, tests/run_agent/test_run_agent.py::TestMemoryProviderTurnStart::test_current_turn_request_overrides_do_not_mutate_agent_config, -q, --tb=short]

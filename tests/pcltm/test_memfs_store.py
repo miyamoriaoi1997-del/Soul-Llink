@@ -155,7 +155,7 @@ def test_list_tree_empty(tmp_path: Path) -> None:
     assert store.list_tree() == []
 
 
-def test_memfs_search_and_open_redact_secret_values(tmp_path: Path) -> None:
+def test_memfs_search_and_open_are_retired_body_surfaces(tmp_path: Path) -> None:
     fake_secret = "PASSWORD=hunter2"
     write_memory_file(
         tmp_path,
@@ -170,14 +170,9 @@ def test_memfs_search_and_open_redact_secret_values(tmp_path: Path) -> None:
     assert fake_secret not in str(view)
     assert "[REDACTED_SECRET]" in str(view)
 
-    hits = store.search("legacy", layers=["episodic"], mode="work", limit=5)
-    assert hits
-    assert fake_secret not in str(hits)
-    assert "[REDACTED_SECRET]" in str(hits)
-
-    opened = store.open_memory("episodic/dirty.md")
-    assert fake_secret not in str(opened)
-    assert "[REDACTED_SECRET]" in str(opened)
+    assert store.search("legacy", layers=["episodic"], mode="work", limit=5) == []
+    with pytest.raises(RuntimeError, match="legacy_memfs_open_retired"):
+        store.open_memory("episodic/dirty.md")
 
 
 def test_load_layer_system_returns_all(tmp_path: Path) -> None:
@@ -358,3 +353,31 @@ def test_write_file_atomically_preserves_previous_content_on_replace_failure(tmp
 
     assert path.read_bytes() == previous
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_write_file_enforces_char_limit_and_round_trips_frontmatter(tmp_path: Path) -> None:
+    store = MemFSStore(tmp_path)
+    frontmatter = MemoryFileFrontmatter(
+        description="Bounded write",
+        authority="pinned",
+        char_limit=4,
+        read_only=True,
+        updated_at="2026-08-03T12:00:00Z",
+        conflict_policy="strict",
+        evidence_refs=({"event_id": 7},),
+        extra={"provenance": "test"},
+    )
+
+    with pytest.raises(ValueError, match="char_limit"):
+        store.write_file("pinned/item.md", frontmatter, "12345")
+    assert not (tmp_path / "pinned" / "item.md").exists()
+
+    store.write_file("pinned/item.md", frontmatter, "1234")
+    reopened, body = store.read_file("pinned/item.md")
+    assert body == "1234\n"
+    assert reopened.char_limit == 4
+    assert reopened.read_only is True
+    assert reopened.updated_at == "2026-08-03T12:00:00Z"
+    assert reopened.conflict_policy == "strict"
+    assert reopened.evidence_refs == ({"event_id": 7},)
+    assert reopened.extra["provenance"] == "test"

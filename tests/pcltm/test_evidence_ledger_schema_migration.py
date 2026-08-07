@@ -4,8 +4,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from pcltm.store import EventStore
 
 
@@ -319,6 +317,29 @@ def test_failed_v8_migration_rolls_back_schema_and_version(tmp_path: Path, monke
     assert content == "旧版原文"
 
 
+def test_migration_rejects_preexisting_invalid_chain_envelope(tmp_path: Path) -> None:
+    db = tmp_path / "pcltm-invalid-chain.db"
+    _create_real_v8_database(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("ALTER TABLE events ADD COLUMN payload_sha256 TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE events ADD COLUMN chain_hash TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE events SET payload_sha256=?, chain_hash=? WHERE event_id=7", ("a" * 64, "b" * 64))
+
+    try:
+        EventStore(db)
+    except RuntimeError as exc:
+        assert str(exc) == "legacy evidence chain validation failed at event 7: payload_sha256_mismatch"
+    else:
+        raise AssertionError("invalid preexisting chain envelope was accepted")
+
+    with sqlite3.connect(db) as conn:
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+        row = conn.execute("SELECT payload_sha256, chain_hash FROM events WHERE event_id=7").fetchone()
+
+    assert versions == list(range(1, 9))
+    assert row == ("a" * 64, "b" * 64)
+
+
 def test_real_v8_database_migrates_without_losing_evidence(tmp_path: Path) -> None:
     db = tmp_path / "pcltm-v8.db"
     _create_real_v8_database(db)
@@ -392,10 +413,10 @@ def test_failed_bootstrap_with_fts_drift_does_not_commit_rebuild(tmp_path: Path,
     store = EventStore(db)
     event_id = store.append_event(
         session_id="s", conversation_id="c", platform="desktop",
-        role="user", source="test", content="authoritative source content",
+        role="user", source="test", content="权威全文内容",
         category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
     )
-    store._conn.execute("UPDATE event_fts SET content='stale index content' WHERE rowid=?", (event_id,))
+    store._conn.execute("UPDATE event_fts SET content='漂移索引内容' WHERE rowid=?", (event_id,))
     store._conn.commit()
     store.close()
 
@@ -406,14 +427,18 @@ def test_failed_bootstrap_with_fts_drift_does_not_commit_rebuild(tmp_path: Path,
         raise RuntimeError("forced failure after FTS rebuild")
 
     monkeypatch.setattr(store_module.EventStore, "_ensure_fts_populated", fail_after_fts_rebuild)
-    with pytest.raises(RuntimeError, match="forced failure after FTS rebuild"):
+    try:
         EventStore(db)
+    except RuntimeError as exc:
+        assert str(exc) == "forced failure after FTS rebuild"
+    else:
+        raise AssertionError("bootstrap failure was not raised")
 
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         indexed = conn.execute("SELECT content FROM event_fts WHERE rowid=?", (event_id,)).fetchone()["content"]
 
-    assert indexed == "stale index content"
+    assert indexed == "漂移索引内容"
 
 
 def test_schema_migration_is_idempotent_for_v9_database(tmp_path: Path) -> None:
@@ -443,3 +468,37 @@ def test_schema_migration_is_idempotent_for_v9_database(tmp_path: Path) -> None:
         assert third.schema_version() >= 9
     finally:
         third.close()
+
+
+def test_v9_bootstrap_validates_current_event_envelope_not_legacy_ingest_defaults(tmp_path: Path) -> None:
+    db = tmp_path / "pcltm.db"
+    first = EventStore(db)
+    try:
+        event_id, _ = first.ingest_external_event(
+            external_id="message:current-envelope",
+            source_hash="source-v1",
+            kind="chat_message",
+            session_id="session-1",
+            conversation_id="conversation-1",
+            platform="desktop",
+            role="user",
+            source="test",
+            content="version one",
+            category="raw_conversation",
+            subcategory="user",
+            inject_policy="retrieve_only",
+            payload_metadata={"timestamp": "2026-08-03T12:00:00Z"},
+            turn_id="turn-1",
+        )
+        assert first.verify_event_chain()["ok"] is True
+    finally:
+        first.close()
+
+    reopened = EventStore(db)
+    try:
+        assert reopened.verify_event_chain()["ok"] is True
+        event = reopened.get_event(event_id)
+        assert event["source_revision"] == 1
+        assert event["turn_id"] == "turn-1"
+    finally:
+        reopened.close()

@@ -5,7 +5,7 @@ from pcltm.store import EventStore
 
 
 def test_redact_secret_assignments_uses_shared_secret_policy() -> None:
-    text = "auth Bearer abcdefghijklmnopqrstuvwxyz123456 and db postgres://example-user:secretpw@db.example.com/app"
+    text = "auth Bearer abcdefghijklmnopqrstuvwxyz123456 and db postgres://alice:secretpw@db.example.com/app"
 
     redacted = redact_secret_assignments(text)
 

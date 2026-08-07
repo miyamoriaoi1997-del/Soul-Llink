@@ -9,6 +9,7 @@ from typing import Any
 
 from .doctor import PersonaLCMDoctor
 from .ingest import PCLTMIngestAdapter
+from .projections.runtime import drain_transcript_projections
 
 
 class JSONLTranscriptImporter:
@@ -53,6 +54,8 @@ class JSONLTranscriptImporter:
                 except Exception as exc:  # pragma: no cover - exercised by future malformed fixtures
                     errors.append({"line": line_number, "error": str(exc)})
 
+        if not errors:
+            drain_transcript_projections(self.store, worker_id="pcltm-jsonl-import")
         doctor = PersonaLCMDoctor(self.store).run_checks()
         return {
             "ok": not errors and doctor["ok"],

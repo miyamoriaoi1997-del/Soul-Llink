@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .budget_manager import BudgetAllocation
 from .candidate import INJECTION_PRIORITY, CandidateType, InjectionCandidate
@@ -83,9 +83,16 @@ def build_context_packet(
     conflict_decisions: Sequence[ConflictDecision],
     budget: BudgetAllocation,
     metadata: Mapping[str, object] | None = None,
+    token_counter: Callable[[str], int] | None = None,
 ) -> ContextPacket:
+    final_selected = list(selected)
+    final_rejected = list(rejected)
+    if token_counter is not None:
+        while final_selected and token_counter(_render_candidates(final_selected)) > budget.total_budget:
+            final_rejected.append((final_selected.pop(), "final-render-budget-exceeded"))
+
     sections: dict[CandidateType, list[InjectionCandidate]] = {}
-    for candidate in sorted(selected, key=lambda item: (item.priority, item.key)):
+    for candidate in sorted(final_selected, key=lambda item: (item.priority, item.key)):
         sections.setdefault(candidate.type, []).append(candidate)
 
     frozen_sections = {key: tuple(value) for key, value in sections.items()}
@@ -94,14 +101,14 @@ def build_context_packet(
             **candidate.to_audit_dict(),
             "reason": "selected-within-fixed-layer-budget",
         }
-        for candidate in selected
+        for candidate in final_selected
     ]
     rejected_audit = [
         {
             **candidate.to_audit_dict(),
             "reason": reason,
         }
-        for candidate, reason in rejected
+        for candidate, reason in final_rejected
     ]
     audit = InjectionAudit(
         injected=injected_audit,
@@ -112,9 +119,22 @@ def build_context_packet(
     return ContextPacket(
         sections=frozen_sections,
         audit=audit,
-        total_tokens=sum(candidate.token_cost or 0 for candidate in selected),
+        total_tokens=(token_counter(_render_candidates(final_selected)) if token_counter is not None else sum(candidate.token_cost or 0 for candidate in final_selected)),
         metadata=dict(metadata or {}),
     )
+
+
+def _render_candidates(candidates: Sequence[InjectionCandidate]) -> str:
+    lines: list[str] = []
+    sections: dict[CandidateType, list[InjectionCandidate]] = {}
+    for candidate in sorted(candidates, key=lambda item: (item.priority, item.key)):
+        sections.setdefault(candidate.type, []).append(candidate)
+    for candidate_type in sorted(sections, key=lambda item: INJECTION_PRIORITY[item]):
+        lines.append(f"## {SECTION_TITLES[candidate_type]}")
+        for candidate in sections[candidate_type]:
+            lines.append(f"- [{_candidate_label(candidate)}] {candidate.content.strip()}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _candidate_label(candidate: InjectionCandidate) -> str:

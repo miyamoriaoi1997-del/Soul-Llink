@@ -99,6 +99,13 @@ def test_run_governance_aggregates_index_governance_scope_and_selection(tmp_path
     assert report["memory_governance"]["pending_candidates"] == 1
     assert report["scope_collisions"]["collision_count"] == 1
     assert report["selection_probe"]["target"] == "user"
+    assert report["selection_probe"] == {
+        "status": "retired",
+        "bodyless": True,
+        "reason": "legacy_memory_selection_probe_not_runtime_authority",
+        "target": "user",
+        "mode": "work",
+    }
     assert report["summary"]["error_count"] == 1
     assert "scope_canonical_key_collision" in report["summary"]["issue_codes"]
 
@@ -128,4 +135,8 @@ def test_governance_run_cli_emits_json(tmp_path, monkeypatch, capsys) -> None:
     output = json.loads(capsys.readouterr().out)
     assert output["authority_boundary"] == "read_only_governance_runtime"
     assert output["selection_probe"]["target"] == "user"
+    assert output["selection_probe"]["status"] == "retired"
+    assert output["selection_probe"]["bodyless"] is True
+    assert "selected" not in output["selection_probe"]
+    assert "load_entries_baseline" not in output["selection_probe"]
     assert output["ok"] is True

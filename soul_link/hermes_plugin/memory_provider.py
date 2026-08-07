@@ -14,27 +14,39 @@ from typing import Any, Dict, List, Optional
 
 try:
     from agent.memory_provider import MemoryProvider
-except ModuleNotFoundError:  # Host API absent in standalone/import-contract checks.
+except ModuleNotFoundError:  # Host API is optional for the standalone public package.
     class MemoryProvider:  # type: ignore[no-redef]
         pass
+
+
+_ROUTER_SERVER = None
+_ROUTER_THREAD = None
+_ROUTER_LOCK = threading.Lock()
 
 
 def _soullink_root() -> Path:
     explicit = os.environ.get("SOULLINK_ROOT")
     if explicit:
-        root = Path(explicit).expanduser().resolve()
-        if (root / "packages" / "pcltm").is_dir():
-            return root
-        raise RuntimeError(f"SOULLINK_ROOT is invalid: {root}")
+        return Path(explicit).expanduser().resolve()
 
+    # This module may be installed either directly as
+    # ``plugins/soullink/__init__.py`` or one level deeper as
+    # ``plugins/soullink/memory_provider/__init__.py``. Search ancestors for
+    # the plugins directory instead of relying on a brittle parent index.
     resolved = Path(__file__).resolve()
-    for candidate in resolved.parents:
-        if (
-            (candidate / "packages" / "pcltm").is_dir()
-            and (candidate / "packages" / "persona_engine").is_dir()
-        ):
-            return candidate
-    raise RuntimeError(f"cannot locate SoulLink root from {resolved}")
+    plugin_repo = resolved.parent / "Soul-Llink"
+    for parent in resolved.parents:
+        if parent.name.casefold() == "plugins":
+            plugin_repo = parent / "Soul-Llink"
+            break
+    if plugin_repo.exists():
+        return plugin_repo
+
+    # Canonical adapter asset inside the Soul-Llink repository.
+    repo_root = Path(__file__).resolve().parents[3]
+    if (repo_root / "packages" / "persona_engine").exists():
+        return repo_root
+    return plugin_repo
 
 
 def _ensure_paths() -> Path:
@@ -43,7 +55,28 @@ def _ensure_paths() -> Path:
         text = str(path)
         if path.exists() and text not in sys.path:
             sys.path.insert(0, text)
+    # The active private installation keeps runtime state under the canonical
+    # Soul-Llink production repository even when code is staged from an
+    # isolated candidate tree. Bind path resolution explicitly so DB and MemFS
+    # cannot silently split into a second authority.
+    production_root = _hermes_home() / "plugins" / "Soul-Llink"
+    runtime_root = production_root if production_root.is_dir() else root
+    os.environ.setdefault("HERMES_PCLTM_DB", str(runtime_root / "var" / "pcltm-prod.db"))
+    os.environ.setdefault("HERMES_PCLTM_MEMFS_ROOT", str(runtime_root / "var" / "memfs"))
     return root
+
+
+def _validate_production_db_binding() -> Path:
+    """Reject ambient DB authority drift at production-provider startup."""
+    production_root = _hermes_home() / "plugins" / "Soul-Llink"
+    if not production_root.is_dir():
+        raise RuntimeError("canonical production SoulLink root is unavailable")
+    canonical_db = (production_root / "var" / "pcltm-prod.db").resolve()
+    ambient_db = os.environ.get("HERMES_PCLTM_DB")
+    if ambient_db and Path(ambient_db).expanduser().resolve() != canonical_db:
+        raise RuntimeError("ambient HERMES_PCLTM_DB is not the canonical production DB")
+    os.environ["HERMES_PCLTM_DB"] = str(canonical_db)
+    return canonical_db
 
 
 def _hermes_home() -> Path:
@@ -51,14 +84,16 @@ def _hermes_home() -> Path:
     return Path(raw).expanduser() if raw else Path.home() / ".hermes"
 
 
-def _state_machine_runtime_config() -> Dict[str, bool]:
-    """Read strict host gates; missing, malformed, and truthy values fail closed."""
+
+def _state_machine_runtime_config() -> Dict[str, object]:
+    """Read bounded state-machine gates from Hermes config, fail closed."""
+    config_path = _hermes_home() / "config.yaml"
     try:
         import yaml
 
-        config = yaml.safe_load((_hermes_home() / "config.yaml").read_text(encoding="utf-8-sig"))
-        entries = config.get("plugins", {}).get("entries", {}) if isinstance(config, dict) else {}
-        settings = entries.get("soullink", {}).get("state_machine", {}) if isinstance(entries, dict) else {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+        entries = ((config.get("plugins") or {}).get("entries") or {})
+        settings = ((entries.get("soullink") or {}).get("state_machine") or {})
     except Exception:
         settings = {}
     if not isinstance(settings, dict):
@@ -66,7 +101,55 @@ def _state_machine_runtime_config() -> Dict[str, bool]:
     return {
         "transition_table_shadow": settings.get("transition_table_shadow") is True,
         "bounded_activation": settings.get("bounded_activation") is True,
+        "semantic_shadow": settings.get("semantic_shadow") is True,
+        "semantic_authority": settings.get("semantic_authority") is True,
+        "semantic_backend": str(settings.get("semantic_backend") or "local"),
     }
+
+
+def _router_is_active_config() -> bool:
+    config_path = _hermes_home() / "config.yaml"
+    if not config_path.is_file():
+        return False
+    try:
+        import yaml
+
+        model = (yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}).get("model") or {}
+    except Exception:
+        return False
+    return (
+        str(model.get("base_url") or "").rstrip("/") == "http://127.0.0.1:18080/v1"
+        and str(model.get("default") or "") == "persona-auto"
+    )
+
+
+def ensure_inprocess_model_router() -> Dict[str, Any]:
+    """Start SoulLink's Router inside the Hermes process when configured.
+
+    This avoids fragile child-process/task-scheduler ownership on Windows and
+    makes a Desktop restart the sole lifecycle boundary.
+    """
+    global _ROUTER_SERVER, _ROUTER_THREAD
+    if not _router_is_active_config():
+        return {"enabled": False, "running": False}
+    with _ROUTER_LOCK:
+        if _ROUTER_THREAD is not None and _ROUTER_THREAD.is_alive():
+            return {"enabled": True, "running": True, "owner": "hermes_process"}
+        _ensure_paths()
+        from model_router.app import Handler, RouterConfig, RouterServer
+
+        config_path = _soullink_root() / "packages" / "model_router" / "config.yaml"
+        cfg = RouterConfig(config_path)
+        server = RouterServer((cfg.listen_host, cfg.listen_port), Handler, cfg)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="soullink-model-router",
+            daemon=True,
+        )
+        thread.start()
+        _ROUTER_SERVER = server
+        _ROUTER_THREAD = thread
+        return {"enabled": True, "running": thread.is_alive(), "owner": "hermes_process"}
 
 
 def _template_path(layer: str) -> Path:
@@ -194,6 +277,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._turn_memory_context = ""
         self._turn_memory_selection_observation: Dict[str, Any] = {}
         self._turn_route_overrides: Dict[str, Any] = {}
+        self._last_candidate_promotion: Dict[str, Any] = {"status": "not_run"}
 
     @property
     def name(self) -> str:
@@ -205,16 +289,23 @@ class SoulLinkMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         _ensure_paths()
-        from pcltm.cli import init_runtime
-
-        init_runtime()
+        _validate_production_db_binding()
         try:
             self._soul_manifest = ensure_soullink_managed_soul()
         except Exception as exc:
-            # Memory availability should not crash the agent, but the failure is
-            # visible in the provider prompt block/status so identity takeover is
-            # never silently claimed when it did not happen.
-            self._soul_manifest = {"error": str(exc), "changed": False, "restart_required": True}
+            self._soul_manifest = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "changed": False,
+                "restart_required": True,
+            }
+            raise RuntimeError(
+                f"SoulLink identity takeover failed: {type(exc).__name__}"
+            ) from exc
+        from pcltm.cli import init_runtime
+
+        init_runtime()
+        self._router_runtime = ensure_inprocess_model_router()
         self._session_id = session_id
         self._platform = str(kwargs.get("platform") or "")
         self._last_emotion_turn_key = None
@@ -224,6 +315,7 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._pcltm_mode = None
         self._mode_sync = None
         self._runtime_capture_payload = None
+        self._last_candidate_promotion = {"status": "not_run"}
 
     def _get_emotion_manager(self):
         if self._emotion_manager is None:
@@ -249,6 +341,9 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 _soullink_root() / "packages" / "persona_engine",
                 log_path=_hermes_home() / "logs" / "persona-orchestrator.jsonl",
                 core_source="host_core",
+                enable_semantic_shadow=runtime_config["semantic_shadow"],
+                enable_semantic_authority=runtime_config["semantic_authority"],
+                semantic_backend=runtime_config["semantic_backend"],
             )
             transitions = getattr(self._state_orchestrator, "transitions", None)
             if transitions is not None:
@@ -284,20 +379,6 @@ class SoulLinkMemoryProvider(MemoryProvider):
             "</state_machine_injection>"
         )
 
-    @staticmethod
-    def _route_request_overrides(route_metadata: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = (
-            "hermes_route_bucket",
-            "hermes_turn_correlation_id",
-        )
-        metadata = {key: route_metadata[key] for key in allowed if key in route_metadata}
-        return {"extra_body": {"metadata": metadata}} if metadata else {}
-
-    def request_overrides(self) -> Dict[str, Any]:
-        """Return bounded per-turn router metadata without changing prompt content."""
-        metadata = ((self._turn_route_overrides.get("extra_body") or {}).get("metadata") or {})
-        return self._route_request_overrides(metadata)
-
     def _write_runtime_capture(self, payload: Dict[str, Any]) -> None:
         path = Path(self._runtime_capture_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +404,25 @@ class SoulLinkMemoryProvider(MemoryProvider):
         )
 
     @staticmethod
+    def _route_request_overrides(route_metadata: Any) -> Dict[str, Any]:
+        if not isinstance(route_metadata, dict):
+            return {}
+        allowed = (
+            "hermes_route_bucket",
+            "hermes_turn_correlation_id",
+        )
+        metadata = {
+            key: route_metadata[key]
+            for key in allowed
+            if route_metadata.get(key) not in (None, "")
+        }
+        return {"extra_body": {"metadata": metadata}} if metadata else {}
+
+    def request_overrides(self) -> Dict[str, Any]:
+        # Return a detached copy so host transport merging cannot mutate turn state.
+        return json.loads(json.dumps(self._turn_route_overrides)) if self._turn_route_overrides else {}
+
+    @staticmethod
     def _selected_records(memory_context: str) -> List[Dict[str, Any]]:
         match = re.search(
             r"【selected_records】\s*(.*?)(?=\n【[^\n]+】|</pcltm_context>|</memory-context>|\Z)",
@@ -345,7 +445,6 @@ class SoulLinkMemoryProvider(MemoryProvider):
             record["content_sha256"] = hashlib.sha256(record["content"].encode("utf-8")).hexdigest()
         return records
 
-
     @staticmethod
     def _message_text(message: Dict[str, Any]) -> str:
         content = message.get("content")
@@ -358,7 +457,6 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 if isinstance(part, dict) and part.get("type") == "text"
             )
         return ""
-
 
     def on_before_model_forward(self, api_messages: List[Dict[str, Any]], **kwargs) -> None:
         """Observe selected memories after the exact injected context reaches outbound."""
@@ -405,15 +503,22 @@ class SoulLinkMemoryProvider(MemoryProvider):
             }
         self._write_runtime_capture(self._runtime_capture_payload)
 
-
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Update emotion once for the real user turn, before host prefetch."""
-        from agent.skill_commands import extract_user_instruction_from_skill_message
+        try:
+            from agent.skill_commands import extract_user_instruction_from_skill_message
+        except ModuleNotFoundError:  # Standalone public runtime has no Hermes command wrapper.
+            skill_prefix = "[IMPORTANT: The user has invoked the "
+            skill_suffix = " skill. The full skill content is loaded below.]"
+            clean_message = "" if message.startswith(skill_prefix) and message.endswith(skill_suffix) else message
+        else:
+            clean_message = extract_user_instruction_from_skill_message(message)
 
-        clean_message = extract_user_instruction_from_skill_message(message)
         text = clean_message.strip() if isinstance(clean_message, str) else ""
         if not text:
             self._turn_emotion_context = ""
+            self._turn_memory_context = ""
+            self._turn_route_overrides = {}
             return
         session_id = str(kwargs.get("session_id") or getattr(self, "_session_id", ""))
         host_turn_id = str(kwargs.get("turn_id") or "").strip()
@@ -423,6 +528,8 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 return
             # Never let a failed new-turn update reuse the preceding turn's state.
             self._turn_emotion_context = ""
+            self._turn_memory_context = ""
+            self._turn_route_overrides = {}
             manager = self._get_emotion_manager()
             if not manager.update_emotion_state([{"role": "user", "content": text}]):
                 raise RuntimeError("SoulLink emotion update failed before reply")
@@ -430,9 +537,10 @@ class SoulLinkMemoryProvider(MemoryProvider):
             emotion_modifier = manager.get_tone_modifiers()
             emotion_context = self._format_emotion_context(state, emotion_modifier)
             previous_mode = self._active_mode
+            recent_messages = kwargs.get("recent_messages")
             packet = self._get_state_orchestrator().analyze_turn(
                 user_message=text,
-                recent_messages=None,
+                recent_messages=recent_messages if isinstance(recent_messages, list) else None,
                 emotion_state=state,
                 emotion_modifier=emotion_modifier,
                 previous_mode=previous_mode,
@@ -443,6 +551,8 @@ class SoulLinkMemoryProvider(MemoryProvider):
             )
             mode_layer = self._read_soul_mode_layer(packet.mode)
             state_machine_context = self._format_state_machine_context(packet, mode_layer)
+            # The mode layer defines posture first; the live turn emotion then
+            # controls this reply's expression without changing its boundaries.
             self._turn_emotion_context = state_machine_context + "\n\n" + emotion_context
             correlation_provenance = "hermes_turn_id" if host_turn_id else "generated_fallback"
             correlation_source = host_turn_id or uuid.uuid4().hex
@@ -450,6 +560,8 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 f"{session_id}\0{correlation_source}".encode("utf-8")
             ).hexdigest()[:24]
             route_metadata = dict(packet.route_metadata) if isinstance(packet.route_metadata, dict) else {}
+            decision_audit = route_metadata.get("decision_audit") or {}
+            transition_audit = decision_audit.get("transition") or {}
             route_metadata["hermes_turn_correlation_id"] = correlation_id
             self._turn_route_overrides = self._route_request_overrides(route_metadata)
             self._active_mode = packet.mode
@@ -479,6 +591,9 @@ class SoulLinkMemoryProvider(MemoryProvider):
                         "selected_layers": list(packet.selected_layers or []),
                         "safety_flags": list(packet.safety_flags or []),
                         "desire_tier": packet.desire_tier,
+                        "semantic_shadow": getattr(packet, "semantic_shadow", None),
+                        "semantic_fusion": decision_audit.get("semantic_fusion"),
+                        "authority_source": transition_audit.get("authority_source"),
                         "route_metadata": packet.route_metadata if isinstance(packet.route_metadata, dict) else {},
                     },
                     "mode_sync": {
@@ -507,6 +622,10 @@ class SoulLinkMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs,
     ) -> None:
+        reason = str(kwargs.get("reason") or "")
+        inherited_mode = None
+        if reason == "compression" and parent_session_id:
+            inherited_mode = self._session_modes.get(parent_session_id)
         self._session_id = new_session_id
         self._last_emotion_turn_key = None
         self._turn_emotion_context = ""
@@ -514,6 +633,11 @@ class SoulLinkMemoryProvider(MemoryProvider):
         if reset:
             self._session_modes.pop(new_session_id, None)
             self._recall_intents_by_session.pop(new_session_id, None)
+        if inherited_mode:
+            self._session_modes[new_session_id] = inherited_mode
+            self._session_modes.move_to_end(new_session_id)
+            while len(self._session_modes) > 128:
+                self._session_modes.popitem(last=False)
         self._active_mode = self._session_modes.get(new_session_id)
         self._pcltm_mode = None
         self._mode_sync = None
@@ -549,23 +673,122 @@ class SoulLinkMemoryProvider(MemoryProvider):
         session_id: str | None = None,
         continuity_evidence: object | None = None,
     ) -> str:
+        del session_id, continuity_evidence
         _ensure_paths()
-        from pcltm.host_context import PCLTMContextPort
-        from pcltm.memory_adapter import load_prompt_context
-
-        return PCLTMContextPort(loader=load_prompt_context).prefetch(
-            query,
-            active_mode=active_mode,
-            session_id=session_id,
-            continuity_evidence=continuity_evidence,
+        from pcltm.injection.governed_memory import (
+            GovernedInjectionStatus,
+            build_governed_memory_context,
         )
+        from pcltm.injection.candidate import estimate_token_cost
+        from pcltm.memory_contracts import PersonaMode
+        from pcltm.memory_retrieval import (
+            GovernedMemorySearchRequest,
+            MemoryRetrievalStatus,
+            search_governed_memories,
+        )
+        from pcltm.runtime_paths import resolve_db_path
+        from pcltm.store import EventStore
+
+        try:
+            mode = PersonaMode(str(active_mode or "default").strip().lower())
+        except ValueError:
+            mode = PersonaMode.DEFAULT
+        store = EventStore(resolve_db_path(), read_only=True)
+        try:
+            retrieval = search_governed_memories(
+                store,
+                GovernedMemorySearchRequest(
+                    query=query,
+                    persona_mode=mode,
+                    limit=8,
+                ),
+            )
+            if retrieval.status is MemoryRetrievalStatus.UNAVAILABLE:
+                self._turn_memory_selection_observation = {
+                    "status": "unavailable",
+                    "authority": "pcltm.memory_current",
+                    "reason": retrieval.reason,
+                    "selected_count": 0,
+                    "selected_records": [],
+                }
+                raise RuntimeError(retrieval.reason or "governed memory retrieval unavailable")
+            if retrieval.status is MemoryRetrievalStatus.ABSTAINED:
+                self._turn_memory_selection_observation = {
+                    "status": "abstained",
+                    "authority": "pcltm.memory_current",
+                    "reason": retrieval.reason,
+                    "selected_count": 0,
+                    "selected_records": [],
+                }
+                return ""
+            total_budget = 800
+            wrapper_prefix = "<pcltm_context>\nsource: pcltm.memory_current\n"
+            wrapper_suffix = "\n</pcltm_context>"
+            packet_budget = max(
+                0,
+                total_budget - estimate_token_cost(wrapper_prefix + wrapper_suffix),
+            )
+            injection = build_governed_memory_context(
+                store,
+                retrieval,
+                persona_mode=mode,
+                total_budget=packet_budget,
+            )
+            if injection.status is GovernedInjectionStatus.UNAVAILABLE:
+                self._turn_memory_selection_observation = {
+                    "status": "unavailable",
+                    "authority": "pcltm.memory_current",
+                    "reason": injection.reason,
+                    "selected_count": 0,
+                    "selected_records": [],
+                }
+                raise RuntimeError(injection.reason or "governed memory injection unavailable")
+            if injection.status is GovernedInjectionStatus.ABSTAINED or injection.packet is None:
+                self._turn_memory_selection_observation = {
+                    "status": "abstained",
+                    "authority": "pcltm.memory_current",
+                    "reason": injection.reason,
+                    "selected_count": 0,
+                    "selected_records": [],
+                }
+                return ""
+            rendered = injection.packet.render()
+            context = wrapper_prefix + rendered + wrapper_suffix
+            if estimate_token_cost(context) > total_budget:
+                raise RuntimeError("governed memory context exceeds final provider budget")
+            selected_records = [
+                {
+                    "claim_id": item.claim_id,
+                    "claim_version": item.claim_version,
+                    "governance_id": item.governance_id,
+                    "canonical_key": item.canonical_key,
+                    "content_sha256": item.content_sha256,
+                    "authority_verified": item.authority_verified,
+                }
+                for item in retrieval.items
+            ]
+            self._turn_memory_selection_observation = {
+                "status": "captured",
+                "authority": "pcltm.memory_current",
+                "selected_count": len(selected_records),
+                "selected_records": selected_records,
+                "context_sha256": hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                "governor_result": injection.packet.audit.to_dict(),
+            }
+            return context
+        finally:
+            store.close()
 
     def _load_memory_selection_observation(self) -> Dict[str, Any]:
-        _ensure_paths()
-        from pcltm.memory_adapter import last_memory_selection_observation
-
-        return last_memory_selection_observation()
-
+        if self._turn_memory_selection_observation.get("authority") == "pcltm.memory_current":
+            return dict(self._turn_memory_selection_observation)
+        return {
+            "status": "unavailable",
+            "authority": "pcltm.memory_current",
+            "reason": "canonical_memory_selection_observation_missing",
+            "selected_count": 0,
+            "selected_records": [],
+        }
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         continuity_evidence = None
@@ -604,9 +827,16 @@ class SoulLinkMemoryProvider(MemoryProvider):
         self._turn_memory_context = memory_context
         observed = self._load_memory_selection_observation()
         expected_sha = hashlib.sha256(memory_context.encode("utf-8")).hexdigest()
-        observation_matches = (
+        canonical_observation = (
             isinstance(observed, dict)
-            and observed.get("context_sha256") == expected_sha
+            and observed.get("authority") == "pcltm.memory_current"
+        )
+        observation_matches = (
+            canonical_observation
+            or (
+                isinstance(observed, dict)
+                and observed.get("context_sha256") == expected_sha
+            )
         )
         observed_intent = (
             ((observed.get("recall_intent") or {}).get("intent"))
@@ -618,7 +848,16 @@ class SoulLinkMemoryProvider(MemoryProvider):
             self._recall_intents_by_session.move_to_end(session_id)
             while len(self._recall_intents_by_session) > 128:
                 self._recall_intents_by_session.popitem(last=False)
-        self._turn_memory_selection_observation = observed if observation_matches else {}
+        self._turn_memory_selection_observation = (
+            {
+                **observed,
+                "context_sha256": expected_sha,
+            }
+            if observation_matches
+            else {
+                "context_sha256": expected_sha,
+            }
+        )
         self._mode_sync = "consistent" if self._active_mode in {"daily", "work", "sex"} else "fallback_hint"
         if isinstance(self._runtime_capture_payload, dict):
             self._runtime_capture_payload["mode_sync"] = {
@@ -627,7 +866,9 @@ class SoulLinkMemoryProvider(MemoryProvider):
                 "status": self._mode_sync,
             }
             self._write_runtime_capture(self._runtime_capture_payload)
-        parts = [part for part in (self._turn_emotion_context, memory_context) if part]
+        # Recalled memory is evidence/context, not a later instruction layer.
+        # Keep the current turn state last in the host-bound prompt fragment.
+        parts = [part for part in (memory_context, self._turn_emotion_context) if part]
         return "\n\n".join(parts)
 
     def sync_turn(
@@ -643,19 +884,68 @@ class SoulLinkMemoryProvider(MemoryProvider):
         Hermes writes the completed turn to ``state.db`` before this lifecycle
         hook runs. Reading that canonical store provides stable message IDs for
         idempotent live sync and makes the same path reusable for historical
-        backfill. Curated ``memory_records`` remain a separate derived layer.
+        backfill. Raw transcript evidence remains retrieve-only; legacy
+        ``memory_records`` remains non-authoritative migration evidence.
         """
+
         _ensure_paths()
+
+        from pcltm.candidate_promotion import CandidatePromotionService
+        from pcltm.candidates import PersonaCandidateExtractor
         from pcltm.hermes_history import HermesHistoryIngestor
-        from pcltm.runtime_paths import resolve_db_path
+        from pcltm.projections.memory_runtime import drain_memory_projections
+        from pcltm.projections.runtime import drain_transcript_projections
+        from pcltm.runtime_paths import resolve_db_path, resolve_memfs_root
         from pcltm.store import EventStore
 
         source_db = _hermes_home() / "state.db"
         store = EventStore(resolve_db_path())
+        persona_mode = getattr(self, "_active_mode", None) or getattr(self, "_pcltm_mode", None)
         try:
             HermesHistoryIngestor(store, source_db).ingest(
-                session_id=session_id or getattr(self, "_session_id", "") or None
+                session_id=session_id or getattr(self, "_session_id", "") or None,
+                persona_mode=persona_mode,
             )
+            # The sync hook owns the bounded projection drain. This preserves
+            # outbox claim/lease/hash/ack semantics and makes the next prefetch
+            # observe completed-turn chunks without a resident worker.
+            drain_transcript_projections(store)
+            # Candidate pipeline: the bounded durable-memory protocol is the
+            # admission authority. Persona-mode confidence never substitutes
+            # for memory worthiness; ambiguous semantic conflicts remain pending.
+            scope = {"session_id": session_id or getattr(self, "_session_id", "") or None}
+            candidates = PersonaCandidateExtractor(store).extract(scope=scope, limit=500)
+            report = CandidatePromotionService(store).promote(candidates)
+            self._last_candidate_promotion = {
+                "status": "completed",
+                "scanned": report.scanned,
+                "activated": report.activated,
+                "pending": report.pending,
+                "dropped": report.dropped,
+                "superseded": report.superseded,
+                "rejected": report.rejected,
+                "failed": report.failed,
+                "outcomes": [
+                    {
+                        "candidate_id": outcome.candidate_id,
+                        "decision": outcome.decision,
+                        "reason": outcome.reason,
+                        "claim_id": outcome.claim_id,
+                        "claim_version": outcome.claim_version,
+                        "target_file": outcome.target_file,
+                    }
+                    for outcome in report.outcomes
+                ],
+            }
+            if isinstance(self._runtime_capture_payload, dict):
+                self._runtime_capture_payload["candidate_promotion"] = dict(self._last_candidate_promotion)
+                self._write_runtime_capture(self._runtime_capture_payload)
+            if report.activated or report.superseded:
+                # RAG half: promoted claims must reach memory_fts / memory_memfs
+                # before the governed search path can recall them. The claim
+                # enqueue happens inside the write above; draining here converges
+                # them for the next prefetch.
+                drain_memory_projections(store, memfs_root=resolve_memfs_root())
         finally:
             store.close()
 
@@ -666,31 +956,193 @@ class SoulLinkMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        _ensure_paths()
-        from pcltm.memory_adapter import sync_memory_tool_write
-
         metadata = dict(metadata or {})
-        sync_memory_tool_write(
-            target,
-            action,
-            content=content,
-            old_text=metadata.get("old_text"),
-        )
+        if action != "add" or metadata.get("old_text"):
+            raise RuntimeError("canonical memory hook only supports explicit add assertions")
+        result = json.loads(self._memory_tools().call(
+            "soullink_memory_remember", {"target": target, "content": content},
+        ))
+        if not result.get("success"):
+            raise RuntimeError(str(result.get("reason") or result.get("status") or "memory write failed"))
 
     def _memory_tools(self):
         _ensure_paths()
         from pcltm.host_tools import PCLTMMemoryTools
-        from pcltm.memory_adapter import (
-            open_archival_memory,
-            search_archival_memories,
-            sync_memory_tool_write,
+        from pcltm.memory_contracts import PersonaMode, Sensitivity
+        from pcltm.memory_retrieval import (
+            GovernedMemoryOpenRequest,
+            GovernedMemorySearchRequest,
+            MemoryRetrievalStatus,
+            open_governed_memory,
+            search_governed_memories,
         )
-        from pcltm.runtime_paths import resolve_db_path
+        from pcltm.memory_write_service import MemoryWriteRequest, MemoryWriteService
+        from pcltm.projections.memory_runtime import (
+            drain_memory_projections,
+            require_memory_projections_applied,
+        )
+        from pcltm.runtime_paths import resolve_db_path, resolve_memfs_root
         from pcltm.store import EventStore
         from pcltm.transcript_search import search_exact_evidence
 
-        def recall_exact(*, query: str, limit: int):
+        def persona_mode(value: object) -> PersonaMode:
+            try:
+                return PersonaMode(str(value or "default").strip().lower())
+            except ValueError:
+                return PersonaMode.DEFAULT
+
+        def serialize_item(item, *, body_limit: int | None = None):
+            body = item.content
+            truncated = False
+            if body_limit is not None and len(body) > body_limit:
+                body = body[:body_limit].rstrip() + "…"
+                truncated = True
+            return {
+                "memory_id": f"claim/{item.claim_id}",
+                "claim_id": item.claim_id,
+                "claim_version": item.claim_version,
+                "governance_id": item.governance_id,
+                "canonical_key": item.canonical_key,
+                "target": item.target,
+                "memory_type": item.memory_type,
+                "sensitivity": item.sensitivity.value,
+                "mode_scope": [mode.value for mode in item.mode_scope],
+                "injection_policy": item.injection_policy,
+                "content_sha256": item.content_sha256,
+                "authority_verified": item.authority_verified,
+                "policy_reason": item.policy_reason,
+                "policy_version": item.policy_version,
+                "source_refs": [
+                    {
+                        "authority_kind": ref.authority_kind,
+                        "object_id": ref.object_id,
+                        "object_version": ref.object_version,
+                        "payload_sha256": ref.payload_sha256,
+                    }
+                    for ref in item.source_refs
+                ],
+                "excerpt": body if body_limit is None else None,
+                "body": body if body_limit is not None else None,
+                "truncated": truncated if body_limit is not None else None,
+                "reference_only": body_limit is None,
+                "rank": item.rank,
+                "rank_score": item.rank_score,
+                "rank_score_is_authority": item.rank_score_is_authority,
+            }
+
+        def search(*, query: str, mode=None, limit: int = 8, **_kwargs):
+            store = EventStore(resolve_db_path(), read_only=True)
+            try:
+                result = search_governed_memories(
+                    store,
+                    GovernedMemorySearchRequest(
+                        query=query,
+                        persona_mode=persona_mode(mode or self._active_mode),
+                        limit=limit,
+                    ),
+                )
+            finally:
+                store.close()
+            if result.status is MemoryRetrievalStatus.UNAVAILABLE:
+                raise RuntimeError(result.reason or "governed memory search unavailable")
+            return {
+                "status": result.status.value,
+                "reason": result.reason,
+                "results": [serialize_item(item) for item in result.items],
+            }
+
+        def open_memory(*, memory_id: str, body_limit: int = 4000, mode=None):
+            prefix = "claim/"
+            if not memory_id.startswith(prefix):
+                return {
+                    "status": MemoryRetrievalStatus.ABSTAINED.value,
+                    "reason": "invalid_memory_id",
+                    "memory": None,
+                }
+            try:
+                claim_id = int(memory_id[len(prefix):])
+            except ValueError:
+                claim_id = 0
+            if claim_id <= 0:
+                return {
+                    "status": MemoryRetrievalStatus.ABSTAINED.value,
+                    "reason": "invalid_memory_id",
+                    "memory": None,
+                }
+            store = EventStore(resolve_db_path(), read_only=True)
+            try:
+                result = open_governed_memory(
+                    store,
+                    GovernedMemoryOpenRequest(
+                        claim_id=claim_id,
+                        persona_mode=persona_mode(mode or self._active_mode),
+                    ),
+                )
+            finally:
+                store.close()
+            if result.status is MemoryRetrievalStatus.UNAVAILABLE:
+                raise RuntimeError(result.reason or "governed memory open unavailable")
+            return {
+                "status": result.status.value,
+                "reason": result.reason,
+                "memory": (
+                    serialize_item(result.items[0], body_limit=body_limit)
+                    if result.items else None
+                ),
+            }
+
+        def remember(*, target: str, action: str, content: str, **_kwargs):
+            if action != "add":
+                raise RuntimeError("canonical memory tools only accept explicit add assertions")
+            normalized = content.strip()
+            digest = hashlib.sha256(
+                f"{target}\0{normalized}".encode("utf-8")
+            ).hexdigest()
             store = EventStore(resolve_db_path())
+            try:
+                receipt = MemoryWriteService(store).write(MemoryWriteRequest(
+                    idempotency_key=f"memory-tool:{target}:{digest}",
+                    content=normalized,
+                    canonical_key=f"memory-tool:{target}:{digest}",
+                    target=target,
+                    memory_type=("user_preference" if target == "user" else "memory_note"),
+                    sensitivity=Sensitivity.NORMAL,
+                    mode_scope=(persona_mode(self._active_mode),),
+                    injection_policy="allow",
+                    session_id=getattr(self, "_session_id", "") or "memory-tool",
+                    conversation_id=getattr(self, "_session_id", "") or "memory-tool",
+                    platform=getattr(self, "_platform", "") or "hermes",
+                ))
+                if not receipt.success or receipt.claim_id is None:
+                    return {
+                        "success": False,
+                        "status": receipt.status,
+                        "reason": receipt.reason_code,
+                        "target": target,
+                    }
+                drain_memory_projections(store, memfs_root=resolve_memfs_root())
+                projection = require_memory_projections_applied(
+                    store,
+                    memfs_root=resolve_memfs_root(),
+                    claim_id=receipt.claim_id,
+                )
+                return {
+                    "success": True,
+                    "status": receipt.status,
+                    "claim_id": receipt.claim_id,
+                    "claim_version": receipt.claim_version,
+                    "governance_id": receipt.governance_id,
+                    "persisted": receipt.persisted,
+                    "projection_status": projection["projection_status"],
+                    "recall_ready": True,
+                    "reason": receipt.reason_code,
+                    "target": target,
+                }
+            finally:
+                store.close()
+
+        def recall_exact(*, query: str, limit: int):
+            store = EventStore(resolve_db_path(), read_only=True)
             try:
                 return [
                     {
@@ -706,15 +1158,20 @@ class SoulLinkMemoryProvider(MemoryProvider):
                         "source_type": item.source_type,
                         "integrity_scope": item.integrity_scope,
                     }
-                    for item in search_exact_evidence(store, query, limit=limit)
+                    for item in search_exact_evidence(
+                        store,
+                        query,
+                        limit=limit,
+                        persona_mode=persona_mode(self._active_mode),
+                    )
                 ]
             finally:
                 store.close()
 
         return PCLTMMemoryTools(
-            search=lambda **kwargs: search_archival_memories(**kwargs),
-            open_memory=lambda **kwargs: open_archival_memory(**kwargs),
-            remember=lambda **kwargs: sync_memory_tool_write(**kwargs),
+            search=search,
+            open_memory=open_memory,
+            remember=remember,
             recall_exact=recall_exact,
         )
 

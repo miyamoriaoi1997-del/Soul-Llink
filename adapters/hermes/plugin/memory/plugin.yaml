@@ -3,3 +3,7 @@ name: soullink
 version: 2.0.0
 description: SoulLink/PCLTM governed persistent memory provider.
 kind: exclusive
+authority: soullink/pcltm
+blocked_host_tools:
+  - memory
+  - session_search

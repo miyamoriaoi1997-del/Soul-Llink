@@ -10,7 +10,10 @@ if not _ROOT_FILE.is_file():
 _SOULLINK_ROOT = Path(_ROOT_FILE.read_text(encoding="utf-8").strip()).expanduser().resolve()
 if not (_SOULLINK_ROOT / "packages" / "pcltm").is_dir():
     raise RuntimeError(f"SoulLink root is invalid: {_SOULLINK_ROOT}")
-os.environ.setdefault("SOULLINK_ROOT", str(_SOULLINK_ROOT))
+# The compatibility entrypoint is the installation authority for the active
+# repository.  Do not preserve a stale value inherited from an old shell or a
+# removed candidate worktree.
+os.environ["SOULLINK_ROOT"] = str(_SOULLINK_ROOT)
 for _path in (_SOULLINK_ROOT, _SOULLINK_ROOT / "packages", _SOULLINK_ROOT / "adapters"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))

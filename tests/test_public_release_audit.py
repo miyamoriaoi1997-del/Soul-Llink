@@ -1,17 +1,32 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from scripts.public_release_audit import audit
+_AUDIT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "public_release_audit.py"
+_AUDIT_SPEC = importlib.util.spec_from_file_location("soullink_public_release_audit", _AUDIT_PATH)
+assert _AUDIT_SPEC is not None and _AUDIT_SPEC.loader is not None
+_AUDIT_MODULE = importlib.util.module_from_spec(_AUDIT_SPEC)
+_AUDIT_SPEC.loader.exec_module(_AUDIT_MODULE)
+audit = _AUDIT_MODULE.audit
 
 
 def test_public_release_audit_accepts_repository() -> None:
     root = Path(__file__).resolve().parents[1]
     script = root / "scripts" / "public_release_audit.py"
 
+    # The public audit is a release-artifact check. Remove ignored runtime logs
+    # that earlier tests may have generated; the audit still fails on any
+    # tracked or otherwise present release-tree residue.
+    for runtime_logs in (
+        root / "logs",
+        root / "packages" / "persona_engine" / "logs",
+    ):
+        shutil.rmtree(runtime_logs, ignore_errors=True)
     completed = subprocess.run(
         [sys.executable, str(script), "--root", str(root), "--json"],
         text=True,

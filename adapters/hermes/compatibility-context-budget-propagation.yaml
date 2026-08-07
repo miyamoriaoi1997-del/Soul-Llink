@@ -1,0 +1,9 @@
+host: hermes-agent
+adapter_version: "context-budget-config-propagation-v1"
+patch: patches/context-budget-config-propagation-host-adapter.patch
+required_paths:
+  - agent/agent_init.py
+  - tests/run_agent/test_plugin_context_engine_init.py
+created_paths: []
+verify_commands:
+  - ["{python}", -m, pytest, tests/run_agent/test_plugin_context_engine_init.py, -q]

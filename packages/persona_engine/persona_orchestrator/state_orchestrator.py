@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,6 @@ from .mode_classifier import ModeClassifier
 from .observability import OrchestratorLogger
 from .prompt_composer import PromptComposer
 from .semantic_classifier import SemanticModeClassifier
-from .transition_manager import TransitionManager
 from .transition_manager_v2 import TransitionManagerV2
 from .types import ActivePromptResult, MODE_DAILY, MODE_SEX, MODE_WORK, MemorySelection, ModeDecision, StatePacket
 
@@ -35,6 +35,7 @@ class StateOrchestrator:
         log_path: str | Path | None = None,
         enable_active_sex: bool = True,
         enable_semantic_shadow: bool = False,
+        enable_semantic_authority: bool = False,
         semantic_backend: str = "local",
         sentiment_analyzer=None,
         core_source: str = "orchestrator_core",
@@ -46,6 +47,7 @@ class StateOrchestrator:
         self.base_dir = self._resolve_base_dir(Path(base_dir))
         self.enable_active_sex = enable_active_sex
         self.enable_semantic_shadow = enable_semantic_shadow
+        self.enable_semantic_authority = enable_semantic_authority
         self.enable_context_router = enable_context_router
         self.core_source = core_source
 
@@ -56,7 +58,6 @@ class StateOrchestrator:
             if enable_semantic_shadow
             else None
         )
-        # Use v2 TransitionManager with shadow table support
         self.transitions = TransitionManagerV2()
         self.memory_selector = MemorySelector()
         self.composer = PromptComposer(self.base_dir, core_source=core_source)
@@ -171,51 +172,16 @@ class StateOrchestrator:
             memory_notes = self.memory_selector.select(packet.mode, packet.safety_flags).reason
             selected_layers = list(packet.selected_layers)
 
+        # Memory injection is owned exclusively by the SoulLink Hermes memory
+        # provider's governed memory_current path.  The orchestrator only owns
+        # persona/state composition; it must not add a second legacy MemFS or
+        # memory_records view to the same prompt.
         memory_view_text = ""
-        memory_selection = self.memory_selector.select(packet.mode, packet.safety_flags)
-        try:
-            from pcltm.memory_adapter import load_layered_prompt_context
-
-            memory_view = load_layered_prompt_context(
-                mode=packet.mode,
-                query=user_message,
-                budgets=memory_selection.budgets,
-                layers=memory_selection.layers,
-                buckets=memory_selection.buckets,
-                active_layers=memory_selection.active_layer_contract(),
-            )
-            frame = memory_view.active_frame() if hasattr(memory_view, "active_frame") else None
-            if frame is not None:
-                memory_view_text = str(frame.active_text or "").strip()
-                if memory_view_text.startswith("<pcltm_context>") and memory_view_text.endswith("</pcltm_context>"):
-                    memory_view_text = memory_view_text.removeprefix("<pcltm_context>").removesuffix("</pcltm_context>").strip()
-                memory_context_summary = frame.to_dict()
-                if isinstance(getattr(frame, "audit", None), dict):
-                    # Preserve the historical top-level audit shape for
-                    # dashboards/tests while still exposing the full
-                    # ActiveContextFrame under explicit keys.
-                    for key, value in frame.audit.items():
-                        if key in {"active_layers", "selected_layers"}:
-                            memory_context_summary[key] = value
-                        else:
-                            memory_context_summary.setdefault(key, value)
-            else:
-                render_active = getattr(memory_view, "render_active_frame", None)
-                if callable(render_active):
-                    memory_view_text = str(render_active() or "").strip()
-                else:
-                    memory_view_text = str(memory_view.render() or "").strip()
-                memory_context_summary = memory_view.context_summary()
-            memory_context_summary["selection_contract"] = memory_selection.contract_summary()
-            self._component_health["pcltm"] = {"status": "healthy"}
-        except Exception as exc:
-            memory_view_text = ""
-            memory_context_summary = {}
-            self._component_health["pcltm"] = {
-                "status": "degraded",
-                "error_type": type(exc).__name__,
-            }
-            packet.route_metadata["runtime_health"] = self.health_status()
+        memory_context_summary = {}
+        self._component_health["pcltm"] = {
+            "status": "delegated",
+            "authority": "soullink_memory_provider",
+        }
 
         composition = self.composer.compose_active(
             host_system_prompt=host_system_prompt,
@@ -272,17 +238,38 @@ class StateOrchestrator:
             emotion_state=emotion_state,
             platform=platform,
         )
+        self._annotate_contextual_continuation(mode_decision, previous_mode)
 
-        # Layer 3: Semantic shadow (optional)
+        # Layer 3: Semantic observation and optional bounded authority
         semantic_shadow = None
+        semantic_fusion = {
+            "enabled": self.enable_semantic_authority,
+            "authority": "rules",
+            "reason": "disabled" if not self.enable_semantic_authority else "semantic_unavailable",
+        }
         if self.semantic_classifier:
-            semantic_shadow = self.semantic_classifier.classify(
-                user_message=user_message,
-                recent_messages=recent_messages,
-                emotion_state=emotion_state,
-                previous_mode=previous_mode,
-                platform=platform,
-            )
+            try:
+                semantic_shadow = self.semantic_classifier.classify(
+                    user_message=user_message,
+                    recent_messages=recent_messages,
+                    emotion_state=emotion_state,
+                    previous_mode=previous_mode,
+                    platform=platform,
+                )
+                mode_decision, semantic_fusion = self._fuse_semantic_decision(
+                    mode_decision, semantic_shadow
+                )
+            except Exception as exc:
+                semantic_shadow = {
+                    "backend": "semantic-error-fallback",
+                    "shadow_only": not self.enable_semantic_authority,
+                    "reason_codes": [f"SEMANTIC_ERROR:{type(exc).__name__}"],
+                }
+                semantic_fusion = {
+                    "enabled": self.enable_semantic_authority,
+                    "authority": "rules",
+                    "reason": "semantic_error_fallback",
+                }
 
         # Layer 4: Context Router (primary decision authority)
         context_result = self._run_context_router(
@@ -339,6 +326,7 @@ class StateOrchestrator:
             emotion_modifier=emotion_modifier,
             selected_layers=selected_layers,
             extra_safety_flags=extra_safety_flags,
+            semantic_fusion=semantic_fusion,
         )
         # Layer 8: Build packet
         packet = StatePacket(
@@ -518,6 +506,7 @@ class StateOrchestrator:
         emotion_modifier: str,
         selected_layers: list[str],
         extra_safety_flags: list[str],
+        semantic_fusion: dict[str, Any],
     ) -> dict[str, Any]:
         """Return read-only reason-code telemetry for cross-system audits.
 
@@ -568,6 +557,7 @@ class StateOrchestrator:
                 "requested_mode": requested_mode,
                 "active_mode": final_mode,
                 "transition": getattr(transition, "transition", ""),
+                "authority_source": getattr(transition, "authority_source", "legacy"),
                 "confidence": getattr(transition, "confidence", 0.0),
                 "reason": transition_reason,
                 "mode_overridden_by_context": mode_overridden_by_context,
@@ -593,6 +583,7 @@ class StateOrchestrator:
                 "reason": memory.reason,
                 "selected_soul_layers": list(selected_layers),
             },
+            "semantic_fusion": dict(semantic_fusion),
             "reason_codes": [
                 code for code in [
                     "context_router_enabled" if context_result is not None else "legacy_classifier_only",
@@ -606,6 +597,93 @@ class StateOrchestrator:
             ],
         }
 
+    def _fuse_semantic_decision(
+        self,
+        rule_decision: ModeDecision,
+        semantic: dict[str, Any],
+    ) -> tuple[ModeDecision, dict[str, Any]]:
+        """Apply bounded semantic authority while preserving hard boundaries."""
+        audit = {"enabled": self.enable_semantic_authority, "authority": "rules", "reason": "shadow_only"}
+        if not self.enable_semantic_authority:
+            return rule_decision, audit
+        mode = semantic.get("primary_mode")
+        confidence_raw = semantic.get("confidence")
+        if (
+            isinstance(confidence_raw, bool)
+            or not isinstance(confidence_raw, (int, float))
+            or not math.isfinite(confidence_raw)
+        ):
+            audit["reason"] = "invalid_semantic_result"
+            return rule_decision, audit
+        confidence = float(confidence_raw)
+        if mode not in self.ACTIVE_LAYER_MODES or not 0.0 <= confidence <= 1.0:
+            audit["reason"] = "invalid_semantic_result"
+            return rule_decision, audit
+        semantic_signals = semantic.get("intent_signals") or {}
+        if not isinstance(semantic_signals, dict):
+            audit["reason"] = "invalid_semantic_signals"
+            return rule_decision, audit
+        semantic_flags_raw = semantic.get("safety_flags") or []
+        if not isinstance(semantic_flags_raw, (list, tuple, set)):
+            audit["reason"] = "invalid_semantic_safety_flags"
+            return rule_decision, audit
+        semantic_flags = [
+            str(flag).strip() for flag in semantic_flags_raw
+            if isinstance(flag, str) and str(flag).strip()
+        ]
+        merged_flags = list(dict.fromkeys([*(rule_decision.safety_flags or []), *semantic_flags]))
+        if semantic_flags:
+            protected_decision = ModeDecision(
+                mode=rule_decision.mode,
+                submode=rule_decision.submode,
+                confidence=rule_decision.confidence,
+                reason=rule_decision.reason,
+                safety_flags=merged_flags,
+                signals=dict(rule_decision.signals or {}),
+                secondary_modes=list(rule_decision.secondary_modes or []),
+            )
+            audit["reason"] = "hard_rule_preserved"
+            return protected_decision, audit
+        protected = bool(merged_flags) or rule_decision.mode == MODE_SEX
+        explicit_technical = bool(
+            rule_decision.submode in {
+                "technical", "meta_discussion", "financial_trading",
+                "creative", "creative_review",
+            }
+            or semantic_signals.get("technical_context") is True
+        )
+        if protected or (mode != rule_decision.mode and explicit_technical):
+            audit["reason"] = "hard_rule_preserved"
+            return rule_decision, audit
+        if confidence < 0.80:
+            audit["reason"] = "semantic_confidence_below_threshold"
+            return rule_decision, audit
+        signals = dict(rule_decision.signals or {})
+        if semantic_signals.get("explicit_daily_intent") and mode == MODE_DAILY:
+            signals["semantic_explicit_daily_intent"] = True
+            signals.pop("contextual_continuation", None)
+            if semantic_signals.get("technical_context") is False:
+                signals.pop("explicit_task_request", None)
+                signals.pop("explicit_system_request", None)
+        fused = ModeDecision(
+            mode=mode,
+            submode=str(semantic.get("submode") or rule_decision.submode),
+            confidence=confidence,
+            reason="semantic_fusion:" + ",".join(
+                str(item) for item in semantic.get("reason_codes") or ["semantic"]
+            ),
+            safety_flags=list(rule_decision.safety_flags or []),
+            signals=signals,
+            secondary_modes=list(rule_decision.secondary_modes or []),
+        )
+        audit.update({
+            "authority": "semantic",
+            "reason": "bounded_high_confidence",
+            "mode": mode,
+            "confidence": confidence,
+        })
+        return fused, audit
+
     def _update_anti_flap(self, current_mode: str, current_submode: str | None) -> None:
         """Track mode switches for anti-flap logic."""
         if self._last_top_mode is not None and current_mode != self._last_top_mode:
@@ -614,6 +692,31 @@ class StateOrchestrator:
             self._turns_since_last_switch += 1
         self._last_top_mode = current_mode
         self._last_submode = current_submode
+
+    def _annotate_contextual_continuation(
+        self,
+        decision: ModeDecision,
+        previous_mode: str | None,
+    ) -> None:
+        """Attach bounded continuity evidence without giving it mode authority."""
+        if previous_mode != MODE_WORK or decision.mode != MODE_DAILY or decision.submode != "default":
+            return
+
+        signals = decision.signals
+        explicit_continuation = bool(
+            signals.get("contextual_reference") or signals.get("question_intent")
+        )
+        recent_ambiguous_holds = 0
+        for recent in reversed(self._recent_decisions):
+            recent_signals = getattr(recent, "signals", {}) or {}
+            if not recent_signals.get("contextual_continuation"):
+                break
+            recent_ambiguous_holds += 1
+
+        if explicit_continuation or recent_ambiguous_holds < 2:
+            signals["contextual_continuation"] = True
+            return
+        signals["context_continuation_exhausted"] = True
 
 
     def _selected_layers(

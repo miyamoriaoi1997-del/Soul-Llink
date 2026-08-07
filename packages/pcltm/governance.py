@@ -482,7 +482,7 @@ class MemoryGovernanceOrchestrator:
                     kind="write_reflection_draft",
                     target=draft.relative_path,
                     reason="reflection draft should be written only after governance approval",
-                    requires_human_review=draft.target_layer == "system" or True,
+                    requires_human_review=True,
                     metadata={
                         "target_layer": draft.target_layer,
                         "authority": draft.frontmatter.authority,

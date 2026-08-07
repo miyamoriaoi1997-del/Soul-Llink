@@ -5,16 +5,28 @@ from pathlib import Path
 
 import pytest
 
-import pcltm.projections.runtime as projection_runtime
-from pcltm.projections.transcript_chunks import TranscriptChunkProjector
 from pcltm.store import EventStore
+from pcltm.projection_outbox import enqueue_memory_projections, require_event_projection_authority
 
 
-def _apply_chunk_projection(store: EventStore) -> None:
-    result = TranscriptChunkProjector(store, worker_id="test-chunks").run_once(
-        now="2026-07-19T17:00:00Z", lease_until="2026-07-19T17:01:00Z",
-    )
-    assert result == {"claimed": 1, "applied": 1, "failed": 0}
+@pytest.mark.parametrize("authority_id", ["+1", "01", " 1", "１"])
+def test_event_projection_authority_rejects_noncanonical_identity(
+    authority_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="transcript projection authority mismatch"):
+        require_event_projection_authority({
+            "authority_kind": "event",
+            "authority_id": authority_id,
+            "event_seq": 1,
+        })
+
+
+@pytest.mark.parametrize("event_seq", ["+1", "01", " 1", "１"])
+def test_event_projection_authority_rejects_noncanonical_event_seq(event_seq: str) -> None:
+    with pytest.raises(ValueError, match="transcript projection authority mismatch"):
+        require_event_projection_authority({
+            "authority_kind": "event", "authority_id": "1", "event_seq": event_seq,
+        })
 
 
 def test_external_ingest_commits_event_and_projection_jobs_together(tmp_path: Path) -> None:
@@ -73,6 +85,55 @@ def test_direct_append_commits_projection_jobs_in_same_transaction(tmp_path: Pat
         store.close()
 
     assert [row["projection_kind"] for row in jobs] == ["transcript_chunks", "transcript_fts"]
+
+
+def test_duplicate_projection_commitment_is_idempotent_but_drift_is_rejected(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "commitment.db")
+    try:
+        kwargs = {
+            "event_id": 1, "authority_kind": "event", "authority_id": "1",
+            "aggregate_id": "memory:1", "aggregate_version": 1,
+            "payload_sha256": "a" * 64,
+        }
+        enqueue_memory_projections(store._conn, **kwargs)
+        enqueue_memory_projections(store._conn, **kwargs)
+        assert store._conn.execute(
+            "SELECT count(*) FROM projection_outbox WHERE aggregate_id='memory:1'"
+        ).fetchone()[0] == 2
+        with pytest.raises(ValueError, match="projection commitment conflict"):
+            enqueue_memory_projections(store._conn, **{**kwargs, "payload_sha256": "b" * 64})
+        with pytest.raises(ValueError, match="projection commitment conflict"):
+            enqueue_memory_projections(store._conn, **{**kwargs, "authority_id": "2"})
+    finally:
+        store.close()
+
+
+def test_projection_insert_race_reconciles_persisted_commitment(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "race.db")
+
+    class RaceConnection:
+        def __init__(self, connection):
+            self.connection = connection
+            self.injected = False
+
+        def execute(self, sql, parameters=()):
+            if "INSERT INTO projection_outbox" in sql and not self.injected:
+                self.injected = True
+                self.connection.execute(sql, parameters)
+                raise sqlite3.IntegrityError("simulated competing insert")
+            return self.connection.execute(sql, parameters)
+
+    try:
+        enqueue_memory_projections(
+            RaceConnection(store._conn), event_id=1, authority_kind="event",
+            authority_id="1", aggregate_id="memory:race", aggregate_version=1,
+            payload_sha256="a" * 64,
+        )
+        assert store._conn.execute(
+            "SELECT count(*) FROM projection_outbox WHERE aggregate_id='memory:race'"
+        ).fetchone()[0] == 2
+    finally:
+        store.close()
 
 
 def test_failed_ingest_rolls_back_event_and_outbox(tmp_path: Path) -> None:
@@ -150,8 +211,14 @@ def test_claim_ack_and_expired_lease_recovery_are_idempotent(tmp_path: Path) -> 
             now="2026-07-17T03:01:01Z",
             lease_until="2026-07-17T03:02:00Z",
         )
-        store.ack_projection_job(recovered[0]["outbox_id"], worker_id="worker-2", now="2026-07-17T03:01:02Z")
-        store.ack_projection_job(recovered[0]["outbox_id"], worker_id="worker-2", now="2026-07-17T03:01:03Z")
+        store.ack_projection_job(
+            recovered[0]["outbox_id"], worker_id="worker-2",
+            expected_attempt_count=recovered[0]["attempt_count"], now="2026-07-17T03:01:02Z",
+        )
+        store.ack_projection_job(
+            recovered[0]["outbox_id"], worker_id="worker-2",
+            expected_attempt_count=recovered[0]["attempt_count"], now="2026-07-17T03:01:03Z",
+        )
         row = store._conn.execute(
             "SELECT status, applied_at FROM projection_outbox WHERE outbox_id = ?",
             (recovered[0]["outbox_id"],),
@@ -182,6 +249,7 @@ def test_failed_projection_retries_then_moves_to_dead_letter(tmp_path: Path) -> 
         )[0]
         retrying = store.fail_projection_job(
             job["outbox_id"], worker_id="worker-1", error="temporary",
+            expected_attempt_count=job["attempt_count"],
             now="2026-07-17T03:00:10Z", next_retry_at="2026-07-17T03:05:00Z",
             max_attempts=2,
         )
@@ -191,6 +259,7 @@ def test_failed_projection_retries_then_moves_to_dead_letter(tmp_path: Path) -> 
         )[0]
         dead = store.fail_projection_job(
             reclaimed["outbox_id"], worker_id="worker-2", error="permanent",
+            expected_attempt_count=reclaimed["attempt_count"],
             now="2026-07-17T03:05:02Z", next_retry_at="2026-07-17T03:10:00Z",
             max_attempts=2,
         )
@@ -203,146 +272,98 @@ def test_failed_projection_retries_then_moves_to_dead_letter(tmp_path: Path) -> 
     assert dead["last_error"] == "permanent"
 
 
-@pytest.mark.parametrize("damage", ("missing", "stale"))
-def test_fts_worker_rebuilds_missing_or_stale_projection_before_ack(tmp_path: Path, damage: str) -> None:
+def test_ack_rejects_stale_attempt_after_same_worker_id_reclaims_expired_lease(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "pcltm.db")
     try:
-        event_id = store.append_event(
+        store.ingest_external_event(
+            external_id="source:stale-attempt", source_hash="hash", kind="chat_message",
             session_id="s", conversation_id="c", platform="desktop",
-            role="user", source="test", content="authoritative transcript",
+            role="user", source="test", content="projection payload",
             category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
         )
-        if damage == "missing":
-            store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
-        else:
-            store._conn.execute("UPDATE event_fts SET content = ? WHERE rowid = ?", ("stale", event_id))
-        store._conn.commit()
+        first = store.claim_projection_jobs(
+            worker_id="worker-1", projection_kind="transcript_chunks", limit=1,
+            now="2026-07-17T03:00:00Z", lease_until="2026-07-17T03:01:00Z",
+        )[0]
+        reclaimed = store.claim_projection_jobs(
+            worker_id="worker-1", projection_kind="transcript_chunks", limit=1,
+            now="2026-07-17T03:01:01Z", lease_until="2026-07-17T03:02:00Z",
+        )[0]
 
-        projection_runtime.drain_transcript_projections(store, worker_id="fts-repair")
-        indexed = store._conn.execute("SELECT content FROM event_fts WHERE rowid = ?", (event_id,)).fetchone()
-        outbox = store._conn.execute(
-            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
-        ).fetchone()
+        stale_ack = store.ack_projection_job(
+            first["outbox_id"], worker_id="worker-1",
+            expected_attempt_count=first["attempt_count"], now="2026-07-17T03:01:02Z",
+        )
+        current_ack = store.ack_projection_job(
+            reclaimed["outbox_id"], worker_id="worker-1",
+            expected_attempt_count=reclaimed["attempt_count"], now="2026-07-17T03:01:03Z",
+        )
     finally:
         store.close()
 
-    assert indexed["content"] == "authoritative transcript"
-    assert outbox["status"] == "applied"
+    assert reclaimed["attempt_count"] == first["attempt_count"] + 1
+    assert stale_ack is False
+    assert current_ack is True
 
 
-def test_fts_worker_retries_idempotently_after_materialization_before_ack_failure(tmp_path: Path, monkeypatch) -> None:
+def test_fail_rejects_stale_attempt_after_same_worker_id_reclaims_expired_lease(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "pcltm.db")
     try:
-        event_id = store.append_event(
+        store.ingest_external_event(
+            external_id="source:stale-failure", source_hash="hash", kind="chat_message",
             session_id="s", conversation_id="c", platform="desktop",
-            role="user", source="test", content="retry-safe transcript",
+            role="user", source="test", content="projection payload",
             category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
         )
-        store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
-        store._conn.commit()
-        _apply_chunk_projection(store)
-        real_ack = store.ack_projection_job
-        failed = False
+        first = store.claim_projection_jobs(
+            worker_id="worker-1", projection_kind="transcript_chunks", limit=1,
+            now="2026-07-17T03:00:00Z", lease_until="2026-07-17T03:01:00Z",
+        )[0]
+        reclaimed = store.claim_projection_jobs(
+            worker_id="worker-1", projection_kind="transcript_chunks", limit=1,
+            now="2026-07-17T03:01:01Z", lease_until="2026-07-17T03:02:00Z",
+        )[0]
 
-        def fail_once_after_materialization(*args, **kwargs):
-            nonlocal failed
-            if not failed:
-                failed = True
-                raise RuntimeError("ack transport failed")
-            return real_ack(*args, **kwargs)
-
-        monkeypatch.setattr(store, "ack_projection_job", fail_once_after_materialization)
-        with pytest.raises(RuntimeError, match="ack transport failed"):
-            projection_runtime.drain_transcript_projections(store, worker_id="fts-retry")
-        first = store._conn.execute(
-            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
-        ).fetchone()
-        indexed_after_failure = store._conn.execute(
-            "SELECT content FROM event_fts WHERE rowid = ?", (event_id,)
-        ).fetchone()
-        store._conn.execute(
-            "UPDATE projection_outbox SET next_retry_at = NULL WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
-        )
-        store._conn.commit()
-        projection_runtime.drain_transcript_projections(store, worker_id="fts-retry")
-        second = store._conn.execute(
-            "SELECT status FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
-        ).fetchone()
-    finally:
-        store.close()
-
-    assert indexed_after_failure["content"] == "retry-safe transcript"
-    assert first["status"] == "pending"
-    assert second["status"] == "applied"
-
-
-def test_fts_worker_write_failure_leaves_job_unacknowledged(tmp_path: Path, monkeypatch) -> None:
-    store = EventStore(tmp_path / "pcltm.db")
-    try:
-        event_id = store.append_event(
-            session_id="s", conversation_id="c", platform="desktop",
-            role="user", source="test", content="write failure transcript",
-            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
-        )
-        store._conn.execute("DELETE FROM event_fts WHERE rowid = ?", (event_id,))
-        store._conn.commit()
-        _apply_chunk_projection(store)
-        monkeypatch.setattr(projection_runtime, "_materialize_fts", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
-
-        with pytest.raises(RuntimeError, match="transcript FTS projection failed"):
-            projection_runtime.drain_transcript_projections(store, worker_id="fts-write-failure")
-        outbox = store._conn.execute(
-            "SELECT status, last_error FROM projection_outbox WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
-        ).fetchone()
-    finally:
-        store.close()
-
-    assert outbox["status"] == "pending"
-    assert "disk full" in outbox["last_error"]
-
-
-def test_fts_worker_ack_false_after_real_lease_handoff_is_not_reported_applied(
-    tmp_path: Path, monkeypatch
-) -> None:
-    db = tmp_path / "pcltm.db"
-    store = EventStore(db)
-    contender = EventStore(db)
-    try:
-        event_id = store.append_event(
-            session_id="s", conversation_id="c", platform="desktop",
-            role="user", source="test", content="lease handoff transcript",
-            category="raw_conversation", subcategory="user", inject_policy="retrieve_only",
-        )
-        _apply_chunk_projection(store)
-        real_ack = store.ack_projection_job
-
-        def handoff_before_ack(outbox_id: int, *, worker_id: str, now: str) -> bool:
-            claimed = contender.claim_projection_jobs(
-                worker_id="fts-contender",
-                projection_kind="transcript_fts",
-                limit=1,
-                now="2099-01-01T00:00:00Z",
-                lease_until="2099-01-01T00:01:00Z",
+        with pytest.raises(RuntimeError, match="projection job is not owned by this worker attempt"):
+            store.fail_projection_job(
+                first["outbox_id"], worker_id="worker-1",
+                expected_attempt_count=first["attempt_count"], error="stale failure",
+                now="2026-07-17T03:01:02Z", next_retry_at="2026-07-17T03:05:00Z",
             )
-            assert [job["outbox_id"] for job in claimed] == [outbox_id]
-            return real_ack(outbox_id, worker_id=worker_id, now=now)
-
-        monkeypatch.setattr(store, "ack_projection_job", handoff_before_ack)
-        with pytest.raises(RuntimeError, match="acknowledgement ownership lost"):
-            projection_runtime.drain_transcript_projections(store, worker_id="fts-original")
-
-        outbox = contender._conn.execute(
-            "SELECT status, lease_owner FROM projection_outbox "
-            "WHERE event_seq = ? AND projection_kind = 'transcript_fts'",
-            (event_id,),
+        row = store._conn.execute(
+            "SELECT status, lease_owner, attempt_count FROM projection_outbox WHERE outbox_id = ?",
+            (reclaimed["outbox_id"],),
         ).fetchone()
     finally:
         store.close()
-        contender.close()
 
-    assert dict(outbox) == {"status": "processing", "lease_owner": "fts-contender"}
+    assert tuple(row) == ("processing", "worker-1", reclaimed["attempt_count"])
+
+
+def test_failed_projection_rolls_back_when_conditional_update_loses_ownership(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "pcltm.db")
+    try:
+        store.ingest_external_event(
+            external_id="source:atomic-failure", source_hash="hash", kind="chat_message",
+            session_id="s", conversation_id="c", platform="desktop", role="user",
+            source="test", content="projection payload", category="raw_conversation",
+            subcategory="user", inject_policy="retrieve_only",
+        )
+        job = store.claim_projection_jobs(
+            worker_id="worker-1", projection_kind="transcript_chunks", limit=1,
+            now="2026-07-17T03:00:00Z", lease_until="2026-07-17T03:01:00Z",
+        )[0]
+        store._conn.execute(
+            "UPDATE projection_outbox SET lease_owner='worker-2' WHERE outbox_id=?",
+            (job["outbox_id"],),
+        )
+        store._conn.commit()
+        with pytest.raises(RuntimeError, match="projection job is not owned"):
+            store.fail_projection_job(
+                job["outbox_id"], worker_id="worker-1",
+                expected_attempt_count=job["attempt_count"], error="lost lease",
+                now="2026-07-17T03:00:10Z", next_retry_at="2026-07-17T03:05:00Z",
+            )
+        assert store._conn.in_transaction is False
+    finally:
+        store.close()

@@ -1,0 +1,178 @@
+diff --git a/agent/verification_evidence.py b/agent/verification_evidence.py
+index 9849cdd73..640d71e95 100644
+--- a/agent/verification_evidence.py
++++ b/agent/verification_evidence.py
+@@ -8,6 +8,7 @@ blocks completion, and never upgrades targeted checks into "repo green".
+ from __future__ import annotations
+ 
+ import json
++import os
+ import re
+ import shlex
+ import sqlite3
+@@ -128,7 +129,7 @@ def _split_segment_tokens(command: str) -> list[list[str]]:
+         if not segment:
+             continue
+         try:
+-            tokens = shlex.split(segment)
++            tokens = shlex.split(segment, posix=os.name != "nt")
+         except ValueError:
+             continue
+         if tokens:
+@@ -138,6 +139,8 @@ def _split_segment_tokens(command: str) -> list[list[str]]:
+ 
+ def _clean_token(token: str) -> str:
+     token = token.strip()
++    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"\"", "'"}:
++        token = token[1:-1]
+     while token.startswith("./"):
+         token = token[2:]
+     return token
+@@ -162,7 +165,7 @@ def _find_subsequence(tokens: list[str], needle: list[str]) -> Optional[int]:
+ 
+ def _strip_command_prefix(tokens: list[str]) -> list[str]:
+     """Remove harmless command prefixes before matching canonical commands."""
+-    remaining = list(tokens)
++    remaining = [_clean_token(token) for token in tokens]
+     if remaining and remaining[0] == "env":
+         remaining = remaining[1:]
+     while remaining and "=" in remaining[0] and not remaining[0].startswith("-"):
+diff --git a/agent/verification_stop.py b/agent/verification_stop.py
+index 1f68b1aac..5e47a0297 100644
+--- a/agent/verification_stop.py
++++ b/agent/verification_stop.py
+@@ -242,6 +242,40 @@ def _status_detail(status: dict[str, Any]) -> str:
+     return "\n".join(parts)
+ 
+ 
++def _top_level_subsystems(paths: list[str], root: str | None) -> set[str]:
++    """Return changed top-level directories that are inside the project root."""
++    if not root:
++        return set()
++    try:
++        root_path = Path(root).resolve()
++    except Exception:
++        return set()
++    subsystems: set[str] = set()
++    for raw in paths:
++        try:
++            relative = Path(raw).resolve().relative_to(root_path)
++        except (OSError, ValueError):
++            continue
++        if len(relative.parts) > 1:
++            subsystems.add(relative.parts[0])
++    return subsystems
++
++
++def _verification_scope_instruction(paths: list[str], facts: dict[str, Any]) -> str:
++    """Recommend the least costly check justified by the edit's blast radius."""
++    subsystems = _top_level_subsystems(paths, str(facts.get("root") or ""))
++    if len(subsystems) >= 3:
++        return (
++            "This edit crosses multiple top-level subsystems, so broader verification "
++            "is recommended after focused checks pass."
++        )
++    return (
++        "Prefer the smallest focused check that exercises the changed behavior. "
++        "A passing targeted test is sufficient for this gate when it covers the final "
++        "edit. Do not run the full suite solely to satisfy this gate."
++    )
++
++
+ def build_verify_on_stop_nudge(
+     *,
+     session_id: str | None,
+@@ -272,6 +306,8 @@ def build_verify_on_stop_nudge(
+     if state == "passed":
+         return None
+ 
++    scope_instruction = _verification_scope_instruction(paths, facts)
++
+     # Optional shipped coding guidance, only paid when this evidence gate fires.
+     try:
+         from agent.verify_hooks import coding_verify_guidance
+@@ -304,7 +340,7 @@ def build_verify_on_stop_nudge(
+         "fresh passing verification evidence yet.\n\n"
+         f"Verification status: {_status_detail(status)}\n\n"
+         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
+-        f"{command_instruction} If verification is not possible, explain the "
++        f"{scope_instruction}\n\n{command_instruction} If verification is not possible, explain the "
+         "concrete blocker instead of claiming the work is fully verified."
+         f"{addendum}]"
+     )
+diff --git a/tests/agent/test_verification_evidence.py b/tests/agent/test_verification_evidence.py
+index 5f957f54e..d62bc5631 100644
+--- a/tests/agent/test_verification_evidence.py
++++ b/tests/agent/test_verification_evidence.py
+@@ -193,6 +193,27 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
+     assert evidence.status == "passed"
+ 
+ 
++def test_quoted_windows_temp_script_records_ad_hoc_evidence(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
++    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name} with spaces.py"
++    script.write_text("print('ok')\n", encoding="utf-8")
++    try:
++        evidence = classify_verification_command(
++            f'python "{script}"',
++            cwd=tmp_path,
++            session_id="s1",
++            exit_code=0,
++            output="ok",
++        )
++    finally:
++        script.unlink(missing_ok=True)
++
++    assert evidence is not None
++    assert evidence.kind == "ad_hoc"
++    assert evidence.status == "passed"
++
++
+ def test_unprefixed_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+diff --git a/tests/agent/test_verification_stop.py b/tests/agent/test_verification_stop.py
+index 61a8c37fc..b8e9a0eda 100644
+--- a/tests/agent/test_verification_stop.py
++++ b/tests/agent/test_verification_stop.py
+@@ -225,6 +225,39 @@ def test_nudge_after_unverified_edit_with_known_command(tmp_path, monkeypatch):
+     assert "creative UI/visual work" in nudge
+ 
+ 
++def test_nudge_prefers_focused_verification_for_localized_edit(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    _node_project(tmp_path)
++    changed = str(tmp_path / "src" / "app.ts")
++    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
++
++    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
++
++    assert nudge is not None
++    assert "Prefer the smallest focused check" in nudge
++    assert "A passing targeted test is sufficient" in nudge
++    assert "Do not run the full suite solely to satisfy this gate" in nudge
++
++
++def test_nudge_recommends_broader_verification_for_cross_subsystem_edit(
++    tmp_path, monkeypatch
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    _node_project(tmp_path)
++    changed = [
++        str(tmp_path / "agent" / "runtime.py"),
++        str(tmp_path / "gateway" / "server.py"),
++        str(tmp_path / "tools" / "registry.py"),
++    ]
++    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=changed)
++
++    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=changed)
++
++    assert nudge is not None
++    assert "broader verification is recommended" in nudge
++    assert "crosses multiple top-level subsystems" in nudge
++
++
+ def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+     _node_project(tmp_path)

@@ -11,7 +11,8 @@ from pcltm.transcript_search import search_exact_evidence
 
 
 def _create_hermes_db(path: Path) -> None:
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path)
+    try:
         conn.executescript(
             """
             CREATE TABLE sessions (
@@ -38,11 +39,14 @@ def _create_hermes_db(path: Path) -> None:
         rows = [
             (1, "s1", "system", "secret system prompt", None, None, None, 101.0, 3, None, "hidden", "hidden", "hidden", "hidden", "hidden", None, 1, 1, 0),
             (2, "s1", "developer", "secret developer prompt", None, None, None, 102.0, 3, None, "hidden", "hidden", "hidden", "hidden", "hidden", None, 1, 1, 0),
-            (3, "s1", "user", "用户的原始问题", None, None, None, 103.0, 5, None, "never persist reasoning", "never persist reasoning", None, None, None, "platform-3", 1, 1, 0),
+            (3, "s1", "user", "老师的原始问题", None, None, None, 103.0, 5, None, "never persist reasoning", "never persist reasoning", None, None, None, "platform-3", 1, 1, 0),
             (4, "s1", "assistant", "可见回答", None, json.dumps([{"id": "call-1", "function": {"name": "read_file"}}]), None, 104.0, 6, "tool_calls", "private chain", None, None, None, None, None, 1, 1, 0),
             (5, "s1", "tool", "工具完整结果", "call-1", None, "read_file", 105.0, 7, None, None, None, None, None, None, None, 1, 0, 1),
         ]
         conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_ingests_visible_tools_prompt_hashes_and_session_lifecycle(tmp_path: Path) -> None:
@@ -61,7 +65,7 @@ def test_ingests_visible_tools_prompt_hashes_and_session_lifecycle(tmp_path: Pat
                 "SELECT status, COUNT(*) AS count FROM projection_outbox GROUP BY status"
             )
         }
-        exact = search_exact_evidence(store, "用户的原始问题", limit=1)
+        exact = search_exact_evidence(store, "老师的原始问题", limit=1)
     finally:
         store.close()
 
@@ -70,7 +74,7 @@ def test_ingests_visible_tools_prompt_hashes_and_session_lifecycle(tmp_path: Pat
     assert projection_statuses == {"applied": 12}
     assert len(exact) == 1 and exact[0].verified is True
     by_role = {event["role"]: event for event in events}
-    assert by_role["user"]["content"] == "用户的原始问题"
+    assert by_role["user"]["content"] == "老师的原始问题"
     assert by_role["assistant"]["content"] == "可见回答"
     assert by_role["tool"]["content"] == "工具完整结果"
     assert "secret system prompt" not in by_role["system"]["content"]
@@ -121,16 +125,16 @@ def test_raw_history_is_searchable_but_not_approved_prompt_memory(tmp_path: Path
     store = EventStore(pcltm_db)
     try:
         HermesHistoryIngestor(store, hermes_db).ingest()
-        hits = store.search_events("用户的原始问题", limit=10)
+        hits = store.search_events("老师的原始问题", limit=10)
     finally:
         store.close()
 
     monkeypatch.setenv("HERMES_PCLTM_DB", str(pcltm_db))
     monkeypatch.setattr(memory_adapter, "_load_system_core_entries", lambda **kwargs: [])
     monkeypatch.setattr(memory_adapter, "enabled", lambda: True)
-    rendered = memory_adapter.load_prompt_context(mode="work", query="用户的原始问题")
+    rendered = memory_adapter.load_prompt_context(mode="work", query="老师的原始问题")
 
-    assert any(hit["snippet"] == "用户的原始问题" for hit in hits)
+    assert any(hit["snippet"] == "老师的原始问题" for hit in hits)
     assert rendered == ""
 
 
@@ -145,7 +149,7 @@ def test_reingest_appends_revisions_without_overwriting_prior_events(tmp_path: P
         original_message = store.find_ingest_event("hermes-message:3")
         with sqlite3.connect(hermes_db) as conn:
             conn.execute("UPDATE sessions SET ended_at=300, end_reason='compression', rewind_count=2 WHERE id='s1'")
-            conn.execute("UPDATE messages SET content='修正后的用户问题', active=0, compacted=1 WHERE id=3")
+            conn.execute("UPDATE messages SET content='修正后的原始问题', active=0, compacted=1 WHERE id=3")
         report = HermesHistoryIngestor(store, hermes_db).ingest()
         lifecycle = store.find_ingest_event("hermes-session:s1")
         message = store.find_ingest_event("hermes-message:3")
@@ -166,5 +170,26 @@ def test_reingest_appends_revisions_without_overwriting_prior_events(tmp_path: P
     assert message["payload_metadata"]["active"] is False
     assert message["payload_metadata"]["compacted"] is True
     assert counts["events"] == counts["event_fts"] == 8
-    assert any(event["event_id"] == original_message["event_id"] and event["content"] == "用户的原始问题" for event in all_events)
-    assert any(event["event_id"] == message["event_id"] and event["content"] == "修正后的用户问题" for event in all_events)
+    assert any(event["event_id"] == original_message["event_id"] and event["content"] == "老师的原始问题" for event in all_events)
+    assert any(event["event_id"] == message["event_id"] and event["content"] == "修正后的原始问题" for event in all_events)
+
+
+def test_ingest_releases_hermes_db_file_handle(tmp_path: Path) -> None:
+    """Windows regression gate: ingest() must close the read-only hermes DB connection.
+
+    `with sqlite3.connect(...) as conn` only commits/rolls back — it does NOT close
+    the connection. On Windows the held handle makes tempdir cleanup fail with
+    PermissionError. The connection must be closed explicitly in finally.
+    """
+    hermes_db = tmp_path / "state.db"
+    pcltm_db = tmp_path / "pcltm.db"
+    _create_hermes_db(hermes_db)
+    store = EventStore(pcltm_db)
+    try:
+        HermesHistoryIngestor(store, hermes_db).ingest()
+    finally:
+        store.close()
+    # If the read-only connection is still open, unlinking fails on Windows
+    # (and on POSIX the lock is advisory, so this is a Windows-specific gate).
+    hermes_db.unlink()
+    assert not hermes_db.exists()

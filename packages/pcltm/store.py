@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import sqlite3
-import json
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|API[_-]?KEY|PASSWORD|PASS)[A-Z0-9_]*)\s*=\s*[^\s,;]+"
 )
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 class EventStore:
@@ -158,6 +159,26 @@ class EventStore:
                 decision_reason TEXT,
                 patch_suggestion TEXT,
                 metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_promotion_receipts (
+                candidate_id TEXT PRIMARY KEY CHECK (length(candidate_id) > 0),
+                request_sha256 TEXT NOT NULL CHECK (
+                    length(request_sha256) = 64
+                    AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                claim_id INTEGER,
+                claim_version INTEGER,
+                target_file TEXT NOT NULL,
+                reviewer TEXT,
+                decision_reason TEXT,
+                reviewed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             )
             """
@@ -360,57 +381,153 @@ class EventStore:
             self._conn.rollback()
             raise
 
-    def ack_projection_job(self, outbox_id: int, *, worker_id: str, now: str) -> bool:
-        """Idempotently mark a worker-owned projection job applied."""
+    def ack_projection_job(
+        self,
+        outbox_id: int,
+        *,
+        worker_id: str,
+        expected_attempt_count: int,
+        now: str,
+    ) -> bool:
+        """Idempotently ACK only the exact claimed lease attempt.
+
+        ``worker_id`` alone is not an ownership token: a restarted worker may
+        reuse the same identifier after an expired lease has been reclaimed.
+        The monotonically increasing attempt count closes that stale-owner race.
+        """
         cur = self._conn.execute(
             """
             UPDATE projection_outbox
             SET status = 'applied', applied_at = COALESCE(applied_at, ?),
                 lease_owner = NULL, lease_until = NULL, last_error = NULL
             WHERE outbox_id = ?
+              AND attempt_count = ?
               AND ((status = 'processing' AND lease_owner = ?) OR status = 'applied')
             """,
-            (now, int(outbox_id), worker_id),
+            (now, int(outbox_id), int(expected_attempt_count), worker_id),
         )
         self._conn.commit()
         return bool(cur.rowcount)
+
+    def ack_memory_memfs_projection_job(
+        self,
+        outbox_id: int,
+        *,
+        claim_id: int,
+        worker_id: str,
+        expected_attempt_count: int,
+        now: str,
+    ) -> bool:
+        """Atomically ACK one MemFS attempt and release its authority guard."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            guard = self._conn.execute(
+                """
+                SELECT 1 FROM memory_projection_guards
+                WHERE claim_id = ? AND outbox_id = ?
+                  AND attempt_count = ? AND worker_id = ?
+                """,
+                (
+                    int(claim_id), int(outbox_id),
+                    int(expected_attempt_count), worker_id,
+                ),
+            ).fetchone()
+            if guard is None:
+                self._conn.rollback()
+                return False
+            cur = self._conn.execute(
+                """
+                UPDATE projection_outbox
+                SET status = 'applied', applied_at = COALESCE(applied_at, ?),
+                    lease_owner = NULL, lease_until = NULL, last_error = NULL
+                WHERE outbox_id = ? AND attempt_count = ?
+                  AND status = 'processing' AND lease_owner = ?
+                  AND projection_kind = 'memory_memfs'
+                """,
+                (now, int(outbox_id), int(expected_attempt_count), worker_id),
+            )
+            if not cur.rowcount:
+                self._conn.rollback()
+                return False
+            self._conn.execute(
+                """
+                DELETE FROM memory_projection_guards
+                WHERE claim_id = ? AND outbox_id = ?
+                  AND attempt_count = ? AND worker_id = ?
+                """,
+                (
+                    int(claim_id), int(outbox_id),
+                    int(expected_attempt_count), worker_id,
+                ),
+            )
+            self._conn.commit()
+            return True
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     def fail_projection_job(
         self,
         outbox_id: int,
         *,
         worker_id: str,
+        expected_attempt_count: int,
         error: str,
         now: str,
         next_retry_at: str,
         max_attempts: int = 5,
     ) -> dict[str, Any]:
-        """Release a failed job for retry or move it to dead-letter."""
-        row = self._conn.execute(
-            "SELECT * FROM projection_outbox WHERE outbox_id = ?",
-            (int(outbox_id),),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"projection job not found: {outbox_id}")
-        if row["status"] != "processing" or row["lease_owner"] != worker_id:
-            raise RuntimeError("projection job is not owned by this worker")
-        status = "dead_letter" if int(row["attempt_count"]) >= max(1, int(max_attempts)) else "pending"
+        """Conditionally release an exact failed lease attempt or dead-letter it."""
+        del now
+        status = "dead_letter" if int(expected_attempt_count) >= max(1, int(max_attempts)) else "pending"
         retry_at = None if status == "dead_letter" else next_retry_at
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             UPDATE projection_outbox
             SET status = ?, next_retry_at = ?, last_error = ?,
                 lease_owner = NULL, lease_until = NULL
             WHERE outbox_id = ? AND status = 'processing' AND lease_owner = ?
+              AND attempt_count = ?
             """,
-            (status, retry_at, error, int(outbox_id), worker_id),
+            (status, retry_at, error, int(outbox_id), worker_id, int(expected_attempt_count)),
         )
+        if cur.rowcount != 1:
+            self._conn.rollback()
+            exists = self._conn.execute(
+                "SELECT 1 FROM projection_outbox WHERE outbox_id = ?",
+                (int(outbox_id),),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"projection job not found: {outbox_id}")
+            raise RuntimeError("projection job is not owned by this worker attempt")
         self._conn.commit()
         updated = self._conn.execute(
             "SELECT * FROM projection_outbox WHERE outbox_id = ?",
             (int(outbox_id),),
         ).fetchone()
         return dict(updated)
+
+    def obsolete_projection_job(
+        self,
+        outbox_id: int,
+        *,
+        worker_id: str,
+        expected_attempt_count: int,
+        reason: str = "stale_projection",
+    ) -> bool:
+        """Finalize an exact stale lease attempt without reporting it applied."""
+        cur = self._conn.execute(
+            """
+            UPDATE projection_outbox
+            SET status = 'obsolete', last_error = ?, lease_owner = NULL,
+                lease_until = NULL, next_retry_at = NULL
+            WHERE outbox_id = ? AND status = 'processing'
+              AND lease_owner = ? AND attempt_count = ?
+            """,
+            (reason, int(outbox_id), worker_id, int(expected_attempt_count)),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
 
     def verify_event_chain(self) -> dict[str, Any]:
         """Verify payload hashes and the linked event chain in event order."""
@@ -625,6 +742,7 @@ class EventStore:
         turn_id: str | None = None,
         parent_event_id: int | None = None,
         source_hash: str | None = None,
+        materialize_fts: bool = True,
     ) -> int:
         """Insert one durable event and its FTS row without committing."""
         classification = EventClassifier().classify(
@@ -634,6 +752,17 @@ class EventStore:
             persona_mode=persona_mode,
             sensitivity=sensitivity,
         )
+        if classification_confidence is not None:
+            if (
+                isinstance(classification_confidence, bool)
+                or type(classification_confidence) not in {int, float}
+            ):
+                raise TypeError("classification_confidence must be a real number")
+            if (
+                not math.isfinite(float(classification_confidence))
+                or not 0.0 <= float(classification_confidence) <= 1.0
+            ):
+                raise ValueError("classification_confidence must be finite and between 0 and 1")
         resolved_sensitivity = classification.sensitivity if sensitivity == "normal" else sensitivity
         cur = self._conn.execute(
             """
@@ -711,7 +840,8 @@ class EventStore:
                 event_id,
             ),
         )
-        self._conn.execute("INSERT INTO event_fts(rowid, content) VALUES (?, ?)", (event_id, content))
+        if materialize_fts:
+            self._conn.execute("INSERT INTO event_fts(rowid, content) VALUES (?, ?)", (event_id, content))
         anchor = self._conn.execute(
             "SELECT first_event_id, event_count FROM event_chain_state WHERE chain_name = 'events-v1'"
         ).fetchone()
@@ -813,6 +943,58 @@ class EventStore:
         except BaseException:
             self._conn.rollback()
             raise
+
+    def ingest_external_event_in_transaction(
+        self,
+        *,
+        external_id: str,
+        source_hash: str,
+        kind: str,
+        attachments: list[dict[str, Any]] | None = None,
+        payload_metadata: dict[str, Any] | None = None,
+        **event: Any,
+    ) -> int:
+        """Insert one external event without taking transaction ownership."""
+        existing = self._conn.execute(
+            "SELECT event_id FROM ingest_events WHERE external_id = ?", (external_id,)
+        ).fetchone()
+        if existing is not None:
+            return int(existing["event_id"])
+        event_id = self._insert_event_row(
+            **event,
+            external_event_id=external_id,
+            source_created_at=normalize_source_created_at(
+                (payload_metadata or {}).get("timestamp") or (payload_metadata or {}).get("created_at")
+            ),
+            source_hash=source_hash,
+            materialize_fts=False,
+        )
+        self._conn.execute(
+            """
+            INSERT INTO event_revisions (
+                event_id, source_revision, source_hash, content_sha256, payload_metadata
+            ) VALUES (?, 1, ?, ?, ?)
+            """,
+            (event_id, source_hash, sha256_text(str(event["content"])), json.dumps(payload_metadata or {}, ensure_ascii=False)),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO ingest_events (external_id, source_hash, kind, event_id, attachments, payload_metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (external_id, source_hash, kind, event_id, json.dumps(attachments or [], ensure_ascii=False),
+             json.dumps(payload_metadata or {}, ensure_ascii=False)),
+        )
+        event_row = self._conn.execute(
+            "SELECT payload_sha256, source_revision FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        enqueue_event_projections(
+            self._conn,
+            event_id=event_id,
+            aggregate_version=int(event_row["source_revision"]),
+            payload_sha256=str(event_row["payload_sha256"]),
+        )
+        return event_id
 
     def upsert_external_event(self, *, external_id: str, source_hash: str, kind: str, attachments: list[dict[str, Any]] | None = None, payload_metadata: dict[str, Any] | None = None, **event: Any) -> tuple[int, str]:
         """Atomically append a new immutable revision for changed source data."""
@@ -1095,7 +1277,9 @@ class EventStore:
                 """,
                 params,
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts_capability_error(exc, "event_fts"):
+                raise
             return self._search_events_like(
                 query,
                 session_id=session_id,
@@ -1182,7 +1366,9 @@ class EventStore:
                 """,
                 params,
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts_capability_error(exc, "summary_fts"):
+                raise
             return self._search_summaries_like(query, limit=limit, include_sensitive=include_sensitive)
         return [dict(row) for row in rows]
 
@@ -1209,6 +1395,12 @@ class EventStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    @staticmethod
+    def _is_fts_capability_error(exc: sqlite3.OperationalError, table: str) -> bool:
+        del table
+        message = str(exc).lower()
+        return "no such module: fts5" in message or "fts5 is not available" in message
+
     def list_events(
         self,
         *,
@@ -1218,6 +1410,7 @@ class EventStore:
         persona_mode: str | None = None,
         source: str | None = None,
         limit: int = 100,
+        order: str = "asc",
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -1233,8 +1426,9 @@ class EventStore:
                 params.append(value)
         params.append(max(1, min(int(limit), 500)))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
         rows = self._conn.execute(
-            f"SELECT * FROM events {where} ORDER BY event_id ASC LIMIT ?",
+            f"SELECT * FROM events {where} ORDER BY event_id {order_sql} LIMIT ?",
             params,
         ).fetchall()
         return [dict(row) for row in rows]
@@ -1333,12 +1527,29 @@ class EventStore:
         ).fetchone()
         if cur is not None:
             return int(cur["record_id"])
+        source_refs = candidate.get("source_refs") or ()
+        metadata = {
+            "canonical_key": candidate.get("canonical_key"),
+            "identity_action": candidate.get("identity_action"),
+            "mode": candidate.get("mode"),
+            "requires_human_confirmation": candidate.get("requires_human_confirmation") is True,
+            "semantic_key": candidate.get("semantic_key"),
+            "source_refs": [
+                {
+                    "authority_kind": ref.authority_kind,
+                    "object_id": ref.object_id,
+                    "object_version": ref.object_version,
+                    "payload_sha256": ref.payload_sha256,
+                }
+                for ref in source_refs
+            ],
+        }
         insert = self._conn.execute(
             """
             INSERT INTO memory_records (
                 candidate_id, kind, target_file, content, confidence, sensitivity,
-                source_event_ids, source_node_ids, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                source_event_ids, source_node_ids, status, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (
                 candidate["candidate_id"],
@@ -1349,6 +1560,7 @@ class EventStore:
                 candidate["sensitivity"],
                 json.dumps(candidate["source_event_ids"]),
                 json.dumps(candidate["source_node_ids"]),
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
             ),
         )
         self._conn.commit()
@@ -1380,19 +1592,59 @@ class EventStore:
         row = self._conn.execute("SELECT * FROM memory_records WHERE record_id = ?", (record_id,)).fetchone()
         if row is None:
             raise KeyError(f"memory record not found: {record_id}")
+        if decision == "approved":
+            from .candidate_promotion import CandidatePromotionService
+            from .candidates import PersonaCandidateExtractor
+            from .memory_contracts import AuthorityRef
+
+            record = self._memory_record_from_row(row)
+            metadata = record["metadata"]
+            raw_refs = metadata.get("source_refs")
+            if not isinstance(raw_refs, list) or len(raw_refs) != 1:
+                raise RuntimeError("candidate has no reopenable event provenance")
+            try:
+                source_refs = tuple(AuthorityRef(**ref) for ref in raw_refs)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("candidate has no reopenable event provenance") from exc
+            source_ref = source_refs[0]
+            if source_ref.authority_kind != "event":
+                raise RuntimeError("candidate has no reopenable event provenance")
+            source_event = self.get_event(int(source_ref.object_id))
+            authoritative = PersonaCandidateExtractor(self).extract(
+                scope={"session_id": source_event["session_id"]}, limit=500,
+            )
+            candidate = next(
+                (item for item in authoritative if item["candidate_id"] == record["candidate_id"]),
+                None,
+            )
+            if candidate is None:
+                raise RuntimeError("candidate has no reopenable event provenance")
+            if (
+                candidate["content"] != record["content"]
+                or candidate["target_file"] != record["target_file"]
+                or candidate["kind"] != record["kind"]
+            ):
+                raise RuntimeError("candidate queue commitment mismatch")
+            outcome = CandidatePromotionService(self).approve_pending(
+                candidate, reviewer=reviewer, decision_reason=decision_reason,
+            )
+            if outcome.decision not in {"activated", "duplicate", "superseded"}:
+                raise RuntimeError(f"governed promotion failed: {outcome.reason}")
+            self._conn.execute(
+                """UPDATE memory_records SET status='promoted', reviewer=?,
+                       reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       decision_reason=?, patch_suggestion=NULL
+                   WHERE record_id=? AND status='pending'""",
+                (reviewer, decision_reason, record_id),
+            )
+            self._conn.commit()
+            updated = self._conn.execute(
+                "SELECT * FROM memory_records WHERE record_id=?", (record_id,),
+            ).fetchone()
+            return self._memory_record_from_row(updated)
         patch_suggestion = None
         content_update_sql = ""
         content_update_params: tuple[Any, ...] = ()
-        if decision == "approved":
-            policy = evaluate_memory_write(str(row["content"] or ""), target_file=str(row["target_file"] or ""))
-            if policy.action == "reject":
-                decision = "rejected"
-                decision_reason = decision_reason or policy.reason
-            else:
-                safe_content = redact_secrets(policy.sanitized_content or str(row["content"] or ""))
-                patch_suggestion = f"Append to {row['target_file']}:\n{safe_content}"
-                content_update_sql = ", content = ?, sensitivity = ?"
-                content_update_params = (safe_content, policy.sensitivity)
         self._conn.execute(
             f"""
             UPDATE memory_records

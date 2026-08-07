@@ -1,8 +1,6 @@
 import json
 from unittest.mock import patch
 
-import pytest
-
 from persona_engine.emotion_state_manager import EmotionStateManager
 from persona_engine.persona_orchestrator.state_orchestrator import StateOrchestrator
 
@@ -71,32 +69,7 @@ def test_high_score_sex_message_selects_sex_layer_by_default(tmp_path):
     assert 'decision_audit' in packet.route_metadata
     assert not hasattr(packet, 'model_override')
     assert not hasattr(packet, 'selected_model')
-    assert 'hermes_selected_model' not in packet.route_metadata
-
-
-def test_state_machine_never_emits_concrete_model_names(tmp_path):
-    packet = StateOrchestrator(
-        '.',
-        log_path=tmp_path / 'o.jsonl',
-    ).analyze_turn(
-        user_message='帮我检查 gateway 日志',
-        emotion_state={'emotion_score': 1.0},
-    )
-
-    assert packet.mode == 'work'
-    assert not hasattr(packet, 'model_override')
-    assert not hasattr(packet, 'selected_model')
-    assert 'hermes_selected_model' not in packet.route_metadata
     assert all('model' not in key for key in packet.route_metadata)
-
-
-def test_state_machine_rejects_model_routing_configuration(tmp_path):
-    with pytest.raises(TypeError, match='model_router_config_path'):
-        StateOrchestrator(
-            '.',
-            log_path=tmp_path / 'o.jsonl',
-            model_router_config_path=tmp_path / 'model-router.yaml',
-        )
 
 
 def test_emotion_state_manager_exposes_emotion_score_and_current_emotion():
@@ -208,7 +181,30 @@ def test_host_core_orchestrator_uses_host_identity_without_core_layer(tmp_path):
     assert result.prompt_text.rstrip().endswith('<emotion_modifier>fresh</emotion_modifier>')
 
 
-def test_active_prompt_marks_pcltm_load_failure_as_degraded(tmp_path):
+def test_state_machine_never_emits_concrete_model_names(tmp_path):
+    packet = StateOrchestrator('.', log_path=tmp_path / 'o.jsonl').analyze_turn(
+        user_message='帮我检查 gateway 日志',
+        emotion_state={'emotion_score': 1.0},
+    )
+
+    assert packet.mode == 'work'
+    assert not hasattr(packet, 'model_override')
+    assert not hasattr(packet, 'selected_model')
+    assert all('model' not in key for key in packet.route_metadata)
+
+
+def test_state_machine_rejects_model_routing_configuration(tmp_path):
+    import pytest
+
+    with pytest.raises(TypeError, match='model_router_config_path'):
+        StateOrchestrator(
+            '.',
+            log_path=tmp_path / 'o.jsonl',
+            model_router_config_path=tmp_path / 'model-router.yaml',
+        )
+
+
+def test_active_prompt_does_not_call_retired_pcltm_adapter(tmp_path):
     orchestrator = StateOrchestrator('.', log_path=tmp_path / 'o.jsonl', core_source='host_core')
 
     with patch(
@@ -222,11 +218,13 @@ def test_active_prompt_marks_pcltm_load_failure_as_degraded(tmp_path):
         )
 
     health = result.packet.route_metadata['runtime_health']
-    assert health['status'] == 'degraded'
-    assert health['components']['pcltm']['status'] == 'degraded'
-    assert health['components']['pcltm']['error_type'] == 'RuntimeError'
+    assert health['status'] == 'healthy'
+    assert health['components']['pcltm'] == {
+        'status': 'delegated',
+        'authority': 'soullink_memory_provider',
+    }
     assert 'database unavailable' not in result.prompt_text
-    assert 'pcltm_degraded' in result.warnings
+    assert 'pcltm_degraded' not in result.warnings
 
 
 def test_orchestrator_health_includes_logger_failures(tmp_path):

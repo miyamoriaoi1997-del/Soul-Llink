@@ -445,6 +445,7 @@ class SoulLink:
             "log_path",
             "enable_active_sex",
             "enable_semantic_shadow",
+            "enable_semantic_authority",
             "semantic_backend",
             "sentiment_analyzer",
             "core_source",

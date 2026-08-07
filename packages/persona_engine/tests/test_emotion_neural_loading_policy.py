@@ -383,6 +383,7 @@ def test_sentiment_model_load_pins_configured_revision(monkeypatch, emotion_modu
         "transformers",
         types.SimpleNamespace(
             AutoTokenizer=FakeLoader,
+            PreTrainedTokenizerFast=FakeLoader,
             AutoModelForSequenceClassification=FakeLoader,
         ),
     )
@@ -394,3 +395,52 @@ def test_sentiment_model_load_pins_configured_revision(monkeypatch, emotion_modu
     assert analyzer._try_load() is True
     assert len(calls) == 2
     assert all(call[1]["revision"] == "51d5d73525c1d5f3e599e4b94a4cd6e69e2c9d6a" for call in calls)
+
+
+def test_multilingual_model_uses_tokenizer_json_without_sentencepiece(monkeypatch, emotion_modules):
+    """The multilingual checkpoint has tokenizer.json and must avoid the SWIG backend."""
+    sentiment_analyzer, _emotion_detector, _emotion_state_manager = emotion_modules
+    tokenizer_calls = []
+
+    class FakeLoadedModel:
+        config = types.SimpleNamespace(id2label={}, problem_type="multi_label_classification")
+
+        def eval(self):
+            return self
+
+    class SlowAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            raise AssertionError("AutoTokenizer would import the SentencePiece SWIG extension")
+
+    class FastTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            tokenizer_calls.append((model_id, kwargs))
+            return object()
+
+    class FakeModelLoader:
+        @classmethod
+        def from_pretrained(cls, _model_id, **_kwargs):
+            return FakeLoadedModel()
+
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(
+            AutoTokenizer=SlowAutoTokenizer,
+            PreTrainedTokenizerFast=FastTokenizer,
+            AutoModelForSequenceClassification=FakeModelLoader,
+        ),
+    )
+    analyzer = sentiment_analyzer.SentimentAnalyzer(
+        model_id=sentiment_analyzer.MULTILINGUAL_MODEL_ID,
+        model_revision="51d5d73525c1d5f3e599e4b94a4cd6e69e2c9d6a",
+    )
+
+    assert analyzer._try_load() is True
+    assert tokenizer_calls == [(
+        sentiment_analyzer.MULTILINGUAL_MODEL_ID,
+        {"revision": "51d5d73525c1d5f3e599e4b94a4cd6e69e2c9d6a"},
+    )]

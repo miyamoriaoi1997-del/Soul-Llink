@@ -39,9 +39,6 @@ from .memory_adapter import (
     db_path,
     enabled,
     last_live_context_telemetry,
-    load_entries,
-    load_prompt_context,
-    sync_memory_tool_write,
 )
 from .memory_feedback import (
     MemoryFeedbackSignal,
@@ -89,10 +86,7 @@ __all__ = [
     "govern_prompt_context",
     "db_path",
     "enabled",
-    "load_entries",
-    "load_prompt_context",
     "last_live_context_telemetry",
-    "sync_memory_tool_write",
     "MemoryFeedbackSignal",
     "MemoryUsageFeedbackRecorder",
     "MemoryUsageFeedbackReport",

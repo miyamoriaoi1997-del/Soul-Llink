@@ -15,7 +15,9 @@ from .hermes_history import HermesHistoryIngestor
 from .live_context_evidence import build_tool_evidence_capsules
 from .live_context_governor import ContextBudgetPolicy, govern_prompt_context
 from .memfs_store import MEMFS_DIRECTORIES, MemFSStore
-from .memory_adapter import last_live_context_telemetry, load_prompt_context
+from .memory_contracts import PersonaMode
+from .memory_retrieval import GovernedMemorySearchRequest, MemoryRetrievalStatus, search_governed_memories
+from .injection.governed_memory import GovernedInjectionStatus, build_governed_memory_context
 from .runtime_paths import DEFAULT_DB, DEFAULT_MEMFS_ROOT, resolve_db_path, resolve_memfs_root
 from .store import EventStore
 
@@ -113,13 +115,17 @@ def doctor_runtime(
     }
 
 
-def _runtime_observability() -> dict[str, Any]:
+def _runtime_observability(
+    *,
+    db_path: str | Path | None = None,
+    memfs_root: str | Path | None = None,
+) -> dict[str, Any]:
     """Return authoritative runtime paths and schema for CLI health reports."""
-    resolved_db = resolve_db_path()
-    resolved_memfs = resolve_memfs_root()
+    resolved_db = resolve_db_path(db_path)
+    resolved_memfs = resolve_memfs_root(memfs_root)
     schema_version = None
     if resolved_db.exists():
-        store = EventStore(resolved_db)
+        store = EventStore(resolved_db, read_only=True)
         try:
             schema_version = store.schema_version()
         finally:
@@ -138,16 +144,49 @@ def live_context_smoke(
     memory_limit: int = 2200,
     user_limit: int = 1375,
 ) -> dict[str, Any]:
-    """Run a read-only smoke check for governed prompt-time PCLTM context."""
-    rendered = load_prompt_context(mode=mode, query=query, memory_limit=memory_limit, user_limit=user_limit)
-    telemetry = last_live_context_telemetry()
-    open_count = rendered.count("<pcltm_context>")
-    close_count = rendered.count("</pcltm_context>")
+    """Run the canonical governed recall → injection path without legacy fallback."""
+    del user_limit
+    try:
+        persona_mode = PersonaMode(str(mode or "default").strip().lower())
+    except ValueError:
+        persona_mode = PersonaMode.DEFAULT
+    store = EventStore(resolve_db_path(), read_only=True)
+    try:
+        retrieval = search_governed_memories(
+            store,
+            GovernedMemorySearchRequest(
+                query=str(query or ""), persona_mode=persona_mode, limit=8,
+            ),
+        )
+        if retrieval.status is MemoryRetrievalStatus.UNAVAILABLE:
+            rendered = ""
+            telemetry = {"status": "unavailable", "reason": retrieval.reason}
+        elif retrieval.status is MemoryRetrievalStatus.ABSTAINED:
+            rendered = ""
+            telemetry = {"status": "abstained", "reason": retrieval.reason}
+        else:
+            injection = build_governed_memory_context(
+                store, retrieval, persona_mode=persona_mode,
+                total_budget=max(0, int(memory_limit)),
+            )
+            rendered = injection.packet.render() if injection.packet is not None else ""
+            telemetry = {
+                "status": injection.status.value,
+                "reason": injection.reason,
+                "within_budget": (
+                    injection.status is GovernedInjectionStatus.OK
+                    and len(rendered) <= max(0, int(memory_limit))
+                ),
+            }
+    finally:
+        store.close()
+    open_count = 1 if rendered else 0
+    close_count = 1 if rendered else 0
     has_context = bool(rendered)
     single_context = open_count == 1 and close_count == 1
-    within_budget = bool(telemetry.get("within_budget")) if telemetry else False
+    within_budget = bool(telemetry.get("within_budget")) if has_context else telemetry.get("status") == "abstained"
     report = {
-        "ok": has_context and single_context and within_budget,
+        "ok": (has_context and single_context and within_budget) or telemetry.get("status") == "abstained",
         "mode": mode,
         "query": query,
         "has_pcltm_context": has_context,
@@ -258,8 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_parser = live_context_subparsers.add_parser("smoke", help="Run read-only live context governance smoke check")
     smoke_parser.add_argument("--mode", default=None, help="Optional persona mode hint")
     smoke_parser.add_argument("--query", default=None, help="Optional recall query")
-    smoke_parser.add_argument("--memory-limit", type=int, default=2200, help="Memory budget passed to load_prompt_context")
-    smoke_parser.add_argument("--user-limit", type=int, default=1375, help="User budget passed to load_prompt_context")
+    smoke_parser.add_argument("--memory-limit", type=int, default=2200, help="Total governed injection budget")
+    smoke_parser.add_argument("--user-limit", type=int, default=1375, help="Deprecated compatibility argument; ignored")
     smoke_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     evidence_smoke_parser = live_context_subparsers.add_parser("evidence-smoke", help="Run synthetic tool-evidence capsule smoke check")
     evidence_smoke_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
@@ -401,7 +440,10 @@ def main(argv: list[str] | None = None) -> int:
     else:  # pragma: no cover - argparse enforces commands
         parser.error(f"unknown command: {args.command}")
 
-    for key, value in _runtime_observability().items():
+    for key, value in _runtime_observability(
+        db_path=getattr(args, "db_path", None),
+        memfs_root=getattr(args, "memfs_root", None),
+    ).items():
         report.setdefault(key, value)
     _print_report(report, json_output=args.json)
     return 0 if report.get("ok") else 1

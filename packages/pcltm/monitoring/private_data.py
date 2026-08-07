@@ -84,18 +84,22 @@ def collect_memory_bodies(db_path: str | Path, *, limit: int = 100) -> dict[str,
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
+        sensitivity = str(row["sensitivity"] or "")
+        sensitive = sensitivity != "normal"
         records.append(
             {
                 "record_id": row["record_id"],
                 "candidate_id": row["candidate_id"],
                 "kind": row["kind"],
                 "target_file": row["target_file"],
-                "content": row["content"],
+                "content": (
+                    "[REDACTED_SENSITIVE_MEMORY]" if sensitive else row["content"]
+                ),
                 "confidence": row["confidence"],
-                "sensitivity": row["sensitivity"],
+                "sensitivity": sensitivity,
                 "status": row["status"],
-                "scope_key": metadata.get("scope_key") or metadata.get("scope") or "",
-                "metadata": metadata,
+                "scope_key": "" if sensitive else metadata.get("scope_key") or metadata.get("scope") or "",
+                "metadata": {} if sensitive else metadata,
             }
         )
     return {
@@ -128,7 +132,9 @@ def collect_injection_preview(
                 """
                 SELECT record_id, target_file, content
                 FROM memory_records
-                WHERE status = 'approved' AND target_file IN ('USER.md', 'MEMORY.md')
+                WHERE status = 'approved'
+                  AND sensitivity = 'normal'
+                  AND target_file IN ('USER.md', 'MEMORY.md')
                 ORDER BY record_id ASC
                 """
             ).fetchall()

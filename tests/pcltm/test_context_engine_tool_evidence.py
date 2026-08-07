@@ -34,3 +34,18 @@ def test_context_engine_compacts_valid_large_tool_result_into_evidence_capsule()
     tool_items = [item for item in context.items if item.role == "tool"]
     assert len(tool_items) == 1
     assert len(tool_items[0].content) < 700
+
+
+def test_context_engine_legacy_memory_probe_is_bodyless_retired_status() -> None:
+    context = PCLTMContextEngine(
+        mode="work", debug_memory_probe=True,
+    ).build_shadow_context([{"role": "user", "content": "probe sentinel body"}])
+
+    probe = context.debug_sidecars["memory_selection_probe"]
+    assert probe == {
+        "status": "retired",
+        "bodyless": True,
+        "reason": "legacy_memory_selection_probe_not_runtime_authority",
+    }
+    assert "selected" not in probe
+    assert "load_entries_baseline" not in probe

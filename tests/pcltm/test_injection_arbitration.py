@@ -101,41 +101,55 @@ def test_emotion_state_cannot_contaminate_fact_layer() -> None:
     assert any(item["reason"] == "emotion-layer-cannot-write-facts" for item in packet.audit.rejected)
 
 
-def test_semantic_memory_requires_source_or_confidence() -> None:
+def test_semantic_memory_requires_governed_authority_receipt() -> None:
     packet = InjectionArbitrator(total_budget=160).arbitrate(
         [
             _candidate(
-                "sourced-fact",
+                "raw-semantic-fact",
                 CandidateType.SEMANTIC_MEMORY,
-                "sourced semantic claim",
+                "raw semantic claim",
                 source="semantic-store",
-                confidence=None,
-                token_cost=8,
-            ),
-            _candidate(
-                "confidence-fact",
-                CandidateType.SEMANTIC_MEMORY,
-                "confidence-only semantic claim",
-                source="",
-                confidence=0.7,
-                token_cost=8,
-            ),
-            _candidate(
-                "unsourced-fact",
-                CandidateType.SEMANTIC_MEMORY,
-                "unsupported semantic claim",
-                source="",
-                confidence=None,
+                confidence=0.9,
                 token_cost=8,
             ),
         ]
     )
 
     rendered = packet.render()
-    assert "sourced semantic claim" in rendered
-    assert "confidence-only semantic claim" in rendered
-    assert "unsupported semantic claim" not in rendered
-    assert any(item["reason"] == "semantic-memory-needs-source-or-confidence" for item in packet.audit.rejected)
+    assert "raw semantic claim" not in rendered
+    assert any(
+        item["reason"] == "semantic-memory-needs-governed-authority"
+        for item in packet.audit.rejected
+    )
+
+
+def test_semantic_memory_cannot_spoof_public_authority_metadata() -> None:
+    packet = InjectionArbitrator(total_budget=160).arbitrate(
+        [
+            _candidate(
+                "spoofed-semantic-fact",
+                CandidateType.SEMANTIC_MEMORY,
+                "spoofed semantic claim",
+                source="pcltm.memory_current",
+                confidence=1.0,
+                token_cost=8,
+                metadata={
+                    "authority_verified": True,
+                    "claim_id": 1,
+                    "claim_version": 1,
+                    "governance_id": 1,
+                    "content_sha256": "a" * 64,
+                    "policy_version": "memory-policy-v1",
+                    "source_refs": [{"authority_kind": "event"}],
+                },
+            )
+        ]
+    )
+
+    assert "spoofed semantic claim" not in packet.render()
+    assert packet.audit.rejected[0]["reason"] == (
+        "semantic-memory-needs-governed-authority"
+    )
 
 
 def test_episodic_memory_must_be_marked_as_event() -> None:
@@ -197,9 +211,9 @@ def test_procedural_memory_only_injected_when_needed() -> None:
 def test_conflicting_memory_is_not_injected_unless_resolution_requested() -> None:
     conflict = _candidate(
         "conflict",
-        CandidateType.SEMANTIC_MEMORY,
+        CandidateType.CURRENT_TASK,
         "old fact conflicts with the current task",
-        source="semantic-store",
+        source="task-source",
         risk_flags=(RiskFlag.CURRENT_TASK_CONFLICT,),
         token_cost=8,
     )
@@ -236,7 +250,6 @@ def test_packet_is_sectioned_and_auditable() -> None:
             metadata={"event": True},
             token_cost=5,
         ),
-        _candidate("fact", CandidateType.SEMANTIC_MEMORY, "semantic fact", source="semantic-store", token_cost=5),
         _candidate(
             "skill",
             CandidateType.PROCEDURAL_SKILL,
@@ -251,9 +264,25 @@ def test_packet_is_sectioned_and_auditable() -> None:
     rendered = packet.render()
 
     assert rendered.index("Core SOUL Identity Anchor") < rendered.index("Active Dialogue State")
-    assert rendered.index("Active Dialogue State") < rendered.index("Relevant Semantic Memories")
-    assert all(entry["reason"] == "selected-within-fixed-layer-budget" for entry in packet.audit.injected)
+    assert rendered.index("Active Dialogue State") < rendered.index("Relevant Episodic Memories")
+    assert rendered.index("Relevant Episodic Memories") < rendered.index("Procedural Skills")
+    assert all(
+        entry["reason"] == "selected-within-fixed-layer-budget"
+        for entry in packet.audit.injected
+    )
     assert packet.to_dict()["rendered"] == rendered
+
+
+def test_final_render_respects_budget_including_section_overhead() -> None:
+    candidates = [
+        _candidate("core", CandidateType.CORE_IDENTITY, "core", token_cost=1),
+        _candidate("task", CandidateType.CURRENT_TASK, "task", token_cost=1),
+    ]
+    packet = InjectionArbitrator(total_budget=70, token_counter=len).arbitrate(candidates)
+
+    assert len(packet.render()) <= 70
+    assert packet.total_tokens == len(packet.render())
+    assert any(item["reason"] == "final-render-budget-exceeded" for item in packet.audit.rejected)
 
 
 def test_arbitration_deduplicates_repeated_current_task_instructions() -> None:

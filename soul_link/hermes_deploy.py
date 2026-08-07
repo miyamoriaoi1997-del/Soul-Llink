@@ -13,34 +13,17 @@ from uuid import uuid4
 
 import yaml
 
+from soul_link.host_adaptation import AdaptationReceipt, CompatibilityManifest, HostAdapterController
+
 
 @dataclass(frozen=True, slots=True)
 class DeploymentReceipt:
-    """Deployment receipt with rollback handle and integrity fingerprints.
-
-    Security boundary: fingerprints detect single-sided corruption of backup files,
-    marker, or receipt independently. They do NOT prevent coordinated tampering where
-    an attacker modifies receipt.json + marker + backup files together, as all three
-    artifacts reside in the filesystem with no external trusted anchor.
-
-    Protects against:
-    - Tampered backup file alone (fingerprint mismatch detected)
-    - Tampered marker alone (receipt vs marker mismatch detected)
-    - Missing backup file (incomplete backup detected)
-    - Receipt with wrong adapter version (version mismatch detected)
-    - Receipt pointing to different host/home (binding mismatch detected)
-
-    Does NOT protect against:
-    - Coordinated modification of receipt + marker + backup files together
-    - Attacker with write access to both $HERMES_HOME and receipt storage
-
-    Future mitigation options include receipt signing, remote storage, or user-confirmed hashes.
-    """
     host_root: Path
     hermes_home: Path
     soullink_root: Path
     backup_path: Path
-    adapter_version: str = "2"
+    host_adaptation_receipt: Path | None = None
+    adapter_version: str = "3"
     fingerprints: dict[str, str] | None = None
     entries: dict[str, bool] | None = None
 
@@ -48,31 +31,41 @@ class DeploymentReceipt:
         path = Path(path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".tmp")
-        payload = {
+        temp.write_text(json.dumps({
             "host_root": str(self.host_root),
             "hermes_home": str(self.hermes_home),
             "soullink_root": str(self.soullink_root),
             "backup_path": str(self.backup_path),
+            "host_adaptation_receipt": (
+                str(self.host_adaptation_receipt) if self.host_adaptation_receipt else ""
+            ),
             "adapter_version": self.adapter_version,
-        }
-        if self.fingerprints is not None:
-            payload["fingerprints"] = self.fingerprints
-        if self.entries is not None:
-            payload["entries"] = self.entries
-        temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            "fingerprints": self.fingerprints,
+            "entries": self.entries,
+        }, indent=2), encoding="utf-8")
         os.replace(temp, path)
 
     @classmethod
     def load(cls, path: Path) -> "DeploymentReceipt":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**{key: Path(data[key]).resolve() for key in (
-            "host_root", "hermes_home", "soullink_root", "backup_path"
-        )}, adapter_version=str(data["adapter_version"]),
-            fingerprints=data.get("fingerprints"), entries=data.get("entries"))
+        paths = {
+            key: Path(data[key]).resolve()
+            for key in ("host_root", "hermes_home", "soullink_root", "backup_path")
+        }
+        raw_host_receipt = str(data.get("host_adaptation_receipt") or "").strip()
+        return cls(
+            **paths,
+            host_adaptation_receipt=Path(raw_host_receipt).resolve() if raw_host_receipt else None,
+            adapter_version=str(data["adapter_version"]),
+            fingerprints=data.get("fingerprints"),
+            entries=data.get("entries"),
+        )
 
 
 class HermesDeployment:
-    adapter_version = "2"
+    adapter_version = "3"
+    rollback_compatible_versions = frozenset({"2", "3"})
+    host_manifest_relative = Path("adapters/hermes/compatibility-soullink-runtime.yaml")
     managed = ("plugins/soullink", "plugins/pcltm-context", "config.yaml", "SOUL.md")
     host_contract = {
         "agent/context_engine.py": "class ContextEngine",
@@ -91,6 +84,7 @@ class HermesDeployment:
             self.asset / "context/plugin.yaml",
             self.root / "packages/pcltm",
             self.root / "packages/persona_engine/soul_layers/SOUL.core.template.md",
+            self.root / self.host_manifest_relative,
         ):
             if not required.exists():
                 raise RuntimeError(f"SoulLink deployment asset missing: {required}")
@@ -98,6 +92,7 @@ class HermesDeployment:
     def detect(self, host_root: Path, hermes_home: Path) -> dict[str, object]:
         host = Path(host_root).resolve()
         home = Path(hermes_home).resolve()
+        host_adaptation = self._host_controller().detect(host)
         missing: list[str] = []
         drifted: list[str] = []
         for relative, marker in self.host_contract.items():
@@ -107,11 +102,27 @@ class HermesDeployment:
             elif marker not in path.read_text(encoding="utf-8", errors="replace"):
                 drifted.append(relative)
         installed = self._installed(home)
+        host_incompatible = bool(missing or drifted)
+        authority_healthy = host_adaptation.classification == "supported"
+        runtime_healthy = installed and not host_incompatible
+        if host_incompatible:
+            classification = "incompatible"
+        elif installed:
+            classification = "supported" if authority_healthy else "degraded"
+        elif host_adaptation.classification in {"supported", "transformable"}:
+            classification = "transformable"
+        else:
+            classification = "incompatible"
         return {
-            "classification": "incompatible" if missing or drifted else (
-                "supported" if installed else "transformable"
-            ),
-            "host_source_mutation_required": False,
+            "classification": classification,
+            "runtime_health": "healthy" if runtime_healthy else "unavailable",
+            "authority_health": "healthy" if authority_healthy else "degraded",
+            "host_source_mutation_required": host_adaptation.classification == "transformable",
+            "host_adaptation": {
+                "classification": host_adaptation.classification,
+                "patch_state": host_adaptation.patch_state,
+                "missing_paths": list(host_adaptation.missing_paths),
+            },
             "missing_host_paths": missing,
             "missing_host_capabilities": drifted,
             "installed": installed,
@@ -127,18 +138,17 @@ class HermesDeployment:
             return None
 
         home.mkdir(parents=True, exist_ok=True)
-        baseline_paths = {
-            path.relative_to(home).as_posix()
-            for path in home.rglob("*")
-        }
+        baseline_paths = {path.relative_to(home).as_posix() for path in home.rglob("*")}
         backup = home / f".soullink-deploy-backup-{uuid4().hex}"
         backup.mkdir()
+        host_receipt: AdaptationReceipt | None = None
+        host_receipt_path = backup / "host-adaptation-receipt.json"
         marker = {
             "host_root": str(host), "hermes_home": str(home),
             "soullink_root": str(self.root), "adapter_version": self.adapter_version,
             "entries": {}, "fingerprints": {},
+            "root_entries": sorted(path.name for path in home.iterdir()),
         }
-        mutation_started = False
         try:
             for relative in self.managed:
                 source = self._inside(home, relative)
@@ -155,7 +165,14 @@ class HermesDeployment:
             (backup / ".soullink-deploy.json").write_text(
                 json.dumps(marker, indent=2), encoding="utf-8"
             )
-            mutation_started = True
+
+            host_controller = self._host_controller()
+            _, host_receipt = host_controller.apply(
+                host, verifier=host_controller.verify, backup_root=backup
+            )
+            if host_receipt is not None:
+                host_receipt.write(host_receipt_path)
+
             self._install_plugin(home)
             self._install_config(home)
             self._install_soul(home)
@@ -166,20 +183,24 @@ class HermesDeployment:
                 json.dumps(marker, indent=2), encoding="utf-8"
             )
             return DeploymentReceipt(
-                host, home, self.root, backup,
-                adapter_version=self.adapter_version,
-                fingerprints=marker.get("fingerprints", {}),
-                entries=marker.get("entries", {})
+                host,
+                home,
+                self.root,
+                backup,
+                host_receipt_path if host_receipt is not None else None,
+                fingerprints=dict(marker["fingerprints"]),
+                entries=dict(marker["entries"]),
             )
         except BaseException:
-            if mutation_started:
-                self._record_created_paths(home, backup, baseline_paths, marker)
-                (backup / ".soullink-deploy.json").write_text(
-                    json.dumps(marker, indent=2), encoding="utf-8"
-                )
-                self._validate_backup(backup, marker)
-                self._restore(home, backup, marker)
-            shutil.rmtree(backup, ignore_errors=not mutation_started)
+            self._record_created_paths(home, backup, baseline_paths, marker)
+            (backup / ".soullink-deploy.json").write_text(
+                json.dumps(marker, indent=2), encoding="utf-8"
+            )
+            self._validate_backup(backup, marker)
+            self._restore(home, backup, marker)
+            if host_receipt is not None:
+                self._host_controller().rollback(host_receipt, trusted_backup_root=backup)
+            shutil.rmtree(backup, ignore_errors=True)
             raise
 
     def verify(self, host_root: Path, hermes_home: Path) -> bool:
@@ -187,15 +208,19 @@ class HermesDeployment:
         home = Path(hermes_home).resolve()
         if self.detect(host, home)["classification"] == "incompatible":
             return False
+        if not self._host_controller().verify(host):
+            return False
         if not self._installed(home):
             return False
         python = self._host_python(host)
         probe = (
             "from plugins.memory import load_memory_provider; "
-            "p=load_memory_provider('soullink'); assert p and p.is_available(); "
+            "p=load_memory_provider('soullink'); "
+            "assert p and p.is_available(), 'soullink memory provider unavailable'; "
             "from hermes_cli.plugins import discover_plugins,get_plugin_context_engine; "
             "discover_plugins(); e=get_plugin_context_engine(); "
-            "assert e and e.name=='pcltm-context' and e.is_available(); "
+            "assert e and e.name=='pcltm-context' and e.is_available(), "
+            "'pcltm context engine unavailable'; "
             "print('SOULLINK_HERMES_PLUGIN_OK')"
         )
         env = os.environ.copy()
@@ -218,7 +243,7 @@ class HermesDeployment:
         return True
 
     def rollback(self, receipt: DeploymentReceipt) -> bool:
-        if receipt.adapter_version != self.adapter_version:
+        if receipt.adapter_version not in self.rollback_compatible_versions:
             raise RuntimeError("deployment receipt version mismatch")
         home = receipt.hermes_home.resolve()
         backup = receipt.backup_path.resolve()
@@ -228,32 +253,53 @@ class HermesDeployment:
         if not marker_path.is_file():
             raise RuntimeError("deployment backup marker missing")
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        entries = marker.get("entries", {})
+        if receipt.adapter_version == "2" and set(entries) != set(self.managed):
+            raise RuntimeError("legacy deployment backup incomplete")
         expected = {
             "host_root": str(receipt.host_root.resolve()),
             "hermes_home": str(home), "soullink_root": str(self.root),
-            "adapter_version": self.adapter_version,
+            "adapter_version": receipt.adapter_version,
         }
         if any(marker.get(key) != value for key, value in expected.items()):
             raise RuntimeError("deployment backup marker mismatch")
-        self._validate_backup(backup, marker)
-        if not isinstance(receipt.fingerprints, dict) or not isinstance(receipt.entries, dict):
-            raise RuntimeError("deployment receipt manifest missing")
-        if receipt.fingerprints != marker.get("fingerprints", {}):
-            raise RuntimeError("deployment backup fingerprint mismatch between receipt and marker")
-        if receipt.entries != marker.get("entries", {}):
-            raise RuntimeError("deployment backup entries mismatch between receipt and marker")
+        if receipt.adapter_version == "2":
+            for relative, existed in marker.get("entries", {}).items():
+                if existed and not self._inside(backup, relative).exists():
+                    raise RuntimeError(f"legacy deployment backup incomplete: {relative}")
+        else:
+            self._validate_backup(backup, marker)
+            if not isinstance(receipt.fingerprints, dict) or not isinstance(receipt.entries, dict):
+                raise RuntimeError("deployment receipt manifest missing")
+            if receipt.fingerprints != marker.get("fingerprints", {}):
+                raise RuntimeError("deployment backup fingerprint mismatch between receipt and marker")
+            if receipt.entries != marker.get("entries", {}):
+                raise RuntimeError("deployment backup entries mismatch between receipt and marker")
+        host_receipt: AdaptationReceipt | None = None
+        if receipt.host_adaptation_receipt is not None:
+            host_receipt_path = receipt.host_adaptation_receipt.resolve()
+            try:
+                host_receipt_path.relative_to(backup)
+            except ValueError as exc:
+                raise RuntimeError("host adaptation receipt escapes deployment backup") from exc
+            if not host_receipt_path.is_file():
+                raise RuntimeError("host adaptation receipt missing")
+            host_receipt = AdaptationReceipt.load(host_receipt_path)
+
         self._restore(home, backup, marker)
+        if host_receipt is not None:
+            self._host_controller().rollback(host_receipt, trusted_backup_root=backup)
         shutil.rmtree(backup)
         return True
+
+    def _host_controller(self) -> HostAdapterController:
+        manifest = CompatibilityManifest.load(self.root / self.host_manifest_relative)
+        return HostAdapterController(manifest)
 
     def _installed(self, home: Path) -> bool:
         plugin = home / "plugins/soullink"
         context_plugin = home / "plugins/pcltm-context"
         config = self._read_yaml(home / "config.yaml")
-        disabled = {
-            str(name)
-            for name in (((config.get("agent") or {}).get("disabled_toolsets")) or [])
-        }
         return (
             (plugin / "__init__.py").is_file()
             and (plugin / "plugin.yaml").is_file()
@@ -264,9 +310,6 @@ class HermesDeployment:
             and (config.get("memory") or {}).get("provider") == "soullink"
             and (config.get("context") or {}).get("engine") == "pcltm-context"
             and "pcltm-context" in ((config.get("plugins") or {}).get("enabled") or [])
-            and "session_search" in disabled
-            and "memory" not in disabled
-            and "context_engine" not in disabled
             and "managed-by: SoulLink/PCLTM" in (home / "SOUL.md").read_text(encoding="utf-8")
         ) if (plugin / "soullink-root.txt").is_file() and (home / "SOUL.md").is_file() else False
 
@@ -292,19 +335,6 @@ class HermesDeployment:
         if "pcltm-context" not in enabled:
             enabled.append("pcltm-context")
         plugins["enabled"] = enabled
-
-        # PCLTM is the authoritative cross-session memory surface for a
-        # SoulLink-managed profile.  Suppress Hermes transcript search so the
-        # agent cannot silently bypass PCLTM provenance, while ensuring the
-        # selected memory provider and context engine remain callable.  Keep
-        # every unrelated user-disabled toolset unchanged.
-        agent = config.setdefault("agent", {})
-        disabled = [str(name) for name in (agent.get("disabled_toolsets") or [])]
-        disabled = [name for name in disabled if name not in {"memory", "context_engine"}]
-        if "session_search" not in disabled:
-            disabled.append("session_search")
-        agent["disabled_toolsets"] = disabled
-
         self._atomic_yaml(path, config)
 
     def _install_soul(self, home: Path) -> None:
@@ -328,6 +358,17 @@ class HermesDeployment:
         self._atomic_text(home / "SOUL.md", text)
 
     def _restore(self, home: Path, backup: Path, marker: dict) -> None:
+        original_roots = marker.get("root_entries")
+        if isinstance(original_roots, list):
+            keep = {str(name) for name in original_roots}
+            keep.add(backup.name)
+            for path in list(home.iterdir()):
+                if path.name in keep:
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
         for relative, existed in marker.get("entries", {}).items():
             target = self._inside(home, relative)
             if target.is_dir():
@@ -345,19 +386,13 @@ class HermesDeployment:
     def _record_created_paths(
         self, home: Path, backup: Path, baseline_paths: set[str], marker: dict
     ) -> None:
-        """Bind topmost verify-created paths so rollback removes only new state."""
         managed = tuple(Path(relative) for relative in self.managed)
         backup_relative = backup.relative_to(home)
-        new_paths = sorted(
-            (
-                path for path in home.rglob("*")
-                if path.relative_to(home).as_posix() not in baseline_paths
-            ),
-            key=lambda path: len(path.relative_to(home).parts),
-        )
         recorded: list[Path] = []
-        for path in new_paths:
+        for path in sorted(home.rglob("*"), key=lambda item: len(item.relative_to(home).parts)):
             relative = path.relative_to(home)
+            if relative.as_posix() in baseline_paths:
+                continue
             if relative == backup_relative or backup_relative in relative.parents:
                 continue
             if any(relative == item or item in relative.parents for item in managed):
@@ -368,8 +403,13 @@ class HermesDeployment:
             recorded.append(relative)
 
     def _validate_backup(self, backup: Path, marker: dict) -> None:
-        fingerprints = marker.get("fingerprints", {})
-        for relative, existed in marker.get("entries", {}).items():
+        entries = marker.get("entries")
+        fingerprints = marker.get("fingerprints")
+        if not isinstance(entries, dict) or not isinstance(fingerprints, dict):
+            raise RuntimeError("deployment backup incomplete: manifest missing")
+        if not set(entries).issuperset(self.managed):
+            raise RuntimeError("deployment backup entries mismatch")
+        for relative, existed in entries.items():
             saved = self._inside(backup, relative)
             if existed and not saved.exists():
                 raise RuntimeError(f"deployment backup incomplete: {relative}")
@@ -431,14 +471,9 @@ class HermesDeployment:
         path = Path(relative)
         windows_path = PureWindowsPath(relative)
         if (
-            path.is_absolute()
-            or path.anchor
-            or path.drive
-            or windows_path.is_absolute()
-            or windows_path.anchor
-            or windows_path.drive
-            or ".." in path.parts
-            or ".." in windows_path.parts
+            path.is_absolute() or path.anchor or path.drive
+            or windows_path.is_absolute() or windows_path.anchor or windows_path.drive
+            or ".." in path.parts or ".." in windows_path.parts
         ):
             raise RuntimeError(f"unsafe managed path: {relative}")
         target = (root / relative).resolve()

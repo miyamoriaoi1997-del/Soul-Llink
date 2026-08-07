@@ -32,18 +32,13 @@ class RuntimeShadowAdapter:
     ):
         self.base_dir = Path(base_dir)
         self.log_path = Path(log_path) if log_path else self.base_dir / "logs" / "runtime_shadow.jsonl"
-        orchestrator_log_path = (
-            self.log_path.with_name("persona_orchestrator_shadow.jsonl")
-            if log_path
-            else self.base_dir / "logs" / "persona_orchestrator_shadow.jsonl"
-        )
         # moments_path is accepted only for backward compatibility. The
         # independent legacy relationship-memory file domain is retired and must not be passed into
         # the active StateOrchestrator path.
         _ = moments_path
         self.orchestrator = StateOrchestrator(
             base_dir=self.base_dir,
-            log_path=orchestrator_log_path,
+            log_path=self.base_dir / "logs" / "persona_orchestrator_shadow.jsonl",
             enable_semantic_shadow=enable_semantic_shadow,
             semantic_backend=semantic_backend,
             sentiment_analyzer=sentiment_analyzer,

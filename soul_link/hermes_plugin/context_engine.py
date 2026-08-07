@@ -10,6 +10,7 @@ construction to the Soul-Link package.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import logging
@@ -266,6 +267,11 @@ except Exception as exc:  # pragma: no cover - availability checked separately
 else:
     _IMPORT_ERROR = None
 
+try:
+    EventStore = import_pcltm_module("store").EventStore
+except Exception:  # pragma: no cover
+    EventStore = None
+
 
 class PCLTMContextCompressionEngine(ContextEngine):
     """Hermes ContextEngine backed solely by PCLTM-context."""
@@ -301,6 +307,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self.last_total_tokens = 0
         self.compression_count = 0
         self.session_id = ""
+        self.turn_id = ""
+        self._trusted_turn_mode: str | None = None
         self._hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
         self._last_context_render = ""
         self._last_continuity_tokens = 0
@@ -320,6 +328,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self._last_budget_total_tokens = 0
         self._last_budget_limit_tokens = 0
         self._last_fail_closed_reason = ""
+        self._continuity_persistence: Dict[str, Any] = {"status": "not_attempted"}
         self.strict_fail_closed = True
         self._evidence_capsules_written: set[str] = set()
         self.governance = ActiveFrameGovernanceSettings()
@@ -331,6 +340,28 @@ class PCLTMContextCompressionEngine(ContextEngine):
     @property
     def name(self) -> str:
         return "pcltm-context"
+
+    def __deepcopy__(self, memo: dict) -> "PCLTMContextCompressionEngine":
+        """Deep-copy mutable budget state for the host's engine copy step.
+
+        Hermes deep-copies plugin context engines before attaching them to a
+        child agent (agent_init, #42449). Without an explicit ``__deepcopy__``,
+        any future uncopyable runtime state (locks, connections, clients)
+        would make that copy fail and silently fall back to the built-in
+        compressor — leaving ``context.engine: pcltm-context`` configured but
+        a stock compressor running. Copy all state deeply; anything that must
+        stay shared is kept by reference instead of failing the whole copy.
+        """
+        cls = type(self)
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            try:
+                copied = copy.deepcopy(value, memo)
+            except Exception:
+                copied = value  # shared uncopyable resource: keep reference
+            setattr(new, key, copied)
+        return new
 
     def configure(self, config: Mapping[str, Any] | None = None) -> None:
         """Apply Hermes ``context`` config to the plugin instance.
@@ -493,6 +524,50 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self.session_id = session_id or self.session_id
         if kwargs.get("hermes_home"):
             self._hermes_home = Path(kwargs["hermes_home"])
+        if kwargs.get("mode") is not None or kwargs.get("turn_id") is not None:
+            self.set_turn_context(
+                mode=kwargs.get("mode"),
+                session_id=session_id,
+                turn_id=kwargs.get("turn_id"),
+            )
+
+    def set_turn_context(
+        self,
+        *,
+        mode: str | None,
+        session_id: str | None,
+        turn_id: str | None,
+    ) -> None:
+        """Bind the active frame to host-trusted turn identity and mode."""
+        self._trusted_turn_mode = str(mode).strip() if mode is not None else None
+        self.session_id = str(session_id or self.session_id or "")
+        self.turn_id = str(turn_id or "")
+
+    def _load_provider_turn_context(self) -> None:
+        """Load the latest state-machine decision emitted by SoulLink's provider."""
+        if self._trusted_turn_mode is not None:
+            return
+        capture_path = self._hermes_home / "runtime" / "soullink-latest-turn.json"
+        try:
+            payload = json.loads(capture_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(payload, Mapping) or payload.get("source") != "exact_host_capture":
+            return
+        captured_session = str(payload.get("session_id") or "")
+        if not captured_session or captured_session != self.session_id:
+            return
+        state_machine = payload.get("state_machine")
+        if not isinstance(state_machine, Mapping):
+            return
+        mode = str(state_machine.get("mode") or "").strip()
+        if mode not in {"daily", "work", "sex"}:
+            return
+        self.set_turn_context(
+            mode=mode,
+            session_id=captured_session,
+            turn_id=str(payload.get("host_turn_id") or ""),
+        )
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
@@ -514,6 +589,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self._last_budget_total_tokens = 0
         self._last_budget_limit_tokens = 0
         self._last_fail_closed_reason = ""
+        self._continuity_persistence = {"status": "not_attempted"}
         self._evidence_capsules_written.clear()
 
     def compress(
@@ -522,6 +598,9 @@ class PCLTMContextCompressionEngine(ContextEngine):
         current_tokens: int = None,
         focus_topic: str = None,
         request_budget: Mapping[str, Any] | None = None,
+        mode: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Assemble a strict Letta-style active frame.
 
@@ -532,6 +611,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
         turn plus any current assistant/tool chain that follows it.  Durable
         memories are injected separately by the system-prompt/PCLTM memory view.
         """
+        if mode is not None or session_id is not None or turn_id is not None:
+            self.set_turn_context(mode=mode, session_id=session_id, turn_id=turn_id)
         sanitized, dropped = sanitize_tool_chain(messages)  # type: ignore[misc]
         latest_user_idx = self._latest_real_user_index(sanitized)
 
@@ -646,118 +727,31 @@ class PCLTMContextCompressionEngine(ContextEngine):
         conversation_id = os.getenv("HERMES_CONVERSATION_ID") or session_id
         platform = os.getenv("HERMES_PLATFORM") or "telegram"
 
+        if EventStore is None:
+            self._continuity_persistence = {"status": "degraded", "reason": "event_store_unavailable"}
+            logger.warning("PCLTM compression continuity persistence degraded: EventStore unavailable")
+            return
+        store = None
         try:
-            with sqlite3.connect(db_path) as conn:
-                short_term_events = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='short_term_events'"
-                ).fetchone()
-                if short_term_events:
-                    existing = conn.execute(
-                        """
-                        SELECT 1 FROM short_term_events
-                        WHERE session_id = ? AND source = ? AND category = ?
-                          AND subcategory = ? AND content = ?
-                        LIMIT 1
-                        """,
-                        (session_id, "compression", "conversation", "context_summary", content),
-                    ).fetchone()
-                    if existing:
-                        return
-                    conn.execute(
-                        """
-                        INSERT INTO short_term_events (
-                            session_id, conversation_id, platform, role, source, content,
-                            persona_mode, route_bucket, model_hint, sensitivity,
-                            category, subcategory, inject_policy, retention_policy, ttl_hours
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            session_id,
-                            conversation_id,
-                            platform,
-                            "system",
-                            "compression",
-                            content,
-                            None,
-                            None,
-                            None,
-                            "normal",
-                            "conversation",
-                            "context_summary",
-                            "no_memory",
-                            "ttl",
-                            168,
-                        ),
-                    )
-                    conn.commit()
-                    return
-
-                legacy_short_term = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pcltm_short_term_memory'"
-                ).fetchone()
-                if legacy_short_term:
-                    existing = conn.execute(
-                        """
-                        SELECT 1 FROM pcltm_short_term_memory
-                        WHERE session_id = ? AND source = ? AND category = ?
-                          AND subcategory = ? AND content = ?
-                        LIMIT 1
-                        """,
-                        (session_id, "compression", "conversation", "context_summary", content),
-                    ).fetchone()
-                    if existing:
-                        return
-                    conn.execute(
-                        """
-                        INSERT INTO pcltm_short_term_memory (
-                            session_id, conversation_id, platform, role, source, category,
-                            subcategory, content, inject_policy, retention_policy, ttl_hours
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            session_id,
-                            conversation_id,
-                            platform,
-                            "system",
-                            "compression",
-                            "conversation",
-                            "context_summary",
-                            content,
-                            "no_memory",
-                            "ttl",
-                            168,
-                        ),
-                    )
-                    conn.commit()
-                    return
-        except Exception:
-            logger.debug("PCLTM direct short-term mirror failed", exc_info=True)
-
-        try:
-            pcltm_store_module = import_pcltm_module("store")
-            store_cls = getattr(pcltm_store_module, "PcltmStore", None)
-            if store_cls is not None:
-                store = store_cls(db_path)
-                try:
-                    store.append_short_term_event(
-                        session_id=session_id,
-                        conversation_id=conversation_id,
-                        platform=platform,
-                        role="system",
-                        source="compression",
-                        content=content,
-                        category="conversation",
-                        subcategory="context_summary",
-                        inject_policy="no_memory",
-                        retention_policy="ttl",
-                        ttl_hours=168,
-                    )
-                finally:
-                    close = getattr(store, "close", None)
-                    if callable(close):
-                        close()
-        except Exception:
-            logger.debug("PCLTM short-term store mirror failed", exc_info=True)
+            store = EventStore(db_path)
+            existing = store._conn.execute(
+                "SELECT 1 FROM short_term_events WHERE session_id = ? AND source = ? AND category = ? AND subcategory = ? AND content = ? LIMIT 1",
+                (session_id, "compression", "conversation", "context_summary", content),
+            ).fetchone()
+            if not existing:
+                store.append_short_term_event(
+                    session_id=session_id, conversation_id=conversation_id, platform=platform,
+                    role="system", source="compression", content=content,
+                    category="conversation", subcategory="context_summary",
+                    inject_policy="no_memory", retention_policy="ttl", ttl_hours=168,
+                )
+            self._continuity_persistence = {"status": "persisted"}
+        except Exception as exc:
+            self._continuity_persistence = {"status": "degraded", "reason": str(exc)}
+            logger.warning("PCLTM compression continuity persistence degraded: %s", exc)
+        finally:
+            if store is not None:
+                store.close()
 
 
 
@@ -783,6 +777,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
                 "configured_budget_tokens": self._configured_budget_tokens,
                 "request_budget_safety_margin_tokens": self._request_budget_safety_margin_tokens,
                 "last_fail_closed_reason": self._last_fail_closed_reason,
+                "continuity_persistence": dict(self._continuity_persistence),
                 "strict_fail_closed": self.strict_fail_closed,
                 "governance": self.governance.as_dict(),
             }
@@ -819,7 +814,12 @@ class PCLTMContextCompressionEngine(ContextEngine):
                 "</pcltm_context>",
             ])
             return {"role": "system", "content": rendered}
-        context = PCLTMContextEngine(mode="work").build_shadow_context(messages)
+        self._load_provider_turn_context()
+        context = PCLTMContextEngine(
+            mode=self._trusted_turn_mode or "work",
+            session_id=self.session_id,
+            turn_id=self.turn_id,
+        ).build_shadow_context(messages)
         request_text = context.current_user_request or context.latest_real_user_message
         rendered = "\n".join([
             "<pcltm_context>",
@@ -1661,7 +1661,99 @@ def _parse_structured_tool_content(raw_content: Any, text: str = "") -> Any:
     return None
 
 
+def _redact_tool_evidence(text: str) -> str:
+    """Apply the canonical PCLTM secret policy before active-frame retention."""
+    try:
+        return str(import_pcltm_module("secret_policy").redact_secrets(str(text or "")))
+    except Exception:
+        # Fail closed for common credential forms if the policy module is not
+        # importable during host plugin discovery.
+        import re
+        redacted = str(text or "")
+        secret_keys = {
+            "token", "access_token", "refresh_token", "id_token", "api_key", "apikey",
+            "client_secret", "private_key", "password", "passwd", "authorization",
+            "cookie", "session", "session_id",
+        }
+
+        def is_secret_key(key: object) -> bool:
+            normalized = re.sub(r"[-\s]+", "_", str(key).strip().lower())
+            return normalized in secret_keys or normalized.endswith(
+                ("_token", "_secret", "_password", "_passwd", "_private_key", "_api_key")
+            )
+
+        def redact_string(value: str) -> str:
+            value = re.sub(
+                r"(?i)Bearer\s+[A-Za-z0-9._~+/-]{8,}",
+                "Bearer [REDACTED]",
+                value,
+            )
+            value = re.sub(
+                r"(?i)\b[A-Z0-9_]*(?:SECRET|TOKEN|API[_-]?KEY|PASSWORD|PASS|COOKIE|SESSION)"
+                r"[A-Z0-9_]*\s*=\s*[^\s,;]+",
+                "[REDACTED]",
+                value,
+            )
+            value = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", value)
+            value = re.sub(r"\bghp_[A-Za-z0-9_]{20,}\b", "[REDACTED]", value)
+            value = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED]", value)
+            value = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{12,}\b", "[REDACTED]", value)
+            value = re.sub(
+                r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+                "[REDACTED]",
+                value,
+            )
+            value = re.sub(
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+                "[REDACTED]",
+                value,
+            )
+            return re.sub(
+                r"\b([a-z][a-z0-9+.-]*://[^:/@\s]+):([^@\s]+)@([^\s]+)",
+                r"\1:[REDACTED]@\3",
+                value,
+                flags=re.I,
+            )
+
+        def redact_structured(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: "[REDACTED]" if is_secret_key(key) else redact_structured(child)
+                    for key, child in value.items()
+                }
+            if isinstance(value, list):
+                return [redact_structured(child) for child in value]
+            if isinstance(value, str):
+                return redact_string(value)
+            return value
+
+        try:
+            structured = json.loads(redacted)
+        except (json.JSONDecodeError, TypeError):
+            structured = None
+        if isinstance(structured, (dict, list)):
+            return json.dumps(redact_structured(structured), ensure_ascii=False)
+        redacted = redact_string(redacted)
+        return re.sub(
+            r"(?i)([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|private[_-]?key|authorization))"
+            r"(\s*[:=]\s*)[^\s,;}]+",
+            r"\1\2[REDACTED]",
+            redacted,
+        )
+
+
+def _edge_excerpt(text: str, limit: int) -> str:
+    """Retain bounded beginning and completion evidence from command output."""
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    tail_limit = max(80, limit // 3)
+    head_limit = max(0, limit - tail_limit - 3)
+    return normalized[:head_limit] + " … " + normalized[-tail_limit:]
+
+
 def _json_capsule_excerpt(text: str, limit: int = 900, raw_content: Any = None) -> str:
+    text = _redact_tool_evidence(text)
     parsed = _parse_structured_tool_content(raw_content, text)
     if parsed is None:
         return _truncate(text, limit)
@@ -1672,11 +1764,11 @@ def _json_capsule_excerpt(text: str, limit: int = 900, raw_content: Any = None) 
         ]
         safe = {key: parsed.get(key) for key in safe_keys if key in parsed}
         if "content" in parsed and isinstance(parsed.get("content"), str):
-            safe["content_excerpt"] = _truncate(parsed["content"], 300)
+            safe["content_excerpt"] = _edge_excerpt(_redact_tool_evidence(parsed["content"]), 300)
         if "output" in parsed and isinstance(parsed.get("output"), str):
-            safe["output_excerpt"] = _truncate(parsed["output"], 300)
+            safe["output_excerpt"] = _edge_excerpt(_redact_tool_evidence(parsed["output"]), 300)
         if safe:
-            return json.dumps(safe, ensure_ascii=False)
+            return _redact_tool_evidence(json.dumps(safe, ensure_ascii=False))
     return _truncate(text, limit)
 
 
@@ -1689,6 +1781,7 @@ def _render_tool_capsule(
     kind: str,
     preserve_edges: bool,
 ) -> str:
+    text = _redact_tool_evidence(text)
     labels = {
         "file": "[File tool evidence capsule for active context]",
         "terminal": "[Terminal tool evidence capsule for active context]",

@@ -121,11 +121,17 @@ class TransitionManagerV2:
             TransitionDecision with authority_source attribute indicating
             which path made the decision.
         """
+        decision_safety_flags = list(getattr(decision, "safety_flags", None) or [])
+        effective_safety_flags = list(safety_flags or [])
+        for flag in decision_safety_flags:
+            if flag not in effective_safety_flags:
+                effective_safety_flags.append(flag)
+
         # Always execute legacy path first
         legacy_result = self.legacy_manager.transition(
             previous_mode=previous_mode,
             decision=decision,
-            safety_flags=safety_flags,
+            safety_flags=effective_safety_flags,
             desire_tier=desire_tier,
             enable_active_sex=enable_active_sex,
             emotion_score=emotion_score,
@@ -135,9 +141,14 @@ class TransitionManagerV2:
         use_new_table = self._should_use_new_table(
             previous_mode=previous_mode,
             nominated_mode=decision.mode,
-            safety_flags=safety_flags,
+            safety_flags=effective_safety_flags,
             enable_active_sex=enable_active_sex,
         )
+        # The legacy manager owns the new bounded semantic-release signal until
+        # the transition table has an equivalent typed condition. Letting the
+        # generic WORK.HOLD rule consume it would reintroduce work stickiness.
+        if decision.signals.get("semantic_explicit_daily_intent"):
+            use_new_table = False
 
         # Try new table for low-risk pairs if bounded activation enabled
         if use_new_table and self.enable_bounded_activation and self.shadow_table:
@@ -145,6 +156,7 @@ class TransitionManagerV2:
                 new_result = self._execute_new_table(
                     previous_mode=previous_mode,
                     decision=decision,
+                    safety_flags=effective_safety_flags,
                     desire_tier=desire_tier,
                     enable_active_sex=enable_active_sex,
                 )
@@ -177,6 +189,7 @@ class TransitionManagerV2:
                     previous_mode=previous_mode,
                     decision=decision,
                     legacy_result=legacy_result,
+                    safety_flags=effective_safety_flags,
                     desire_tier=desire_tier,
                     enable_active_sex=enable_active_sex,
                 )
@@ -223,6 +236,7 @@ class TransitionManagerV2:
         self,
         previous_mode: str | None,
         decision: ModeDecision,
+        safety_flags: list[str],
         desire_tier: str | None,
         enable_active_sex: bool,
     ) -> TransitionDecision:
@@ -231,7 +245,7 @@ class TransitionManagerV2:
         Returns a TransitionDecision object matching legacy format.
         """
         # Map decision signals to new table inputs
-        force_event = self._map_force_event(decision, previous_mode, None)
+        force_event = self._map_force_event(decision, previous_mode, None, safety_flags)
         continuation_target = self._map_continuation_target(decision)
         gate_result = self._map_gate_result(decision, desire_tier, enable_active_sex)
 
@@ -275,7 +289,7 @@ class TransitionManagerV2:
             transition=new_rule.transition_label,
             confidence=decision.confidence,
             reason=new_rule.reason,
-            safety_flags=decision.safety_flags or [],
+            safety_flags=safety_flags,
         )
 
         return result
@@ -325,13 +339,14 @@ class TransitionManagerV2:
         previous_mode: str | None,
         decision: ModeDecision,
         legacy_result: TransitionDecision,
+        safety_flags: list[str],
         desire_tier: str | None,
         enable_active_sex: bool,
     ):
         """Run shadow table and compare with legacy result."""
 
         # Map decision signals to new table inputs
-        force_event = self._map_force_event(decision, previous_mode, legacy_result)
+        force_event = self._map_force_event(decision, previous_mode, legacy_result, safety_flags)
         continuation_target = self._map_continuation_target(decision)
         gate_result = self._map_gate_result(decision, desire_tier, enable_active_sex)
 
@@ -373,11 +388,13 @@ class TransitionManagerV2:
         decision: ModeDecision,
         previous_mode: str | None,
         legacy_result: TransitionDecision,
+        safety_flags: list[str] | None = None,
     ) -> ForceEvent:
         """Map decision signals to ForceEvent enum."""
 
         # Crisis guard
-        if "crisis_guard" in (decision.safety_flags or []):
+        effective_safety_flags = safety_flags if safety_flags is not None else (decision.safety_flags or [])
+        if "crisis_guard" in effective_safety_flags:
             return ForceEvent.CRISIS
 
         # Explicit task/system request

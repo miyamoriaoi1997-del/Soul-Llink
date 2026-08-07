@@ -108,7 +108,7 @@ def test_active_injection_strips_legacy_user_memory_blocks(tmp_path):
     assert result.prompt_text.count('<pcltm_context>') <= 1
 
 
-def test_active_prompt_context_summary_available_via_packet(tmp_path):
+def test_active_prompt_delegates_memory_context_to_soullink_provider(tmp_path):
     result = StateOrchestrator('.', log_path=tmp_path / 'o.jsonl').compose_active_prompt(
         host_system_prompt=BASE_PROMPT,
         user_message='帮我检查 gateway 日志',
@@ -122,16 +122,12 @@ def test_active_prompt_context_summary_available_via_packet(tmp_path):
 
     assert summary['hermes_route_bucket'] == 'task'
     assert all('model' not in key for key in summary)
-    assert 'memory_context_summary' in summary
-    assert summary['memory_context_summary']['active_layers'] == ['system', 'pinned', 'transient']
-    assert summary['memory_context_summary']['selected_layers'] == ['system', 'pinned', 'transient']
-    assert summary['memory_context_summary']['selection_contract']['layers'] == ['system', 'pinned', 'episodic', 'transient']
-    assert summary['memory_context_summary']['selection_contract']['archival_layers'] == ['episodic']
-    assert summary['memory_context_summary']['prompt_active_layers'] == ['system', 'pinned', 'transient']
-    assert 'runtime_boundary' in summary['memory_context_summary']['selected_buckets']
-    assert 'project_path' in summary['memory_context_summary']['selected_buckets']
-    assert summary['memory_context_summary']['compression']['is_reference_only'] is True
-    assert all(layer['layer'] != 'compression' for layer in summary['memory_context_summary']['layers'])
+    assert 'memory_context_summary' not in summary
+    assert summary['runtime_health']['components']['pcltm'] == {
+        'status': 'delegated',
+        'authority': 'soullink_memory_provider',
+    }
+    assert '<pcltm_memory_view>' not in result.prompt_text
 
     audit = summary['decision_audit']
     assert audit['previous_mode'] == 'daily'

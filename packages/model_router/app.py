@@ -354,9 +354,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": {"message": last_error, "type": "upstream_error"}})
             return None
 
-        self._send_json(502, {"error": {"message": last_error or "upstream failed", "type": "upstream_error"}})
-        return None
-
     def _call_upstream(self, payload: dict, upstream: UpstreamConfig) -> Tuple[int, bytes, str, dict]:
         body = json_bytes(payload)
         headers = {

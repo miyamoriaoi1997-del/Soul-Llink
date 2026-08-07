@@ -6,6 +6,7 @@ recursive-include soul_link *.py
 recursive-include packages/pcltm *.py
 recursive-include packages/persona_engine *.py *.md *.yaml
 recursive-include packages/model_router *.py *.yaml *.service
+exclude packages/model_router/config.yaml
 
 prune tests
 prune packages/model_router/tests

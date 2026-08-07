@@ -264,18 +264,18 @@ print(result.packet.selected_layers)
 
 PromptComposer 会移除旧的 `<persona_orchestrator_prompt>` 和旧的 `<emotion_modifier>`，再插入新的 managed region，并把最新 emotion_modifier 放到末尾。
 
-### RuntimePreviewAdapter
+### RuntimeShadowAdapter
 
-宿主运行时可以用 RuntimePreviewAdapter 记录红acted JSONL 审计日志：
+宿主运行时可以用 `RuntimeShadowAdapter` 记录脱敏 JSONL 审计日志：
 
 ```python
-from persona_orchestrator import RuntimePreviewAdapter
+from persona_orchestrator import RuntimeShadowAdapter
 
-adapter = RuntimePreviewAdapter(
+adapter = RuntimeShadowAdapter(
     base_dir="/path/to/host_agent-persona-engine",
-    log_path="/tmp/persona_runtime_preview.jsonl",
-    enable_semantic_preview=True,
-    semantic_backend="local_lightweight",
+    log_path="/tmp/persona_runtime_shadow.jsonl",
+    enable_semantic_shadow=True,
+    semantic_backend="local",
 )
 
 record = adapter.analyze_runtime_turn(
@@ -294,16 +294,16 @@ assert record["active"] is False
 
 日志文件不会写入完整用户消息和 candidate_prompt，只记录 hash、mode、transition、selected_layers、safety_flags、desire_tier、prompt_hash 和 packet 元数据。完整 candidate_prompt 只在返回值内存对象中提供。
 
-### Host plugin scaffold
+### Host plugin shadow scaffold
 
-如果只想先观察真实运行流，不想改宿主 prompt，可以生成 preview-only 插件。当前脚本以 host agent-style plugin hook 为例，但设计目标不是绑定某一个 Agent；其他宿主只需要提供等价的 pre-LLM hook、session id、platform name、current system prompt 和 emotion state：
+如果只想观察真实运行流而不改变宿主 prompt，可以先预览或生成 shadow-only 插件：
 
 ```bash
-python scripts/runtime_preview_plugin_probe.py --dry-run
-python scripts/runtime_preview_plugin_probe.py --write
+python scripts/runtime_shadow_plugin_probe.py --dry-run
+python scripts/runtime_shadow_plugin_probe.py --write
 ```
 
-生成的插件：
+生成的 shadow 插件：
 
 - 只注册 `pre_llm_call`。
 - 返回 `None`。
@@ -311,7 +311,7 @@ python scripts/runtime_preview_plugin_probe.py --write
 - 不修改系统提示词。
 - 不改变回复路径。
 
-启用插件仍需要宿主 Agent 配置显式开启并重启。不要把“文件已生成”等同于“运行时已启用”。
+启用插件仍需要宿主配置显式开启并重启。不要把“文件已生成”等同于“运行时已启用”。
 
 ## 安装
 
@@ -332,14 +332,12 @@ pip install torch transformers pyyaml
 ### 克隆仓库
 
 ```bash
-git clone https://github.com/soullink-public/soullink-public-2.0.git
-cd soullink-public-2.0/packages/persona_engine
-python3 -m venv .venv
-.venv/bin/pip install -U pip
-.venv/bin/pip install -r requirements.txt
+git clone https://github.com/miyamoriaoi1997-del/Soul-Llink.git
+cd Soul-Llink
+uv sync --locked --group dev
 ```
 
-如果不需要神经模型，可以只安装 `pyyaml pytest` 后运行 orchestrator 相关测试。
+如果不需要神经模型，默认 dev 环境已经足够运行 orchestrator 相关测试；神经依赖保留在可选 `ml` 组中。
 
 ## 快速开始
 
@@ -372,7 +370,7 @@ print(emotion_modifier)
 python scripts/orchestrator_probe.py "[pet name]帮我看 gateway 日志" --score 1.0
 python scripts/orchestrator_probe.py "我们成人亲密" --score 4.5
 python scripts/orchestrator_probe.py "不是骂你，测试一下讨厌你这个词会不会触发 conflict" --score 1.0
-python scripts/orchestrator_probe.py "继续" --previous-mode system_maintenance --semantic-preview --semantic-backend local_lightweight
+uv run --locked --group dev python packages/persona_engine/scripts/orchestrator_probe.py "继续" --previous-mode work --semantic-shadow --semantic-backend local_lightweight
 ```
 
 预期类别：
@@ -409,12 +407,13 @@ persona-engine/
 ├── sentiment_analyzer.py          # Chinese-Emotion-Small wrapper（可选）
 ├── persona_orchestrator/
 │   ├── mode_classifier.py         # deterministic mode classifier
-│   ├── transition_manager.py      # anti-flap / guard / mode transition
+│   ├── transition_manager.py      # compatibility authority used by v2
+│   ├── transition_manager_v2.py   # bounded transition wrapper used by the orchestrator
 │   ├── memory_selector.py         # mode -> memory profile
 │   ├── legacy relationship-memory provider module        # retired relationship_memorys no-op compatibility shim
 │   ├── prompt_composer.py         # host/orchestrator core + mode + memory profile + modifier composition
 │   ├── semantic_classifier.py     # semantic preview backend scaffold
-│   ├── runtime_preview.py          # runtime adapter / audit record
+│   ├── runtime_shadow.py          # observation-only runtime adapter / audit record
 │   └── types.py                   # StatePacket and shared dataclasses
 ├── soul_layers/
 │   ├── SOUL.core.template.md
@@ -430,7 +429,7 @@ persona-engine/
 ├── scripts/
 │   ├── orchestrator_probe.py
 │   ├── validate_soul_layers.py
-│   └── runtime_preview_plugin_probe.py
+│   └── runtime_shadow_plugin_probe.py
 ├── tests/
 └── docs/
 ```
@@ -440,26 +439,26 @@ persona-engine/
 推荐先跑轻量 orchestrator 测试，再决定是否安装 torch：
 
 ```bash
-cd persona-engine
-python3 -m venv .venv
-.venv/bin/pip install -U pip
-.venv/bin/pip install pytest pyyaml
-PYTHONPATH=$PWD .venv/bin/pytest tests/ -q
+cd Soul-Llink
+uv sync --locked --group dev
+uv run --locked --group dev python -m pytest packages/persona_engine/tests --ignore=packages/persona_engine/tests/test_stateful_properties.py -q
+uv run --locked --group dev python -m pytest packages/persona_engine/tests/test_stateful_properties.py -q
 ```
 
 如果需要完整情绪神经侧通道：
 
 ```bash
-.venv/bin/pip install -r requirements.txt
-PYTHONPATH=$PWD .venv/bin/pytest tests/ -q
+uv sync --locked --group dev --group ml
+uv run --locked --group dev --group ml python -m pytest packages/persona_engine/tests --ignore=packages/persona_engine/tests/test_stateful_properties.py -q
+uv run --locked --group dev --group ml python -m pytest packages/persona_engine/tests/test_stateful_properties.py -q
 ```
 
 常用 smoke checks：
 
 ```bash
-python -m py_compile emotion_calculator.py emotion_detector.py emotion_state_manager.py legacy relationship-memory writer module persona_orchestrator/*.py scripts/*.py
-python scripts/validate_soul_layers.py
-python scripts/orchestrator_probe.py "[pet name]帮我看 gateway 日志" --score 1.0 --semantic-preview --semantic-backend local
+uv run --locked --group dev python -m compileall -q packages/persona_engine
+uv run --locked --group dev python packages/persona_engine/scripts/validate_soul_layers.py
+uv run --locked --group dev python packages/persona_engine/scripts/orchestrator_probe.py "[pet name]帮我看 gateway 日志" --score 1.0 --semantic-shadow --semantic-backend local
 ```
 
 ## 集成建议
@@ -510,7 +509,7 @@ Persona Orchestrator 不要求宿主一定是 host agent。任何 Agent runtime 
    - `orchestrator_core`：宿主不要再加载自己的单体 core prompt。
    - `host_core`：宿主保留自己的 core prompt，orchestrator 不再选择 `core` layer。
 2. 每轮情绪更新后，取最新 emotion_modifier。
-3. 调用 `RuntimePreviewAdapter.analyze_runtime_turn(..., active=True)` 或 `StateOrchestrator.compose_active_prompt()`。
+3. 调用 `RuntimeShadowAdapter.analyze_runtime_turn(..., active=True)` 或 `StateOrchestrator.compose_active_prompt()`。
 4. 只有在明确 active 模式下，宿主才安装 candidate_prompt。
 5. 安装后更新 session cached prompt / session DB，避免下一轮回到旧 prompt。
 6. 保证最终 prompt 只有一个 core identity、一个 `<emotion_modifier>`，且 emotion_modifier 位于末尾。
@@ -545,6 +544,7 @@ Persona Orchestrator 不要求宿主一定是 host agent。任何 Agent runtime 
 
 - `INTEGRATION.md`：宿主 Agent 集成方式。
 - `docs/soul-state-orchestrator.md`：分层 SOUL 状态机设计和 probe。
+- `docs/plans/2026-04-29-soul-state-orchestrator.md`：历史设计计划。
 
 ## 许可证
 

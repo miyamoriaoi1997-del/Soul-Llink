@@ -1,78 +1,54 @@
 from __future__ import annotations
 
-import json
-import sqlite3
+from pcltm.memory_contracts import PersonaMode, Sensitivity
+from pcltm.memory_retrieval import (
+    GovernedMemorySearchRequest,
+    MemoryRetrievalStatus,
+    search_governed_memories,
+)
+from pcltm.memory_write_service import MemoryWriteRequest, MemoryWriteService
+from pcltm.projections.memory_fts import MemoryFtsProjector
+from pcltm.store import EventStore
 
-from pcltm import memory_adapter
 
-
-def _init_db(path):
-    con = sqlite3.connect(path)
-    con.execute(
-        """
-        CREATE TABLE memory_records (
-            record_id INTEGER PRIMARY KEY,
-            candidate_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            target_file TEXT NOT NULL,
-            content TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            sensitivity TEXT NOT NULL,
-            source_event_ids TEXT NOT NULL,
-            source_node_ids TEXT NOT NULL,
-            status TEXT NOT NULL,
-            metadata TEXT NOT NULL,
-            created_at TEXT
+def test_governed_retrieval_preserves_authority_metadata_for_audits(tmp_path) -> None:
+    store = EventStore(tmp_path / "authority.db")
+    try:
+        receipt = MemoryWriteService(store).write(MemoryWriteRequest(
+            idempotency_key="audit-metadata",
+            content="audit-token 用户希望长期记忆召回要完整命中，不要只靠短词撞中。",
+            canonical_key="profile:memory-quality",
+            target="profile",
+            memory_type="preference",
+            sensitivity=Sensitivity.NORMAL,
+            mode_scope=(PersonaMode.WORK,),
+            injection_policy="allow",
+        ))
+        assert receipt.success is True
+        outcome = MemoryFtsProjector(store, worker_id="audit").run_once(
+            now="2026-07-31T03:00:00Z", lease_until="2026-07-31T03:01:00Z",
         )
-        """
-    )
-    return con
+        assert outcome["applied"] == 1
 
+        result = search_governed_memories(store, GovernedMemorySearchRequest(
+            query="audit-token", persona_mode=PersonaMode.WORK,
+        ))
+    finally:
+        store.close()
 
-def _row(con: sqlite3.Connection, record_id: int, target_file: str, content: str, metadata: dict) -> None:
-    con.execute(
-        """
-        INSERT INTO memory_records(record_id, candidate_id, kind, target_file, content, confidence, sensitivity,
-                                   source_event_ids, source_node_ids, status, metadata, created_at)
-        VALUES (?, ?, 'fact', ?, ?, 0.9, 'normal', '[]', '[]', 'approved', ?, '2026-01-01T00:00:00Z')
-        """,
-        (record_id, f"cand-{record_id}", target_file, content, json.dumps(metadata, ensure_ascii=False)),
-    )
-
-
-def test_layered_fallback_preserves_source_record_metadata_for_audits(tmp_path, monkeypatch):
-    db = tmp_path / "pcltm.db"
-    con = _init_db(db)
-    _row(
-        con,
-        42,
-        "USER.md",
-        "用户希望长期记忆召回要完整命中，不要只靠短词撞中。",
-        {"gov_score": 4.2, "buckets": ["memory_quality"], "tags": ["recall"], "type": "UserPreference"},
-    )
-    con.commit()
-    con.close()
-
-    monkeypatch.setattr(memory_adapter, "DEFAULT_DB", db)
-    monkeypatch.setenv("HERMES_PCLTM_DB", str(db))
-    monkeypatch.setenv("HERMES_PCLTM_MEMFS_ROOT", str(tmp_path / "missing-memfs"))
-    monkeypatch.setattr(memory_adapter, "_semantic_scores_for_query", lambda *args, **kwargs: {})
-
-    view = memory_adapter._fallback_layered_prompt_context(mode="work", query="长期记忆召回", budgets={"system": 1000, "pinned": 1500, "episodic": 1000, "transient": 500}, policy=memory_adapter.DEFAULT_VIEW_POLICY)
-
-    item = view.pinned.items[0]
-    assert item.id == "42"
-    assert item.path.startswith("pinned/")
-    assert item.buckets == ("memory_quality",)
-    assert item.mode_scope == ("daily", "work", "sex")
-    assert item.score == 4.2
-    assert item.memory_type == "UserPreference"
-    assert item.metadata["source"] == "db_fallback"
-    assert item.metadata["target_file"] == "USER.md"
-    assert item.metadata["bucket"] == "memory_quality"
-    assert item.body == "用户希望长期记忆召回要完整命中，不要只靠短词撞中。"
-
-    snapshot = view.context_selection_snapshot()
-    pinned_audit = next(layer for layer in snapshot.layers if layer["layer"] == "pinned")
-    assert pinned_audit["selected_items"][0]["id"] == "42"
-    assert pinned_audit["selected_items"][0]["buckets"] == ["memory_quality"]
+    assert result.status is MemoryRetrievalStatus.OK
+    item = result.items[0]
+    assert item.claim_id == receipt.claim_id
+    assert item.claim_version == receipt.claim_version
+    assert item.governance_id == receipt.governance_id
+    assert item.canonical_key == "profile:memory-quality"
+    assert item.target == "profile"
+    assert item.memory_type == "preference"
+    assert item.mode_scope == (PersonaMode.WORK,)
+    assert item.sensitivity is Sensitivity.NORMAL
+    assert item.authority_verified is True
+    assert item.rank == 1
+    assert item.rank_score is not None
+    assert item.rank_score_is_authority is False
+    assert item.policy_reason == "access_allowed"
+    assert item.content.endswith("用户希望长期记忆召回要完整命中，不要只靠短词撞中。")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soullink-public"
-version = "2.1.0"
+version = "2.2.0"
 description = "Open public reference runtime for persona, memory/context governance, and model routing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,7 +29,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.9.0",
+    "mcp>=1.9.0,<2",
     "openai>=1.0.0",
     "pyyaml>=6.0",
 ]
@@ -40,6 +40,7 @@ pcltm = "pcltm.cli:main"
 soullink-continuity-gate = "pcltm.continuity_gate:main"
 soullink-host-adapt = "soul_link.host_adaptation:main"
 soullink-hermes-deploy = "soul_link.hermes_deploy:main"
+soullink-hermes-update = "soul_link.hermes_update:main"
 soullink-codex-deploy = "soul_link.codex_deploy:main"
 soullink-codex-mcp = "soul_link.codex_mcp:main"
 soullink-codex-hook = "soul_link.codex_hook:main"
@@ -51,7 +52,9 @@ Issues = "https://github.com/miyamoriaoi1997-del/Soul-Llink/issues"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.0.0",
     "pytest>=9.0.0",
+    "ruff>=0.12,<1",
 ]
 ml = [
     "torch>=2.0.0",

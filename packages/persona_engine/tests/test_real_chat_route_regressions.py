@@ -82,7 +82,7 @@ def test_real_chat_adult_policy_edit_request_is_work_not_sex_scene(tmp_path):
     assert "sex_requires_gate" not in packet.safety_flags
 
 
-def test_generic_acceptance_phrase_does_not_enter_glm5_without_desire_gate(tmp_path):
+def test_generic_acceptance_phrase_uses_daily_model_without_desire_gate(tmp_path):
     orchestrator = StateOrchestrator(".", log_path=tmp_path / "runtime-shadow.jsonl")
 
     packet = orchestrator.analyze_turn(
@@ -129,3 +129,62 @@ def test_work_authorization_phrase_does_not_enter_sex_mode(tmp_path):
     assert packet.transition == "hold_context_action"
     assert "work" in packet.selected_layers
     assert "sex" not in packet.selected_layers
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "这个结论确定吗？",
+        "为什么会这样？",
+        "这里似乎不对。",
+        "那另一个呢？",
+    ],
+)
+def test_ambiguous_follow_up_semantic_classes_hold_active_work(message, tmp_path):
+    orchestrator = StateOrchestrator(".", log_path=tmp_path / "work-continuation.jsonl")
+
+    packet = orchestrator.analyze_turn(
+        user_message=message,
+        emotion_state={"emotion_score": 1.0},
+        previous_mode="work",
+    )
+
+    assert packet.mode == "work"
+    audit = packet.route_metadata["decision_audit"]
+    assert audit["context_router"]["signals"]["continuation"] is True
+
+
+def test_ambiguous_work_hold_is_bounded_and_does_not_lock_unrelated_daily_turns(tmp_path):
+    orchestrator = StateOrchestrator(".", log_path=tmp_path / "bounded-work-continuation.jsonl")
+    mode = "work"
+
+    for message in ("这个呢？", "然后呢？"):
+        packet = orchestrator.analyze_turn(
+            user_message=message,
+            emotion_state={"emotion_score": 1.0},
+            previous_mode=mode,
+        )
+        mode = packet.mode
+        assert mode == "work"
+
+    packet = orchestrator.analyze_turn(
+        user_message="今天空气不错。",
+        emotion_state={"emotion_score": 1.0},
+        previous_mode=mode,
+    )
+
+    assert packet.mode == "daily"
+    assert packet.transition == "work->daily"
+
+
+def test_explicit_relationship_turn_exits_work_without_waiting_for_decay(tmp_path):
+    orchestrator = StateOrchestrator(".", log_path=tmp_path / "explicit-daily-exit.jsonl")
+
+    packet = orchestrator.analyze_turn(
+        user_message="先别工作了，陪陪我。",
+        emotion_state={"emotion_score": 1.0},
+        previous_mode="work",
+    )
+
+    assert packet.mode == "daily"
+    assert packet.transition == "work->daily"

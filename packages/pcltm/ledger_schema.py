@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from .evidence_chain import chain_hash, normalize_source_created_at, sha256_text
+from .memory_schema import ensure_memory_claim_schema
 from .transcript_chunker import chunk_transcript
 
 
@@ -56,6 +57,11 @@ def ensure_evidence_ledger_schema(conn: sqlite3.Connection) -> None:
     untouched; a later governed backfill populates hashes and chain values.
     """
 
+    conn.create_function(
+        "pcltm_sha256", 1,
+        lambda value: sha256_text(str(value)),
+        deterministic=True,
+    )
     _ensure_columns(conn, "events", EVENT_LEDGER_COLUMNS)
     _execute_script_without_implicit_commit(
         conn,
@@ -101,7 +107,14 @@ def ensure_evidence_ledger_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS projection_outbox (
             outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_seq INTEGER NOT NULL,
+            event_seq INTEGER,
+            authority_kind TEXT NOT NULL
+                CHECK (authority_kind IN ('event', 'legacy_record')),
+            authority_id TEXT NOT NULL CHECK (
+                length(authority_id) > 0
+                AND authority_id NOT GLOB '*[^0-9]*'
+                AND substr(authority_id, 1, 1) BETWEEN '1' AND '9'
+            ),
             projection_kind TEXT NOT NULL,
             aggregate_id TEXT NOT NULL,
             aggregate_version INTEGER NOT NULL,
@@ -162,8 +175,115 @@ def ensure_evidence_ledger_schema(conn: sqlite3.Connection) -> None:
             ON projection_outbox(status, next_retry_at, outbox_id);
         """
     )
+    _ensure_projection_outbox_authority(conn)
     _backfill_legacy_evidence(conn)
     _install_immutability_triggers(conn)
+    _install_hash_validation_triggers(conn)
+    ensure_memory_claim_schema(conn)
+    _install_memory_source_integrity_triggers(conn)
+
+
+def _ensure_projection_outbox_authority(conn: sqlite3.Connection) -> None:
+    """Make memory-job provenance explicit without changing transcript semantics."""
+
+    columns = {
+        str(row[1]): row
+        for row in conn.execute("PRAGMA table_info(projection_outbox)").fetchall()
+    }
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projection_outbox'"
+    ).fetchone()
+    table_sql = str(table_row[0]) if table_row is not None else ""
+    if (
+        "authority_kind" in columns
+        and "authority_id" in columns
+        and int(columns["event_seq"][3]) == 0
+        and "authority_id NOT GLOB '*[^0-9]*'" in table_sql
+        and "substr(authority_id, 1, 1) BETWEEN '1' AND '9'" in table_sql
+    ):
+        return
+
+    if "authority_kind" in columns and "authority_id" in columns:
+        invalid = conn.execute(
+            """
+            SELECT 1 FROM projection_outbox
+            WHERE authority_kind NOT IN ('event', 'legacy_record')
+               OR authority_id IS NULL
+               OR length(authority_id) = 0
+               OR authority_id GLOB '*[^0-9]*'
+               OR substr(authority_id, 1, 1) NOT BETWEEN '1' AND '9'
+            LIMIT 1
+            """
+        ).fetchone()
+    else:
+        invalid = conn.execute(
+            "SELECT 1 FROM projection_outbox WHERE event_seq IS NULL LIMIT 1"
+        ).fetchone()
+    if invalid is not None:
+        raise sqlite3.IntegrityError("projection outbox authority invalid")
+
+    conn.execute("DROP INDEX IF EXISTS idx_projection_outbox_pending")
+    conn.execute("ALTER TABLE projection_outbox RENAME TO projection_outbox_legacy")
+    conn.execute(
+        """
+        CREATE TABLE projection_outbox (
+            outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_seq INTEGER,
+            authority_kind TEXT NOT NULL
+                CHECK (authority_kind IN ('event', 'legacy_record')),
+            authority_id TEXT NOT NULL CHECK (
+                length(authority_id) > 0
+                AND authority_id NOT GLOB '*[^0-9]*'
+                AND substr(authority_id, 1, 1) BETWEEN '1' AND '9'
+            ),
+            projection_kind TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            aggregate_version INTEGER NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            lease_owner TEXT,
+            lease_until TEXT,
+            next_retry_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            applied_at TEXT,
+            UNIQUE(projection_kind, aggregate_id, aggregate_version)
+        )
+        """
+    )
+    if "authority_kind" in columns and "authority_id" in columns:
+        authority_select = """
+               CASE
+                   WHEN authority_kind = 'legacy_record' THEN 'legacy_record'
+                   ELSE 'event'
+               END,
+               COALESCE(NULLIF(trim(authority_id), ''), CAST(event_seq AS TEXT)),"""
+    else:
+        authority_select = """
+               'event',
+               CAST(event_seq AS TEXT),"""
+    conn.execute(
+        f"""
+        INSERT INTO projection_outbox(
+            outbox_id, event_seq, authority_kind, authority_id, projection_kind,
+            aggregate_id, aggregate_version, payload_sha256, status,
+            attempt_count, lease_owner, lease_until, next_retry_at, last_error,
+            created_at, applied_at
+        )
+        SELECT outbox_id, event_seq,
+               {authority_select}
+               projection_kind, aggregate_id, aggregate_version, payload_sha256,
+               status, attempt_count, lease_owner, lease_until, next_retry_at,
+               last_error, created_at, applied_at
+        FROM projection_outbox_legacy
+        """
+    )
+    conn.execute("DROP TABLE projection_outbox_legacy")
+    conn.execute(
+        "CREATE INDEX idx_projection_outbox_pending "
+        "ON projection_outbox(status, next_retry_at, outbox_id)"
+    )
 
 
 def _install_immutability_triggers(conn: sqlite3.Connection) -> None:
@@ -210,13 +330,91 @@ def _install_immutability_triggers(conn: sqlite3.Connection) -> None:
     )
 
 
+def _install_hash_validation_triggers(conn: sqlite3.Connection) -> None:
+    """Reject malformed hashes on the append-only revision table."""
+    _execute_script_without_implicit_commit(conn, """
+        CREATE TRIGGER IF NOT EXISTS validate_event_revisions_hashes_insert
+        BEFORE INSERT ON event_revisions
+        WHEN length(NEW.content_sha256) <> 64 OR NEW.content_sha256 GLOB '*[^0-9a-f]*'
+        BEGIN SELECT RAISE(ABORT, 'event revision hashes must be lowercase hex'); END;
+    """)
+
+
+def _install_memory_source_integrity_triggers(conn: sqlite3.Connection) -> None:
+    """Bind memory sources to their persisted authority commitments."""
+    _execute_script_without_implicit_commit(conn, """
+        CREATE TRIGGER IF NOT EXISTS validate_memory_event_source_insert
+        BEFORE INSERT ON memory_claim_sources
+        WHEN NEW.source_kind = 'event' AND NOT EXISTS (
+            SELECT 1 FROM events e
+            WHERE e.event_id = NEW.event_id
+              AND e.source_revision = NEW.event_revision
+              AND e.payload_sha256 = NEW.event_payload_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'event source commitment mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS validate_memory_legacy_source_insert
+        BEFORE INSERT ON memory_claim_sources
+        WHEN NEW.source_kind = 'legacy_record' AND NOT EXISTS (
+            SELECT 1 FROM memory_records r
+            WHERE r.record_id = NEW.legacy_record_id
+              AND r.status = 'approved'
+              AND pcltm_sha256(r.content) = NEW.legacy_content_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy source commitment mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_legacy_source_projection_guard_update
+        BEFORE UPDATE ON memory_records
+        WHEN EXISTS (
+            SELECT 1
+            FROM memory_claim_sources s
+            JOIN memory_claim_versions v
+              ON v.claim_version_id = s.claim_version_id
+            JOIN memory_projection_guards pg
+              ON pg.claim_id = v.claim_id
+            WHERE s.source_kind = 'legacy_record'
+              AND s.legacy_record_id IN (OLD.record_id, NEW.record_id)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy memory source projection guarded');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_legacy_source_projection_guard_delete
+        BEFORE DELETE ON memory_records
+        WHEN EXISTS (
+            SELECT 1
+            FROM memory_claim_sources s
+            JOIN memory_claim_versions v
+              ON v.claim_version_id = s.claim_version_id
+            JOIN memory_projection_guards pg
+              ON pg.claim_id = v.claim_id
+            WHERE s.source_kind = 'legacy_record'
+              AND s.legacy_record_id = OLD.record_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy memory source projection guarded');
+        END;
+    """)
+
+
 def _backfill_legacy_evidence(conn: sqlite3.Connection) -> None:
     """Deterministically enroll legacy events into the v9 evidence chain."""
     rows = conn.execute(
         """
-        SELECT e.*, i.external_id, i.source_hash, i.payload_metadata
+        SELECT e.*,
+               i.external_id AS ingest_external_id,
+               i.source_hash AS ingest_source_hash,
+               i.payload_metadata AS ingest_payload_metadata,
+               r.source_hash AS revision_source_hash,
+               r.payload_metadata AS revision_payload_metadata
         FROM events e
         LEFT JOIN ingest_events i ON i.event_id = e.event_id
+        LEFT JOIN event_revisions r
+          ON r.event_id = e.event_id AND r.source_revision = e.source_revision
         ORDER BY e.event_id ASC
         """
     ).fetchall()
@@ -229,26 +427,25 @@ def _backfill_legacy_evidence(conn: sqlite3.Connection) -> None:
     migrated_events: list[tuple[int, str, str, int]] = []
     for row in rows:
         event_id = int(row["event_id"])
-        if row["chain_hash"] and row["payload_sha256"]:
-            previous_hash = str(row["chain_hash"])
-            first_event_id = event_id if first_event_id is None else first_event_id
-            last_event_id = event_id
-            count += 1
-            continue
         content = str(row["content"])
-        recorded_at = str(row["created_at"])
+        recorded_at = str(row["recorded_at"] or row["created_at"])
         payload_sha256 = sha256_text(content)
-        external_id = row["external_id"]
-        source_created_at = None
-        if row["payload_metadata"]:
+        has_chain_envelope = bool(row["payload_sha256"] and row["chain_hash"])
+        external_id = row["external_event_id"] if has_chain_envelope else row["ingest_external_id"]
+        source_revision = int(row["source_revision"] or 1)
+        source_created_at = row["source_created_at"] if has_chain_envelope else None
+        payload_metadata = row["revision_payload_metadata"] if has_chain_envelope else row["ingest_payload_metadata"]
+        if source_created_at is None and payload_metadata:
             try:
                 import json
-                metadata = json.loads(row["payload_metadata"])
+                metadata = json.loads(payload_metadata)
                 source_created_at = normalize_source_created_at(
                     metadata.get("timestamp") or metadata.get("created_at")
                 )
             except (TypeError, ValueError):
                 source_created_at = None
+        visibility = row["visibility"] if has_chain_envelope else row["inject_policy"]
+        source_hash = row["revision_source_hash"] if has_chain_envelope else row["ingest_source_hash"]
         resolved_chain_hash = chain_hash(
             previous_chain_hash=previous_hash,
             event_id=event_id,
@@ -259,16 +456,41 @@ def _backfill_legacy_evidence(conn: sqlite3.Connection) -> None:
             source=str(row["source"]),
             payload_sha256=payload_sha256,
             recorded_at=recorded_at,
-            schema_version=9,
+            schema_version=int(row["schema_version"] or 9),
             external_event_id=external_id,
-            source_revision=1,
+            source_revision=source_revision,
             source_created_at=source_created_at,
+            turn_id=row["turn_id"],
+            parent_event_id=row["parent_event_id"],
             sensitivity=str(row["sensitivity"]),
             category=str(row["category"]),
             subcategory=str(row["subcategory"]),
-            visibility=str(row["inject_policy"]),
-            source_hash=row["source_hash"],
+            visibility=str(visibility),
+            source_hash=source_hash,
         )
+
+        existing_payload_sha256 = str(row["payload_sha256"] or "")
+        existing_previous_hash = str(row["previous_chain_hash"] or "")
+        existing_chain_hash = str(row["chain_hash"] or "")
+        expected_previous_hash = previous_hash or ""
+        validations = (
+            ("payload_sha256_mismatch", existing_payload_sha256, payload_sha256),
+            ("previous_chain_hash_mismatch", existing_previous_hash, expected_previous_hash),
+            ("chain_hash_mismatch", existing_chain_hash, resolved_chain_hash),
+        )
+        for reason, existing_value, expected_value in validations:
+            if existing_value and existing_value != expected_value:
+                raise RuntimeError(
+                    f"legacy evidence chain validation failed at event {event_id}: {reason}"
+                )
+
+        if existing_payload_sha256 and existing_chain_hash:
+            previous_hash = existing_chain_hash
+            first_event_id = event_id if first_event_id is None else first_event_id
+            last_event_id = event_id
+            count += 1
+            continue
+
         conn.execute(
             """
             UPDATE events
@@ -291,8 +513,8 @@ def _backfill_legacy_evidence(conn: sqlite3.Connection) -> None:
                 ) VALUES (?, 1, ?, ?, ?)
                 """,
                 (
-                    event_id, str(row["source_hash"] or "legacy-unknown"),
-                    payload_sha256, str(row["payload_metadata"] or "{}"),
+                    event_id, str(row["ingest_source_hash"] or "legacy-unknown"),
+                    payload_sha256, str(row["ingest_payload_metadata"] or "{}"),
                 ),
             )
         previous_hash = resolved_chain_hash
@@ -321,11 +543,16 @@ def _backfill_legacy_evidence(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO projection_outbox (
-                    event_seq, projection_kind, aggregate_id, aggregate_version,
-                    payload_sha256, status, applied_at
-                ) VALUES (?, ?, ?, ?, ?, 'applied', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    event_seq, authority_kind, authority_id, projection_kind,
+                    aggregate_id, aggregate_version, payload_sha256, status,
+                    applied_at
+                ) VALUES (?, 'event', ?, ?, ?, ?, ?, 'applied',
+                          strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 """,
-                (event_id, projection_kind, str(event_id), source_revision, payload_sha256),
+                (
+                    event_id, str(event_id), projection_kind, str(event_id),
+                    source_revision, payload_sha256,
+                ),
             )
     conn.execute(
         """

@@ -66,6 +66,7 @@ class SemanticModeClassifier:
         previous_mode: str | None = None,
         platform: str = "cli",
     ) -> dict:
+        semantic_override = self._local_semantic_intent(user_message)
         decision = self.rule_probe.classify(
             user_message=user_message,
             recent_messages=recent_messages,
@@ -84,20 +85,73 @@ class SemanticModeClassifier:
             if key in decision.signals
         }
         result = {
-            "primary_mode": decision.mode,
-            "submode": decision.submode,
-            "confidence": decision.confidence,
+            "primary_mode": semantic_override.get("primary_mode", decision.mode),
+            "submode": semantic_override.get("submode", decision.submode),
+            "confidence": semantic_override.get("confidence", decision.confidence),
             "secondary_modes": [],
             "safety_flags": decision.safety_flags,
-            "intent_signals": intent_signals,
-            "reason_codes": self._reason_codes(decision),
+            "intent_signals": {**intent_signals, **semantic_override.get("intent_signals", {})},
+            "reason_codes": semantic_override.get("reason_codes", self._reason_codes(decision)),
             "backend": "deterministic-local-shadow",
             "shadow_only": True,
             "previous_mode": previous_mode,
+            "intent": semantic_override.get("intent", "rule_observation"),
+            "objects": semantic_override.get("objects", []),
         }
         if decision.mode == "work" and self._contains_affective_marker(user_message):
             result["affective_overlay"] = "daily"
         return result
+
+    @staticmethod
+    def _local_semantic_intent(user_message: str) -> dict:
+        """Resolve high-precision action/object and conversational meanings."""
+        text = "".join((user_message or "").lower().split())
+        relationship_objects = ("感情", "关系", "战友情", "友谊", "亲密", "陪伴")
+        technical_objects = (
+            "系统", "服务器", "数据库", "服务", "代码", "网关", "gateway",
+            "runtime", "生产环境", "部署", "进程", "接口", "api", "文件",
+        )
+        relationship_hits = [item for item in relationship_objects if item in text]
+        technical_hits = [item for item in technical_objects if item in text]
+        if "维护" in text and relationship_hits and not technical_hits:
+            return {
+                "primary_mode": "daily",
+                "submode": "relationship_closeness",
+                "confidence": 0.94,
+                "intent": "relationship_bonding",
+                "objects": relationship_hits,
+                "intent_signals": {
+                    "explicit_daily_intent": True,
+                    "continuation_of_previous_task": False,
+                    "technical_context": False,
+                },
+                "reason_codes": ["SEMANTIC_ACTION_OBJECT:relationship_bonding"],
+            }
+        if technical_hits:
+            return {
+                "intent": "technical_context",
+                "objects": technical_hits,
+                "intent_signals": {"technical_context": True},
+            }
+        conversational_questions = (
+            "你喜欢吃什么", "你爱吃什么", "你今天怎么样", "你在想什么",
+            "你喜欢什么", "你想吃什么", "你累不累", "你开心吗",
+        )
+        if any(phrase in text for phrase in conversational_questions):
+            return {
+                "primary_mode": "daily",
+                "submode": "conversation",
+                "confidence": 0.91,
+                "intent": "social_conversation",
+                "objects": [],
+                "intent_signals": {
+                    "explicit_daily_intent": True,
+                    "continuation_of_previous_task": False,
+                    "technical_context": False,
+                },
+                "reason_codes": ["SEMANTIC_CONVERSATION:personal_question"],
+            }
+        return {}
 
     # Sentiment label -> candidate mode when rules miss (fallback to daily).
     # Only applied when model confidence exceeds SENTIMENT_CORRECTION_THRESHOLD.
@@ -209,11 +263,18 @@ class SemanticModeClassifier:
 
     @staticmethod
     def _load_default_sentiment_analyzer():
+        # Prefer the package-qualified import: production and the emotion
+        # warmup use persona_engine.sentiment_analyzer, so this must resolve
+        # to the SAME module/singleton. Importing the top-level name first can
+        # load the same file under a second module name (when
+        # packages/persona_engine is on sys.path), yielding two SentimentAnalyzer
+        # classes with independent singletons -- the shadow path would then read
+        # a cold _available=False even after warmup succeeded.
         try:
-            from sentiment_analyzer import SentimentAnalyzer
+            from persona_engine.sentiment_analyzer import SentimentAnalyzer
         except ImportError:
             try:
-                from persona_engine.sentiment_analyzer import SentimentAnalyzer
+                from sentiment_analyzer import SentimentAnalyzer
             except Exception:
                 return None
         try:

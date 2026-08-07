@@ -13,6 +13,11 @@ from .candidate import (
 )
 from .conflict_filter import ConflictAction, ConflictDecision, ConflictFilter
 from .context_packet import ContextPacket, InjectionAudit, build_context_packet
+from .governed_memory import (
+    GovernedInjectionResult,
+    GovernedInjectionStatus,
+    build_governed_memory_context,
+)
 
 __all__ = [
     "ArbitrationInput",
@@ -29,9 +34,12 @@ __all__ = [
     "InjectionArbitrator",
     "InjectionAudit",
     "InjectionCandidate",
+    "GovernedInjectionResult",
+    "GovernedInjectionStatus",
     "RiskFlag",
     "arbitrate_injection",
     "build_context_packet",
+    "build_governed_memory_context",
     "estimate_token_cost",
     "normalize_candidate",
 ]

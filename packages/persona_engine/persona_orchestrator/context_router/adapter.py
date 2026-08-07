@@ -89,7 +89,7 @@ class AbstractStateAdapter:
         # Context signals
         if self._is_relationship_context(mode, submode, signals):
             tags.append("relationship_context")
-        if signals.get("sex_scene_continue"):
+        if signals.get("sex_scene_continue") or signals.get("contextual_continuation"):
             tags.append("continuation_cue")
         if self._is_progression(mode, submode, signals):
             tags.append("progression_setup")
@@ -248,18 +248,3 @@ class AbstractStateAdapter:
         if signals.get("sex_scene_continue") and not signals.get("sex_scene_close"):
             return True
         return False
-
-    @staticmethod
-    def _default_model_map() -> dict[str, str]:
-        """Default model selection map. Reads from router config at runtime."""
-        return {
-            "work": "claude-opus-4-6",
-            "work:route_inspection": "claude-opus-4-6",
-            "work:code_change": "claude-opus-4-6",
-            "relationship": "claude-opus-4-6",
-            "relationship:daily": "claude-opus-4-6",
-            "relationship:affectionate": "claude-opus-4-6",
-            "relationship:confirmed_intimacy": "claude-opus-4-6",
-            "relationship:cooldown": "claude-opus-4-6",
-            "default": "claude-opus-4-6",
-        }

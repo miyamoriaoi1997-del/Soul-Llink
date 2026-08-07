@@ -11,10 +11,11 @@ source of truth or derived state.
 | Surface | Role | Source of truth? | Rebuildable? |
 | --- | --- | --- | --- |
 | `events` / `summary_nodes` in SQLite | Raw evidence and compressed evidence graph | Yes for captured runtime evidence | No, unless the upstream transcript still exists |
-| `memory_records` in SQLite | Governed memory candidates and approved durable facts | Yes for tool writes and reviewer decisions | No, except from explicit review/export artifacts |
-| MemFS (`system/`, `pinned/`, `episodic/`, `transient/`, `skills/`) | Human-readable memory view and review surface | Yes when a record is promoted to a managed memory file | Partially; files are themselves the reviewable artifact |
-| SQLite FTS tables (`event_fts`, `summary_fts`) | Search acceleration over SQLite evidence | No; derived index | Yes, from SQLite source tables |
-| In-memory BM25 (`SemanticIndex`) | Prompt-time lexical retrieval over approved records | No; derived index | Yes, from `memory_records.status=approved` |
+| `memory_claims` / `memory_current` / `memory_governance_events` in SQLite | Versioned governed claims, current lifecycle tuples, and decision receipts | Yes for durable governed memory | No; preserve with SQLite online backup |
+| `memory_records` in SQLite | Legacy evidence and migration inventory | No runtime authority | Not applicable; classify/shadow only, never fallback |
+| MemFS (`system/`, `pinned/`, `episodic/`, `transient/`, `skills/`) | Human-readable projection and bounded transient/tool evidence | No for governed durable claims | Yes; rebuild governed files from SQLite authority |
+| SQLite FTS tables (`event_fts`, `summary_fts`, governed-memory FTS) | Search acceleration | No; derived index | Yes, from canonical SQLite source tables |
+| Optional lexical/vector/neural indexes | Candidate retrieval experiments | No; derived and subordinate | Yes; never promotion or injection authority |
 
 Derived state must never become the only copy of a durable memory.  A failed or
 stale index is an observability problem, not permission to invent memory content.
@@ -39,7 +40,7 @@ profile:<profile_id>/app:<app_id>/project:<project_id>/persona:<persona_id>/user
 Example:
 
 ```text
-profile:default/app:hermes-desktop/project:soullink-pcltm/persona:example-persona-rin/user:example-user/modes:cron+work
+profile:example/app:example-agent/project:example-project/persona:example-persona/user:example-user/modes:daily+work
 ```
 
 Rules:
@@ -61,7 +62,7 @@ Recommended canonical form:
 
 ## Runtime boundaries
 
-- SoulLink-managed SOUL identity remains higher authority than memory records.
+- SoulLink-managed SOUL identity remains higher authority than governed memory.
 - Mode layers (`daily`, `work`, `sex`, `cron`) narrow retrieval; they do not
   redefine identity.
 - Compression and handoff blocks are reference-only and must not become active
@@ -83,12 +84,15 @@ The commands report:
 
 - SQLite source row counts;
 - SQLite FTS derived row counts;
-- approved-memory BM25 record count;
+- governed-memory derived-index count;
 - MemFS file counts by layer;
 - mismatch issues that require rebuild.
 
-`--rebuild` only rebuilds derived SQLite FTS tables.  It must not edit durable
-memory content, MemFS files, SOUL templates, or reviewer decisions.
+`pcltm index doctor --rebuild` rebuilds only the index scope stated by that
+command. Full governed projection restore uses the separate restore rehearsal
+service: verify backup/config/Git commitments, restore SQLite, rebuild governed
+FTS and MemFS, and verify lifecycle/projection receipts. Neither path may edit
+durable claim content, SOUL templates, or reviewer decisions.
 
 ## EverOS ideas deliberately not adopted
 

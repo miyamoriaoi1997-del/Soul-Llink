@@ -1,4 +1,4 @@
-# SoulLink Public 2.1
+# SoulLink Public 2.2
 
 **Persistent identity, continuous emotion, governed memory, and auditable context for long-running AI personas.**
 
@@ -40,7 +40,7 @@ The dashboard opens at `http://127.0.0.1:8765/`. Core runtime use does not requi
 For a packaged install, download the wheel from the [latest GitHub Release](https://github.com/miyamoriaoi1997-del/Soul-Llink/releases/latest), verify `SHA256SUMS.txt`, then run:
 
 ```bash
-python -m pip install soullink_public-2.1.0-py3-none-any.whl
+python -m pip install soullink_public-2.2.0-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -218,7 +218,7 @@ python -m venv .venv
 # Windows PowerShell
 # .venv\Scripts\Activate.ps1
 
-python -m pip install soullink_public-2.1.0-py3-none-any.whl
+python -m pip install soullink_public-2.2.0-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -266,6 +266,7 @@ The wheel installs the core commands plus managed Hermes and Codex adapter comma
 | `soullink-continuity-gate` | Evaluate pinned continuity artifacts using deployment-owned baselines and policy |
 | `soullink-host-adapt` | Detect, apply, verify, and roll back a versioned host patchset |
 | `soullink-hermes-deploy` | Managed Hermes deployment lifecycle |
+| `soullink-hermes-update` | Lossless Hermes update transaction with recovery and rollback evidence |
 | `soullink-codex-deploy` | Detect, apply, verify, and byte-exactly roll back a Codex installation |
 | `soullink-codex-mcp` | SoulLink/PCLTM STDIO MCP server used by Codex |
 | `soullink-codex-hook` | Codex lifecycle hook entrypoint |
@@ -560,4 +561,4 @@ python scripts/public_release_audit.py --root .
 
 ## License
 
-SoulLink Public 2.1 is released under the MIT License. See [LICENSE](LICENSE).
+SoulLink Public 2.2 is released under the MIT License. See [LICENSE](LICENSE).

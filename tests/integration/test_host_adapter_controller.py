@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -247,6 +248,85 @@ def test_repository_hermes_manifest_loads_patch_and_all_patch_targets() -> None:
         "tests/agent/test_context_request_budget.py",
         "tests/agent/test_pcltm_context_budget.py",
     )
+
+
+def test_repository_soullink_runtime_manifest_owns_every_live_host_delta() -> None:
+    root = Path(__file__).resolve().parents[2]
+    manifest = CompatibilityManifest.load(
+        root / "adapters/hermes/compatibility-soullink-runtime.yaml"
+    )
+
+    assert manifest.host == "hermes-agent"
+    assert manifest.adapter_version == "soullink-runtime-v3-upstream-01a1037"
+    patch_text = manifest.patch_path.read_text(encoding="utf-8")
+    patch_targets = tuple(re.findall(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE))
+    assert set(patch_targets) == set(manifest.required_paths + manifest.created_paths)
+    assert "agent/memory_authority.py" in manifest.created_paths
+    assert "tests/agent/test_exclusive_memory_authority_contract.py" in manifest.created_paths
+    assert "tests/agent/test_soullink_memory_authority_adapter.py" in manifest.created_paths
+    assert "agent/memory_manager.py" in manifest.required_paths
+    assert "agent/verification_stop.py" in manifest.required_paths
+    assert "hermes_cli/subcommands/memory.py" in manifest.required_paths
+
+
+def test_repository_context_budget_propagation_manifest_is_bounded() -> None:
+
+    root = Path(__file__).resolve().parents[2]
+    manifest = CompatibilityManifest.load(
+        root / "adapters/hermes/compatibility-context-budget-propagation.yaml"
+    )
+
+    assert manifest.host == "hermes-agent"
+    assert manifest.required_paths == (
+        "agent/agent_init.py",
+        "tests/run_agent/test_plugin_context_engine_init.py",
+    )
+    assert manifest.created_paths == ()
+    patch_text = manifest.patch_path.read_text(encoding="utf-8")
+    assert all(
+        f"diff --git a/{path} b/{path}" in patch_text
+        for path in manifest.required_paths
+    )
+    assert "_configure_context_engine(_ctx_cfg)" in patch_text
+    assert "test_plugin_engine_gets_context_config_before_model_metadata" in patch_text
+
+
+def test_repository_model_router_manifest_owns_detached_turn_overrides() -> None:
+    root = Path(__file__).resolve().parents[2]
+    manifest = CompatibilityManifest.load(
+        root / "adapters/hermes/compatibility-model-router-v3.yaml"
+    )
+
+    assert manifest.host == "hermes-agent"
+    assert "tests/run_agent/test_run_agent.py" in manifest.required_paths
+    patch_text = manifest.patch_path.read_text(encoding="utf-8")
+    patch_targets = tuple(re.findall(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE))
+    assert set(patch_targets) == set(manifest.required_paths + manifest.created_paths)
+    assert "copy.deepcopy(agent.request_overrides or {})" in patch_text
+    assert "test_current_turn_request_overrides_do_not_mutate_agent_config" in patch_text
+
+
+def test_repository_verification_guidance_manifest_is_bounded() -> None:
+    root = Path(__file__).resolve().parents[2]
+    manifest = CompatibilityManifest.load(
+        root / "adapters/hermes/compatibility-verification-guidance.yaml"
+    )
+
+    assert manifest.host == "hermes-agent"
+    assert manifest.required_paths == (
+        "agent/verification_evidence.py",
+        "agent/verification_stop.py",
+        "tests/agent/test_verification_evidence.py",
+        "tests/agent/test_verification_stop.py",
+    )
+    assert manifest.created_paths == ()
+    patch_text = manifest.patch_path.read_text(encoding="utf-8")
+    assert all(
+        f"diff --git a/{path} b/{path}" in patch_text
+        for path in manifest.required_paths
+    )
+    assert "_verification_scope_instruction" in patch_text
+    assert "test_quoted_windows_temp_script_records_ad_hoc_evidence" in patch_text
 
 
 def test_detect_rejects_required_path_through_symlink_escape(tmp_path: Path) -> None:

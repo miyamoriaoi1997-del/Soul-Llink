@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from .live_context_evidence import build_tool_evidence_capsules
-from .memory_selection_probe import build_probe_report
+
 from .state import (
     ActiveDialogueState,
     DialogueTurn,
@@ -471,8 +471,12 @@ class PCLTMContextEngine:
         debug_memory_probe: bool = False,
         active_dialogue_state: ActiveDialogueState | None = None,
         session_summary_chain: SessionSummaryChain | None = None,
+        session_id: str = "",
+        turn_id: str = "",
     ) -> None:
         self.mode = mode
+        self.session_id = session_id
+        self.turn_id = turn_id
         self.tail_limit = tail_limit
         self.debug_memory_probe = debug_memory_probe
         self.active_dialogue_state = active_dialogue_state
@@ -591,12 +595,11 @@ class PCLTMContextEngine:
 
         debug_sidecars: dict[str, Any] = {"tool_evidence": tool_evidence_telemetry}
         if self.debug_memory_probe:
-            debug_sidecars["memory_selection_probe"] = build_probe_report(
-                "user",
-                mode=self.mode,
-                emotion_axes=set(),
-                budget_available=None,
-            )
+            debug_sidecars["memory_selection_probe"] = {
+                "status": "retired",
+                "bodyless": True,
+                "reason": "legacy_memory_selection_probe_not_runtime_authority",
+            }
 
         return PCLTMContext(
             mode=self.mode,

@@ -86,6 +86,26 @@ class TestLowRiskPairActivation:
 
         assert result.authority_source == "new_table"
 
+    def test_new_table_result_preserves_caller_safety_flags(self):
+        """Bounded results must retain flags supplied at the transition boundary."""
+        manager = TransitionManagerV2(enable_bounded_activation=True, enable_shadow_table=True)
+
+        decision = Mock()
+        decision.mode = "work"
+        decision.confidence = 0.8
+        decision.submode = None
+        decision.safety_flags = []
+        decision.signals = {"explicit_task_request": True}
+
+        result = manager.transition(
+            previous_mode="daily",
+            decision=decision,
+            safety_flags=["repair_guard"],
+        )
+
+        assert result.authority_source == "new_table"
+        assert result.safety_flags == ["repair_guard"]
+
 
 class TestProtectedPairLegacyAuthority:
     """Test that protected/high-risk pairs continue using legacy."""
@@ -149,6 +169,46 @@ class TestProtectedPairLegacyAuthority:
 
         # Crisis is high-risk - must use legacy
         assert result.authority_source == "legacy"
+
+    def test_crisis_flag_on_decision_uses_legacy_without_duplicate_argument(self):
+        """Decision-owned crisis flags must fail closed at the authority gate."""
+        manager = TransitionManagerV2(enable_bounded_activation=True, enable_shadow_table=True)
+
+        decision = Mock()
+        decision.mode = "daily"
+        decision.confidence = 0.9
+        decision.submode = "crisis"
+        decision.safety_flags = ["crisis_guard"]
+        decision.signals = {"message_length": 10}
+
+        result = manager.transition(
+            previous_mode="work",
+            decision=decision,
+        )
+
+        assert result.authority_source == "legacy"
+
+    def test_caller_crisis_flag_is_visible_to_shadow_force_mapping(self):
+        """Shadow telemetry must consume the same merged flags as authority gating."""
+        manager = TransitionManagerV2(enable_bounded_activation=True, enable_shadow_table=True)
+        original_decide = manager.shadow_table.decide
+        manager.shadow_table.decide = Mock(wraps=original_decide)
+
+        decision = Mock()
+        decision.mode = "daily"
+        decision.confidence = 0.9
+        decision.submode = "crisis"
+        decision.safety_flags = []
+        decision.signals = {"message_length": 10}
+
+        result = manager.transition(
+            previous_mode="work",
+            decision=decision,
+            safety_flags=["crisis_guard"],
+        )
+
+        assert result.authority_source == "legacy"
+        assert manager.shadow_table.decide.call_args.kwargs["force_event"] is ForceEvent.CRISIS
 
 
 class TestFailureRollback:

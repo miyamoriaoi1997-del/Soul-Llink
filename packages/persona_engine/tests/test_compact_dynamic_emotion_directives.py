@@ -26,10 +26,10 @@ def test_modifier_uses_a_bounded_compact_directive_and_keeps_public_control_anch
 
     block = EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
-    assert len(block) <= 700
-    assert "【强度】" not in block
+    assert len(block) <= 900
+    assert "【强度】overwhelming/positive" in block
     assert "【维度】" not in block
-    assert "【锚点】身份/事实/工具纪律不变" in block
+    assert "【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。" in block
     assert "不覆盖work或crisis边界" in block
 
 
@@ -52,8 +52,8 @@ def test_visibility_and_self_control_change_continuously_within_one_tier(tmp_pat
     )
     high = EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
-    assert "【表达】可见度=0.20；自控=0.80" in low
-    assert "【表达】可见度=0.23；自控=0.77" in high
+    assert "可见度=36%；自控=64%" in low
+    assert "可见度=48%；自控=52%" in high
 
 
 def test_mild_intense_and_overwhelming_directives_raise_expression_pressure_monotonically(tmp_path):
@@ -68,16 +68,17 @@ def test_mild_intense_and_overwhelming_directives_raise_expression_pressure_mono
         return EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
     mild = render(76)
-    intense = render(108)
+    intense = render(96)
     overwhelming = render(150)
 
-    def visibility(block: str) -> float:
-        return float(block.split("【表达】可见度=", 1)[1].split("；", 1)[0])
+    def visibility(block: str) -> int:
+        return int(block.split("可见度=", 1)[1].split("%", 1)[0])
 
     assert visibility(mild) < visibility(intense) < visibility(overwhelming)
-    assert "【压力】" in mild
-    assert "【压力】" in intense
-    assert "【压力】强反应聚焦；不可压成中性。" in overwhelming
+    assert "【强度】moderate/positive" in mild
+    assert "【强度】intense/positive" in intense
+    assert "【强度】overwhelming/positive" in overwhelming
+    assert "只抓最核心的一种反应" in overwhelming
 
 
 def test_stable_state_omits_residue_but_retains_the_control_anchor(tmp_path):
@@ -91,8 +92,8 @@ def test_stable_state_omits_residue_but_retains_the_control_anchor(tmp_path):
     manager = EmotionStateManager(hermes_home=tmp_path)
     block = manager.get_tone_modifiers()
 
-    assert "【余温】" not in block
-    assert "【锚点】身份/事实/工具纪律不变" in block
+    assert "【轨迹】" in block
+    assert "【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。" in block
 
 
 def test_relationship_gate_rejects_patience_only_peak(tmp_path):
@@ -107,7 +108,7 @@ def test_relationship_gate_rejects_patience_only_peak(tmp_path):
 
     block = EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
-    assert "【关系】保持当前距离" in block
+    assert "【关系】" not in block
 
 
 def test_relationship_gate_needs_trigger_desire_and_relationship_axis_evidence(tmp_path):
@@ -122,4 +123,5 @@ def test_relationship_gate_needs_trigger_desire_and_relationship_axis_evidence(t
 
     block = EmotionStateManager(hermes_home=tmp_path).get_tone_modifiers()
 
-    assert "【关系】允许推进" in block
+    assert "【关系】显性/ambivalent" in block
+    assert "不自行升级场景" in block

@@ -1,7 +1,7 @@
 """Tests for Phase 4 Task 4.3: Comprehensive evaluation metrics."""
 
 import pytest
-from packages.persona_engine.persona_orchestrator.evaluation_metrics import (
+from persona_orchestrator.evaluation_metrics import (
     MetricsCalculator,
     TransitionResult,
     SequenceResult,

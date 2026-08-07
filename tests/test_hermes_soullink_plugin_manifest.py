@@ -25,12 +25,15 @@ def test_soullink_manifest_uses_host_recognized_exclusive_kind(caplog):
     repo_root = Path(__file__).resolve().parents[1]
     manifest_paths = (
         repo_root / "adapters/hermes/soullink-plugin.yaml",
-        repo_root / "adapters/hermes/memory_provider/plugin.yaml",
+        repo_root / "soul_link/hermes_assets/memory/plugin.yaml",
+        repo_root / "adapters/hermes/plugin/memory/plugin.yaml",
     )
     for manifest_path in manifest_paths:
         data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
         assert data["name"] == "soullink"
         assert data["kind"] == "exclusive"
+        assert data["authority"] == "soullink/pcltm"
+        assert set(data["blocked_host_tools"]) == {"memory", "session_search"}
 
     manager = PluginManager()
     with caplog.at_level(logging.WARNING):

@@ -41,6 +41,7 @@ OPEN_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "Memory id returned by search."},
             "body_limit": {"type": "integer", "description": "Maximum body characters, default 4000."},
+            "mode": {"type": "string", "description": "Optional persona mode; defaults to the provider's current mode."},
         },
         "required": ["memory_id"],
     },
@@ -99,6 +100,8 @@ class PCLTMMemoryTools:
                 )
             except Exception:
                 return self._unavailable()
+            if isinstance(results, Mapping) and "status" in results:
+                return self._json({"success": True, **dict(results)})
             return self._json({"success": True, "results": results})
 
         if tool_name == EXACT_RECALL_SCHEMA["name"]:
@@ -127,9 +130,12 @@ class PCLTMMemoryTools:
                 opened = self._open_memory(
                     memory_id=memory_id,
                     body_limit=body_limit,
+                    mode=args.get("mode"),
                 )
             except Exception:
                 return self._unavailable()
+            if isinstance(opened, Mapping) and "status" in opened:
+                return self._json({"success": True, **dict(opened)})
             return self._json({"success": True, "memory": opened})
 
         if tool_name == REMEMBER_SCHEMA["name"]:
@@ -140,10 +146,12 @@ class PCLTMMemoryTools:
             if target not in {"user", "memory"}:
                 return self._error("target must be user or memory")
             try:
-                ok = self._remember(target=target, action="add", content=content)
+                remembered = self._remember(target=target, action="add", content=content)
             except Exception:
                 return self._unavailable()
-            return self._json({"success": bool(ok), "target": target})
+            if isinstance(remembered, Mapping):
+                return self._json(dict(remembered))
+            return self._json({"success": bool(remembered), "target": target})
 
         return self._error(f"unknown tool: {tool_name}")
 

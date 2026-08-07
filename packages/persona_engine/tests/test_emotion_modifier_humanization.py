@@ -130,10 +130,10 @@ def test_emotion_manager_modifier_preserves_desire_first_and_emotion_last(tmp_pa
 
     block = mgr.get_tone_modifiers()
 
-    assert block.strip().startswith("<emotion_modifier>\n【欲望】")
+    assert block.strip().startswith("<emotion_modifier>\n【状态】")
     assert block.strip().endswith("</emotion_modifier>")
-    assert "【情绪】" in block
-    assert "【表达】可见度=" in block
+    assert "【强度】" in block
+    assert "可见度=" in block
 
 
 def test_mixed_emotion_blend_exposes_core_tension_and_regulation_strategy():
@@ -175,11 +175,10 @@ def test_emotion_manager_modifier_contains_integrated_blend_before_dimension_lin
 
     block = mgr.get_tone_modifiers()
 
-    assert "【欲望】" in block
-    assert "【情绪】" in block
-    assert "【表达】" in block
-    assert "【锚点】" in block
-    assert block.index("【欲望】") < block.index("【情绪】") < block.index("【表达】") < block.index("【锚点】")
+    for label in ("【状态】", "【强度】", "【执行】", "【轨迹】", "【关系】", "【边界】"):
+        assert label in block
+    assert block.index("【状态】") < block.index("【强度】") < block.index("【执行】")
+    assert block.index("【执行】") < block.index("【轨迹】") < block.index("【边界】")
 
 
 def test_emotion_blend_handles_involved_but_impatient_tension():
@@ -311,10 +310,10 @@ def test_emotion_manager_modifier_includes_appraisal_before_aftereffect(tmp_path
 
     block = mgr.get_tone_modifiers()
 
-    assert "【欲望】" in block
-    assert "【触发】" in block
-    assert "【锚点】" in block
-    assert block.index("【欲望】") < block.index("【触发】") < block.index("【锚点】")
+    assert "【状态】" in block
+    assert "触发=被需要" in block
+    assert "【边界】" in block
+    assert block.index("【状态】") < block.index("【强度】") < block.index("【边界】")
 
 
 def test_emotion_momentum_classifies_rising_recovery_and_interruption_contexts():
@@ -374,10 +373,10 @@ def test_emotion_manager_passes_state_momentum_fields_into_modifier(tmp_path):
 
     block = mgr.get_tone_modifiers()
 
-    assert "【情绪】" in block
-    assert "【表达】可见度=" in block
-    assert "【锚点】" in block
-    assert block.index("【情绪】") < block.index("【表达】") < block.index("【锚点】")
+    assert "【状态】" in block
+    assert "【强度】" in block and "可见度=" in block
+    assert "【边界】" in block
+    assert block.index("【状态】") < block.index("【强度】") < block.index("【边界】")
 
 
 def test_emotion_blend_handles_exhausted_trust_without_pushing_away():
@@ -415,10 +414,10 @@ def test_emotion_manager_modifier_includes_behavior_axes_without_scenario_hardco
 
     block = mgr.get_tone_modifiers()
 
-    assert "【欲望】" in block
-    assert "【情绪】" in block
-    assert "【锚点】" in block
-    assert "身份/事实/工具纪律不变" in block
+    assert "【状态】受伤后的控制欲" in block
+    assert "【执行】" in block
+    assert "【边界】" in block
+    assert "身份、事实、安全、权限、工具纪律不变" in block
 
 
 def test_emotion_manager_refines_raw_detector_trigger_before_state_write(tmp_path):
@@ -501,8 +500,8 @@ def test_emotion_manager_modifier_uses_refined_trigger_appraisal_after_raw_event
         assert emotion_state["last_raw_trigger_type"] == raw_trigger
 
         block = mgr.get_tone_modifiers()
-        assert expected_trigger_line in block
-        assert expected_appraisal_line in block
+        assert expected_trigger_line.replace("【触发】", "触发=") in block
+        assert "【强度】" in block
         assert raw_trigger not in block
 
 
@@ -585,8 +584,8 @@ def test_emotion_manager_modifier_includes_aftereffect_after_integrated_blend(tm
 
     block = mgr.get_tone_modifiers()
 
-    assert "【余温】正向高峰余温" in block
-    assert block.index("【情绪】") < block.index("【余温】") < block.index("【关系】")
+    assert "正向高峰余温" in block
+    assert block.index("【状态】") < block.index("【轨迹】") < block.index("【关系】")
 
 
 def test_desire_control_contract_is_four_tiered_and_scoped_to_explicit_sex():
@@ -681,10 +680,10 @@ def test_emotion_manager_overwhelming_block_is_self_contained_for_runtime_concat
 
     block = mgr.get_tone_modifiers().strip()
 
-    assert block.startswith("<emotion_modifier>\n【欲望】")
+    assert block.startswith("<emotion_modifier>\n【状态】")
     assert block.endswith("</emotion_modifier>")
     assert block.count("<emotion_modifier>") == 1
     assert block.count("</emotion_modifier>") == 1
-    assert block.index("【欲望】") < block.index("【情绪】") < block.index("【表达】")
-    assert "【表达】可见度=" in block
-    assert "【锚点】身份/事实/工具纪律不变" in block
+    assert block.index("【状态】") < block.index("【强度】") < block.index("【执行】")
+    assert "可见度=" in block
+    assert "【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。" in block

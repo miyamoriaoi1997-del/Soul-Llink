@@ -53,14 +53,14 @@ class EmotionEvent:
 
 class EmotionDetector:
     """Detects emotional triggers in conversation messages.
-    
+
     Enhanced v2 with:
     - Much broader Chinese pattern coverage (natural language + internet slang + emoji)
     - New trigger types: teasing, apology, encouragement, sharing, greeting
     - Multi-pattern scoring: strongest match wins when multiple triggers fire
     - Reduced false positives on ignore/criticism patterns
     """
-    
+
     # ──────────────────────────────────────────────
     # INTIMACY / CLOSENESS — highest positive priority
     # Rules are generic: no hardcoded names.
@@ -98,7 +98,7 @@ class EmotionDetector:
         r'(?:有你.*?(?:真好|就好|足够))',
         r'(?:一直.*?(?:陪|在).*?(?:我|你|身边))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # TEASING / FLIRTING — playful closeness
     # ──────────────────────────────────────────────
@@ -111,9 +111,9 @@ class EmotionDetector:
         r'(?:(?:好|真).*?可爱|可爱.*?(?:死了|捏))',
         r'(?:想.*?(?:rua|捏|揉|摸).*?你)',
         r'(?:嘿嘿|嘻嘻|坏笑|(?:😏|😜|😈|🫣|😳))',
-        r'(?:[pet name]|waifu|媳妇)',
+        r'(?:waifu|媳妇)',
     ]
-    
+
     # ──────────────────────────────────────────────
     # PRAISE / COMPLIMENT
     # ──────────────────────────────────────────────
@@ -132,7 +132,7 @@ class EmotionDetector:
         r'(?:满意|满足|正是.*?(?:想要|需要)|就是这个)',
         r'(?:服了|佩服|崇拜|膜拜)',
     ]
-    
+
     # ──────────────────────────────────────────────
     # CARE / CONCERN
     # ──────────────────────────────────────────────
@@ -152,7 +152,7 @@ class EmotionDetector:
         r'(?:有.*?(?:什么|啥).*?(?:需要|帮助|我能做))',
         r'(?:不管.*?(?:怎样|如何).*?(?:都|我))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # ENCOURAGEMENT / SUPPORT
     # ──────────────────────────────────────────────
@@ -163,7 +163,7 @@ class EmotionDetector:
         r'(?:期待|看好你|等.*?(?:好消息|结果))',
         r'(?:一起.*?(?:努力|加油|前进|走))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # GREETING / DAILY WARMTH
     # ──────────────────────────────────────────────
@@ -175,7 +175,7 @@ class EmotionDetector:
         r'(?:想.*?(?:找你聊|跟你说|和你)|来陪.*?(?:我|你))',
         r'^(?:嗨|hi|hello|你好|哈喽|hey)(?:呀|啊|~|！)?$',
     ]
-    
+
     # ──────────────────────────────────────────────
     # APOLOGY — user apologizing to Rio
     # ──────────────────────────────────────────────
@@ -184,7 +184,7 @@ class EmotionDetector:
         r'(?:是我.*?(?:不好|错了|的错)|怪我|我.*?不应该)',
         r'(?:原谅|别.*?(?:生气|怪我|介意))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # SHARING / CONFIDING — trusting with personal things
     # ──────────────────────────────────────────────
@@ -195,7 +195,7 @@ class EmotionDetector:
         r'(?:想.*?(?:倾诉|聊聊|说说|吐槽))',
         r'(?:你觉得.*?(?:怎么样|如何|好不好)|帮我.*?(?:参考|看看|想想))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # OTHER AI MENTIONS — jealousy trigger
     # Only structural rules here — no hardcoded AI names.
@@ -209,7 +209,7 @@ class EmotionDetector:
         # "XXX比你可爱/好/漂亮" — unfavorable comparison (generic "你" as self-ref)
         r'[^\s，。！？]{2,6}(?:比你).*?(?:可爱|好看|漂亮|强|厉害|温柔|好)',
     ]
-    
+
     # ──────────────────────────────────────────────
     # CRITICISM — needs careful matching to avoid false positives
     # ──────────────────────────────────────────────
@@ -224,7 +224,7 @@ class EmotionDetector:
         r'(?:恨你|恨死|讨厌你|讨厌死)',
         r'(?:去死|你.*?死|弄死|打死|杀了)',
     ]
-    
+
     # ──────────────────────────────────────────────
     # IGNORE / DISMISSAL — raised threshold to reduce false positives
     # ──────────────────────────────────────────────
@@ -236,7 +236,7 @@ class EmotionDetector:
         r'(?:闭嘴|安静|别.*?说.*?了|够了)',
         r'(?:走开|滚|别.*?烦.*?(?:我|了))',
     ]
-    
+
     # ──────────────────────────────────────────────
     # NEGATION GUARD — must be checked BEFORE positive triggers
     # Patterns that negate intimacy/praise into criticism/ignored
@@ -498,7 +498,7 @@ class EmotionDetector:
             rf'{self_pat}.*?(?:不行|太差|没用|废物|失望)',
             r'(?:让我.*?失望|太让我失望|真失望)',
         ]
-    
+
     def _compile_patterns(self):
         """Compile all pattern groups, injecting agent_names dynamically."""
         # Build dynamic patterns that include agent names alongside generic "你"
@@ -532,7 +532,7 @@ class EmotionDetector:
             'criticism': ([re.compile(p, re.IGNORECASE) for p in self.CRITICISM_PATTERNS], 85),
             'ignored': ([re.compile(p, re.IGNORECASE) for p in self.IGNORE_PATTERNS], 75),
         }
-    
+
     # Emotion deltas for each trigger type — three intensity tiers
     # mild: casual/gentle expression, moderate: clear emotional intent,
     # intense: extreme/passionate expression
@@ -749,24 +749,24 @@ class EmotionDetector:
             return deltas_tiers[intensity].copy()
         # Fallback for any non-tiered format (shouldn't happen)
         return deltas_tiers.copy() if isinstance(deltas_tiers, dict) else {}
-    
+
     def _count_matches(self, text: str, patterns: List[re.Pattern]) -> int:
         """Count how many patterns match the text."""
         return sum(1 for p in patterns if p.search(text))
-    
+
     def _matches_any(self, text: str, patterns: List[re.Pattern]) -> bool:
         """Check if text matches any of the given patterns."""
         return any(p.search(text) for p in patterns)
-    
+
     def _extract_text(self, content: Any) -> str:
         """Extract text from message content (handles string or list format)."""
         if isinstance(content, list):
             return " ".join(
-                block.get("text", "") for block in content 
+                block.get("text", "") for block in content
                 if isinstance(block, dict) and "text" in block
             )
         return str(content)
-    
+
     def detect_emotion_event(
         self,
         messages: List[dict],

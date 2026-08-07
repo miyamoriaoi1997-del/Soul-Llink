@@ -139,7 +139,14 @@ def test_state_machine_eval_fixture_has_broad_regression_coverage():
 
     expected_modes = {case['expected_mode'] for case in cases}
     assert expected_modes <= {'daily', 'work', 'sex'}
-    assert {'daily', 'work'} <= expected_modes
+    assert {'daily', 'work', 'sex'} <= expected_modes
+
+    transition_pairs = {
+        (case.get('previous_mode'), case['expected_mode'])
+        for case in cases
+        if case.get('previous_mode') != case['expected_mode']
+    }
+    assert {('daily', 'work'), ('work', 'daily'), ('daily', 'sex'), ('sex', 'daily'), ('sex', 'work')} <= transition_pairs
 
     required_case_ids = {
         'work_authorization_after_eval_task',
@@ -147,6 +154,10 @@ def test_state_machine_eval_fixture_has_broad_regression_coverage():
         'technical_with_affection_marker',
         'meta_sensitive_not_sex',
         'high_emotion_technical_task_stays_system',
+        'explicit_adult_invitation_enters_sex',
+        'sex_scene_close_exits_daily',
+        'sex_to_work_explicit_task',
+        'work_status_continuation',
     }
     actual_case_ids = {case['id'] for case in cases}
     assert required_case_ids <= actual_case_ids

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -29,9 +30,19 @@ def _host(tmp_path: Path) -> Path:
     return host
 
 
-def _deployment() -> HermesDeployment:
-    """Get HermesDeployment pointing to this repository."""
-    return HermesDeployment(Path(__file__).resolve().parents[2])
+def _deployment(monkeypatch) -> HermesDeployment:
+    """Get a deployment with a supported no-op host adapter seam."""
+    deployment = HermesDeployment(Path(__file__).resolve().parents[2])
+    controller = SimpleNamespace(
+        detect=lambda _host: SimpleNamespace(
+            classification="supported", patch_state="applied", missing_paths=()
+        ),
+        apply=lambda _host, **_kwargs: (SimpleNamespace(classification="supported"), None),
+        verify=lambda _host: True,
+        rollback=lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(deployment, "_host_controller", lambda: controller)
+    return deployment
 
 
 def test_rollback_rejects_mismatched_adapter_version(tmp_path: Path, monkeypatch) -> None:
@@ -40,7 +51,7 @@ def test_rollback_rejects_mismatched_adapter_version(tmp_path: Path, monkeypatch
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -67,7 +78,7 @@ def test_rollback_rejects_receipt_pointing_to_different_host(tmp_path: Path, mon
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -95,7 +106,7 @@ def test_rollback_rejects_receipt_pointing_to_different_home(tmp_path: Path, mon
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.yaml").write_text("original: true\n", encoding="utf-8")
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -129,7 +140,7 @@ def test_rollback_rejects_backup_outside_home(tmp_path: Path, monkeypatch) -> No
     host = _host(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)
@@ -165,7 +176,7 @@ def test_rollback_rejects_backup_with_wrong_naming(tmp_path: Path, monkeypatch) 
     host = _host(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    deployment = _deployment()
+    deployment = _deployment(monkeypatch)
     monkeypatch.setattr(deployment, "verify", lambda *_: True)
 
     receipt = deployment.apply(host, home)

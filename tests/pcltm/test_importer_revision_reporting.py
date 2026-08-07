@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from pcltm.projections.transcript_chunks import TranscriptChunkProjector
 from pcltm.importer import JSONLTranscriptImporter
 from pcltm.store import EventStore
 
@@ -33,9 +34,9 @@ def test_jsonl_import_converges_transcript_projections_before_return(tmp_path: P
     transcript = tmp_path / "events.jsonl"
     payload = {
         "external_id": "message:projection", "session_id": "s", "conversation_id": "c",
-        "kind": "chat_message", "role": "user", "content": "public importer convergence",
+        "kind": "chat_message", "role": "user", "content": "JSONL 原文",
     }
-    transcript.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    transcript.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
     store = EventStore(tmp_path / "pcltm.db")
     try:
         report = JSONLTranscriptImporter(store).import_file(transcript)
@@ -47,4 +48,30 @@ def test_jsonl_import_converges_transcript_projections_before_return(tmp_path: P
         store.close()
 
     assert report["ok"] is True
-    assert [row["chunk_text"] for row in chunks] == ["public importer convergence"]
+    assert [row["chunk_text"] for row in chunks] == ["JSONL 原文"]
+
+
+def test_jsonl_duplicate_import_reports_projection_retry_as_failure(tmp_path: Path, monkeypatch) -> None:
+    transcript = tmp_path / "events.jsonl"
+    payload = {
+        "external_id": "message:retry", "session_id": "s", "conversation_id": "c",
+        "kind": "chat_message", "role": "user", "content": "等待 JSONL 重试的原文",
+    }
+    transcript.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    store = EventStore(tmp_path / "pcltm.db")
+    real_apply = TranscriptChunkProjector._apply
+
+    def fail_chunk(self, job, *, now):
+        raise RuntimeError("forced chunk failure")
+
+    try:
+        monkeypatch.setattr(TranscriptChunkProjector, "_apply", fail_chunk)
+        first = JSONLTranscriptImporter(store).import_file(transcript)
+        monkeypatch.setattr(TranscriptChunkProjector, "_apply", real_apply)
+        duplicate = JSONLTranscriptImporter(store).import_file(transcript)
+    finally:
+        store.close()
+
+    assert first["ok"] is False
+    assert duplicate["ok"] is False
+    assert any("projections are not converged" in issue["error"] for issue in duplicate["errors"])

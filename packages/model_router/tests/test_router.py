@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app import Handler, RouterConfig, decide_route, extract_text_for_routing, make_request_hash
+from service import _health, _task_xml, install_autostart
 
 
 @pytest.fixture
@@ -21,7 +22,7 @@ def router_config_path(tmp_path):
                 "listen": {"host": "127.0.0.1", "port": 18080},
                 "audit": {"path": str(tmp_path / "audit.jsonl")},
                 "upstream": {
-                    "base_url": "https://upstream.example/v1",
+                    "base_url": "http://www.1314mc.net:3333/v1",
                     "api_key": "test-key",
                     "timeout_seconds": 180,
                 },
@@ -239,7 +240,7 @@ def test_explicit_real_model_passthrough(cfg):
 def test_proxy_config_pins_real_upstream_after_hermes_points_to_proxy(cfg):
     c = cfg
     upstream = c.upstream()
-    assert upstream.base_url == "https://upstream.example/v1"
+    assert upstream.base_url == "http://www.1314mc.net:3333/v1"
     assert not hasattr(upstream, "default_model")
 
 
@@ -273,14 +274,19 @@ def test_router_audit_preserves_turn_correlation_and_actual_forwarded_model(cfg,
     handler.server = type("Server", (), {"cfg": cfg})()
     payload = {
         "model": "persona-auto",
-        "metadata": {"hermes_turn_correlation_id": "turn-public"},
+        "metadata": {
+            "hermes_turn_correlation_id": "turn-abc",
+            "hermes_selected_model": "legacy-state-machine-model",
+        },
     }
+    decision = decide_route(payload, cfg)
 
-    handler._audit("request-public", payload, None, "work-model", False, 200, True, 0.0, None)
+    handler._audit("hash", payload, decision, "actual-forwarded-model", False, 200, True, 0.0, None)
 
     row = json.loads(cfg.audit_path.read_text(encoding="utf-8").splitlines()[-1])
-    assert row["turn_correlation_id"] == "turn-public"
-    assert row["forwarded_model"] == "work-model"
+    assert row["turn_correlation_id"] == "turn-abc"
+    assert row["selected_model"] == "daily-model"
+    assert row["forwarded_model"] == "actual-forwarded-model"
 
 
 def test_health_payload_supports_health_alias_and_reports_models(cfg):
@@ -290,7 +296,7 @@ def test_health_payload_supports_health_alias_and_reports_models(cfg):
     payload = handler._health_payload()
 
     assert payload["ok"] is True
-    assert payload["upstream_base_url"] == "https://upstream.example/v1"
+    assert payload["upstream_base_url"] == "http://www.1314mc.net:3333/v1"
     assert payload["default_model"] == "daily-model"
     assert payload["work_model"] == "work-model"
     assert "technical_model" not in payload
@@ -312,3 +318,50 @@ def test_v1_models_payload_exposes_virtual_and_backing_models(cfg):
     assert "work-model" in ids
     assert "sex-model" in ids
     assert len(ids) == len(set(ids))
+
+def test_task_xml_is_invisible_restartable_and_uses_pythonw(tmp_path, monkeypatch):
+    pythonw = tmp_path / "pythonw.exe"
+    pythonw.write_text("", encoding="utf-8")
+    monkeypatch.setattr("service._pythonw", lambda: pythonw)
+
+    text = _task_xml(tmp_path / "router config.yaml", r"desktop\\alice")
+
+    assert str(pythonw) in text
+    assert " run " in text
+    assert "router config.yaml" in text
+    assert "<LogonType>InteractiveToken</LogonType>" in text
+    assert "<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count>" in text
+    assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in text
+    assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in text
+
+
+def test_install_autostart_creates_and_runs_scheduled_task(tmp_path, monkeypatch):
+    startup = tmp_path / "Startup" / "SoulLink-Model-Router.cmd"
+    startup.parent.mkdir(parents=True)
+    startup.write_text("legacy", encoding="utf-8")
+    monkeypatch.setattr("service.STARTUP_FILE", startup)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 0, "stdout": "desktop\\alice\n", "stderr": ""})()
+
+    monkeypatch.setattr("service.subprocess.run", fake_run)
+    result = install_autostart(tmp_path / "router config.yaml", tmp_path / "runtime")
+
+    assert result["installed"] is True
+    assert calls[0] == ["whoami"]
+    assert calls[1][:5] == ["schtasks.exe", "/Create", "/TN", "SoulLink-Model-Router", "/XML"]
+    assert calls[2] == ["schtasks.exe", "/Run", "/TN", "SoulLink-Model-Router"]
+    assert not startup.exists()
+    assert (tmp_path / "runtime/router-task.xml").is_file()
+
+
+def test_health_returns_not_running_on_connection_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr("service.urlrequest.urlopen", fail)
+    result = _health()
+    assert result["running"] is False
+    assert "offline" in result["error"]

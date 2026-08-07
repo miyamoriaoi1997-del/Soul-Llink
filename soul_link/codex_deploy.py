@@ -85,8 +85,15 @@ class CodexDeployment:
             except (OSError, UnicodeError, tomllib.TOMLDecodeError):
                 blockers.append("invalid_config_toml")
             else:
-                if parsed.get("mcp_servers", {}).get("soullink") and BEGIN not in text:
-                    blockers.append("foreign_mcp_table")
+                servers = parsed.get("mcp_servers", {})
+                if not isinstance(servers, dict):
+                    blockers.append("invalid_config_shape")
+                else:
+                    soullink = servers.get("soullink")
+                    if soullink is not None and not isinstance(soullink, dict):
+                        blockers.append("invalid_config_shape")
+                    elif soullink and BEGIN not in text:
+                        blockers.append("foreign_mcp_table")
                 if (BEGIN in text) != (END in text):
                     blockers.append("damaged_managed_block")
         hooks = home / "hooks.json"
@@ -96,7 +103,7 @@ class CodexDeployment:
             except (OSError, json.JSONDecodeError):
                 blockers.append("invalid_hooks_json")
             else:
-                if not isinstance(payload, dict) or not isinstance(payload.get("hooks", {}), dict):
+                if not self._hooks_shape_valid(payload):
                     blockers.append("invalid_hooks_shape")
         installed = not blockers and self._installed(home)
         return {
@@ -122,6 +129,8 @@ class CodexDeployment:
         if state["classification"] == "supported" and self.verify(home):
             return None
         receipt_path = self._safe_path(receipt_path or home / "soullink-deployment-receipt.json", allow_missing=True)
+        if self._receipt_overlaps_managed_path(home, receipt_path):
+            raise RuntimeError("receipt path overlaps managed runtime")
         if receipt_path.exists():
             raise RuntimeError("receipt path already exists; refusing to overwrite")
         home.mkdir(parents=True, exist_ok=True)
@@ -130,6 +139,7 @@ class CodexDeployment:
         backup.mkdir()
         marker: dict[str, object] = {
             "codex_home": str(home), "adapter_version": self.adapter_version,
+            "receipt_path": str(receipt_path),
             "entries": {}, "fingerprints": {},
         }
         mutation_started = False
@@ -203,7 +213,7 @@ class CodexDeployment:
             "enabled": True,
             "enabled_tools": [
                 "soullink_memory_search", "soullink_memory_open", "soullink_memory_recall_exact",
-                "soullink_memory_remember", "soullink_identity_status", "soullink_runtime_status",
+                "soullink_identity_status", "soullink_runtime_status",
             ],
             "default_tools_approval_mode": "writes",
             "env": {
@@ -233,6 +243,8 @@ class CodexDeployment:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         if marker.get("codex_home") != str(home) or marker.get("adapter_version") != self.adapter_version:
             raise RuntimeError("deployment backup marker mismatch")
+        if marker.get("receipt_path") != str(receipt_path):
+            raise RuntimeError("deployment receipt path does not match backup")
         if marker.get("entries") != receipt.entries or marker.get("fingerprints") != receipt.fingerprints:
             raise RuntimeError("deployment receipt does not match backup")
         self._validate_manifest(marker)
@@ -284,7 +296,7 @@ class CodexDeployment:
             "startup_timeout_sec = 20",
             "tool_timeout_sec = 60",
             "enabled = true",
-            'enabled_tools = ["soullink_memory_search", "soullink_memory_open", "soullink_memory_recall_exact", "soullink_memory_remember", "soullink_identity_status", "soullink_runtime_status"]',
+            'enabled_tools = ["soullink_memory_search", "soullink_memory_open", "soullink_memory_recall_exact", "soullink_identity_status", "soullink_runtime_status"]',
             "default_tools_approval_mode = \"writes\"",
             "[mcp_servers.soullink.env]",
             f"HERMES_PCLTM_DB = {quote(db_path)}",
@@ -420,6 +432,43 @@ class CodexDeployment:
         return False
 
     @staticmethod
+    def _hooks_shape_valid(payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if "hooks" not in payload:
+            return False
+        groups = payload["hooks"]
+        if not isinstance(groups, dict):
+            return False
+        return all(
+            isinstance(event_groups, list)
+            and all(
+                isinstance(group, dict)
+                and "hooks" in group
+                and isinstance(group["hooks"], list)
+                and all(isinstance(handler, dict) for handler in group["hooks"])
+                for group in event_groups
+            )
+            for event_groups in groups.values()
+        )
+
+    @classmethod
+    def _receipt_overlaps_managed_path(cls, home: Path, receipt_path: Path) -> bool:
+        receipt = receipt_path.absolute()
+        for relative in cls.managed:
+            managed = (home / relative).absolute()
+            if receipt == managed:
+                return True
+            if relative == "soullink":
+                try:
+                    receipt.relative_to(managed)
+                except ValueError:
+                    pass
+                else:
+                    return True
+        return False
+
+    @staticmethod
     def _hook_commands() -> tuple[str, str]:
         command = f'"{sys.executable}" -m soul_link.codex_hook'
         hook_executable = Path(sys.executable).with_name("soullink-codex-hook.exe")
@@ -444,8 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "detect": result = deployment.detect(Path(args.codex_home))
     elif args.command == "verify": result = {"verified": deployment.verify(Path(args.codex_home))}
     elif args.command == "apply":
-        receipt = deployment.apply(Path(args.codex_home), db_path=Path(args.db), memfs_root=Path(args.memfs), receipt_path=Path(args.receipt).resolve() if args.receipt else None)
-        result = {"applied": receipt is not None, "receipt": str(Path(args.receipt).resolve()) if args.receipt else str(Path(args.codex_home).resolve() / "soullink-deployment-receipt.json")}
+        receipt_path = Path(args.receipt) if args.receipt else None
+        receipt = deployment.apply(Path(args.codex_home), db_path=Path(args.db), memfs_root=Path(args.memfs), receipt_path=receipt_path)
+        result = {"applied": receipt is not None, "receipt": str(receipt.receipt_path if receipt is not None else receipt_path or Path(args.codex_home) / "soullink-deployment-receipt.json")}
     else:
         receipt = CodexDeploymentReceipt.load(Path(args.receipt))
         result = {"rolled_back": deployment.rollback(receipt)}

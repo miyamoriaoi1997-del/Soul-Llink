@@ -8,7 +8,6 @@ or injecting memory by itself.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -17,7 +16,6 @@ from typing import Any
 from .governance import MemoryGovernanceOrchestrator
 from .index_observability import index_doctor
 from .memfs_store import MemFSStore
-from .memory_selection_probe import build_probe_report
 from .runtime_paths import resolve_db_path, resolve_memfs_root
 from .store import EventStore
 
@@ -116,20 +114,13 @@ def _selection_report_for_db(
     emotion_axes: set[str] | None,
     budget_available: float | None,
 ) -> dict[str, Any]:
-    previous = os.environ.get("HERMES_PCLTM_DB")
-    os.environ["HERMES_PCLTM_DB"] = str(db)
-    try:
-        return build_probe_report(
-            target,
-            mode=mode,
-            emotion_axes=emotion_axes,
-            budget_available=budget_available,
-        )
-    finally:
-        if previous is None:
-            os.environ.pop("HERMES_PCLTM_DB", None)
-        else:
-            os.environ["HERMES_PCLTM_DB"] = previous
+    return {
+        "status": "retired",
+        "bodyless": True,
+        "reason": "legacy_memory_selection_probe_not_runtime_authority",
+        "target": target,
+        "mode": mode,
+    }
 
 
 def run_governance(

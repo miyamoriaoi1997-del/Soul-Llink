@@ -207,5 +207,6 @@ def test_governance_report_can_include_reflection_drafts_without_writing(tmp_pat
     )
 
     assert report.reflection_drafts == 1
-    assert any(action.kind == "write_reflection_draft" for action in report.actions)
+    reflection_action = next(action for action in report.actions if action.kind == "write_reflection_draft")
+    assert reflection_action.requires_human_review is True
     assert not any((store.root / "episodic").rglob("*.md"))

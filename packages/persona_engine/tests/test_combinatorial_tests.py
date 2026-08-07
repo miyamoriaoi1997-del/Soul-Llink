@@ -1,7 +1,7 @@
 """Tests for Phase 4 Task 4.4: Combinatorial test generation."""
 
 import pytest
-from packages.persona_engine.persona_orchestrator.combinatorial_tests import (
+from persona_orchestrator.combinatorial_tests import (
     PairwiseGenerator,
     ThreeWayGenerator,
     CombinatorialTestSuite,

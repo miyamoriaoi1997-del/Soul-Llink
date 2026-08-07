@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from pcltm.secret_policy import (
     contains_secret_value,
     evaluate_memory_write,
@@ -49,7 +53,7 @@ def test_secret_policy_sanitizes_connection_metadata_with_password() -> None:
 
 
 def test_secret_policy_redacts_password_bearing_database_url() -> None:
-    url = "postgres://example-user:secretpw@db.example.com:5432/app"
+    url = "postgres://alice:secretpw@db.example.com:5432/app"
     redacted = redact_secrets(f"DATABASE_URL={url}")
 
     assert "secretpw" not in redacted
@@ -77,3 +81,43 @@ def test_redact_secrets_masks_known_patterns() -> None:
     assert fake_github not in redacted
     assert fake_bearer not in redacted
     assert redacted.count("[REDACTED_SECRET]") >= 2
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "token", "access_token", "api_key", "client_secret",
+        "private_key", "password", "passwd", "authorization",
+    ],
+)
+def test_redact_secrets_masks_structured_json_secret_fields(key: str) -> None:
+    secret = 'opaque-secret\\"-value\nsecond-line-123456789'
+    text = json.dumps({"nested": {key: secret}, "status": "ok"})
+
+    redacted = redact_secrets(text)
+    parsed = json.loads(redacted)
+
+    assert secret not in redacted
+    assert parsed["nested"][key] == "[REDACTED_SECRET]"
+    assert parsed["status"] == "ok"
+
+
+def test_secret_policy_detects_structured_json_secret_field() -> None:
+    secret = "opaque-secret-value-123456789"
+    text = json.dumps({"access_token": secret})
+
+    assert contains_secret_value(text) is True
+    decision = evaluate_memory_write(text, target_file="MEMORY.md")
+    assert decision.action == "reject"
+    assert secret not in (decision.sanitized_content or "")
+
+
+def test_redact_secrets_still_masks_value_patterns_inside_json() -> None:
+    bearer = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+    text = json.dumps({"message": bearer, "token": "opaque-secret-value-123456789"})
+
+    redacted = redact_secrets(text)
+
+    assert bearer not in redacted
+    assert "opaque-secret-value-123456789" not in redacted
+    assert json.loads(redacted)["message"] == "[REDACTED_SECRET]"

@@ -105,16 +105,13 @@ def test_retired_dac_modules_are_absent_from_packaging_metadata() -> None:
     assert '"pcltm.dac"' not in metadata
 
 
-def test_active_memory_policy_drops_dac_while_legacy_readers_remain() -> None:
-    root = Path(__file__).parents[2]
-    memory_adapter = (root / "packages" / "pcltm" / "memory_adapter.py").read_text(encoding="utf-8")
-    governor = (root / "packages" / "pcltm" / "pcltm_governor.py").read_text(encoding="utf-8")
-    legacy_assets = (root / "packages" / "pcltm" / "legacy_assets.py").read_text(encoding="utf-8")
-    lineage_recovery = (root / "packages" / "pcltm" / "lineage_recovery.py").read_text(encoding="utf-8")
+def test_active_memory_policy_has_no_dac_markers_or_current_architecture_rules() -> None:
+    root = Path(__file__).parents[2] / "packages" / "pcltm"
+    adapter_source = (root / "memory_adapter.py").read_text(encoding="utf-8")
 
-    assert '        "dac",' not in memory_adapter
-    assert "pcltm_dac_role" not in governor
-    assert "DAC=schema summaries" not in governor
-    assert "PCLTM DAC support modules now live under" not in governor
-    assert '"dac_raw_messages"' in legacy_assets
-    assert "FROM dac_summary_nodes" in lineage_recovery
+    assert '        "dac",' not in adapter_source
+
+
+def test_retired_legacy_memory_governor_is_absent() -> None:
+    root = Path(__file__).parents[2] / "packages" / "pcltm"
+    assert not (root / "pcltm_governor.py").exists()

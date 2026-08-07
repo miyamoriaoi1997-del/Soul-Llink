@@ -53,7 +53,7 @@ def test_active_mood_injects_daily_bottom_noise_without_mutating_state(tmp_path)
     assert "不改真实STATE" in block
     assert "不单独触发sex" in block
     assert "不覆盖work或crisis边界" in block
-    assert block.index("【表达】") < block.index("【日内心情底噪】") < block.index("【锚点】")
+    assert block.index("【强度】") < block.index("【日内心情底噪】") < block.index("【边界】")
 
 
 def test_inactive_mood_does_not_inject_bottom_noise(tmp_path):
@@ -85,7 +85,7 @@ def test_active_mood_can_create_modifier_even_when_real_deviation_is_subthreshol
     assert "<emotion_modifier>" in block
     assert "【日内心情底噪】soft/mild" in block
     assert "今天状态和平时差不多，只是稍微柔软一点" in block
-    assert "【锚点】" in block
+    assert "【边界】" in block
 
 
 def test_active_mood_with_no_dimension_lines_still_returns_mood_modifier(tmp_path):

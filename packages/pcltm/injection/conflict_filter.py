@@ -9,6 +9,31 @@ from typing import Iterable
 from .candidate import CandidateType, InjectionCandidate, RiskFlag
 
 
+_GOVERNED_MEMORY_AUTHORITY = object()
+
+
+def _seal_governed_memory_candidate(
+    candidate: InjectionCandidate,
+) -> InjectionCandidate:
+    """Mark a candidate produced by the authority-reopening injection gate."""
+
+    metadata = dict(candidate.metadata)
+    metadata["_governed_memory_authority"] = _GOVERNED_MEMORY_AUTHORITY
+    return InjectionCandidate(
+        key=candidate.key,
+        content=candidate.content,
+        type=candidate.type,
+        source=candidate.source,
+        confidence=candidate.confidence,
+        freshness=candidate.freshness,
+        relevance=candidate.relevance,
+        priority=candidate.priority,
+        risk_flags=candidate.risk_flags,
+        token_cost=candidate.token_cost,
+        metadata=metadata,
+    )
+
+
 class ConflictAction(str, Enum):
     KEEP = "keep"
     REJECT = "reject"
@@ -61,9 +86,43 @@ class ConflictFilter:
         if RiskFlag.EMOTION_FACT_CONTAMINATION in flags:
             return ConflictDecision(candidate, ConflictAction.REJECT, "emotion-layer-cannot-write-facts", tuple(flags))
 
-        if candidate.type is CandidateType.SEMANTIC_MEMORY and candidate.confidence is None and not candidate.source:
-            flagged = candidate.with_risk(RiskFlag.MISSING_SOURCE, RiskFlag.MISSING_CONFIDENCE)
-            return ConflictDecision(flagged, ConflictAction.REJECT, "semantic-memory-needs-source-or-confidence", flagged.risk_flags)
+        if candidate.type is CandidateType.SEMANTIC_MEMORY:
+            metadata = dict(candidate.metadata)
+            marker = metadata.pop("_governed_memory_authority", None)
+            required_receipt = {
+                "authority_verified",
+                "claim_id",
+                "claim_version",
+                "governance_id",
+                "content_sha256",
+                "policy_version",
+                "source_refs",
+            }
+            if (
+                marker is not _GOVERNED_MEMORY_AUTHORITY
+                or metadata.get("authority_verified") is not True
+                or not required_receipt.issubset(metadata)
+            ):
+                flagged = candidate.with_risk(RiskFlag.MISSING_SOURCE)
+                return ConflictDecision(
+                    flagged,
+                    ConflictAction.REJECT,
+                    "semantic-memory-needs-governed-authority",
+                    flagged.risk_flags,
+                )
+            candidate = InjectionCandidate(
+                key=candidate.key,
+                content=candidate.content,
+                type=candidate.type,
+                source=candidate.source,
+                confidence=candidate.confidence,
+                freshness=candidate.freshness,
+                relevance=candidate.relevance,
+                priority=candidate.priority,
+                risk_flags=candidate.risk_flags,
+                token_cost=candidate.token_cost,
+                metadata=metadata,
+            )
 
         if candidate.type is CandidateType.EPISODIC_MEMORY:
             event_marker = candidate.metadata.get("event") or candidate.metadata.get("is_event")

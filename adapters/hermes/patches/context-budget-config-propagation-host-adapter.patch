@@ -1,0 +1,68 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 0c700c279..08cb880a3 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1827,6 +1827,9 @@ def init_agent(
+ 
+     if _selected_engine is not None:
+         agent.context_compressor = _selected_engine
++        _configure_context_engine = getattr(agent.context_compressor, "configure", None)
++        if callable(_configure_context_engine):
++            _configure_context_engine(_ctx_cfg)
+         # External engines own compaction policy: the host compression
+         # threshold (including the Codex gpt-5.5 autoraise above) only
+         # configures the built-in ContextCompressor and never reaches the
+diff --git a/tests/run_agent/test_plugin_context_engine_init.py b/tests/run_agent/test_plugin_context_engine_init.py
+index 2c7e53e13..9d58982a3 100644
+--- a/tests/run_agent/test_plugin_context_engine_init.py
++++ b/tests/run_agent/test_plugin_context_engine_init.py
+@@ -37,6 +37,49 @@ class _ToolEngine(_StubEngine):
+         ]
+ 
+ 
++class _ConfigurableEngine(_StubEngine):
++    def __init__(self):
++        self.events = []
++        self.config = None
++
++    def configure(self, config):
++        self.events.append("configure")
++        self.config = config
++
++    def update_model(self, **kwargs):
++        self.events.append("update_model")
++        super().update_model(**kwargs)
++
++
++def test_plugin_engine_gets_context_config_before_model_metadata():
++    """The selected plugin receives the authoritative context config first."""
++    engine = _ConfigurableEngine()
++    context_config = {"engine": "stub", "budget_tokens": 256_000}
++    cfg = {"context": context_config, "agent": {}}
++
++    with (
++        patch("hermes_cli.config.load_config", return_value=cfg),
++        patch("plugins.context_engine.load_context_engine", return_value=engine),
++        patch("agent.model_metadata.get_model_context_length", return_value=1_050_000),
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        from run_agent import AIAgent
++
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++
++    assert agent.context_compressor is engine
++    assert engine.config is context_config
++    assert engine.events == ["configure", "update_model"]
++
++
+ def test_plugin_engine_gets_context_length_on_init():
+     """Plugin context engine should have context_length set during AIAgent init."""
+     engine = _StubEngine()

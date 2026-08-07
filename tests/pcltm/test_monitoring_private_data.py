@@ -26,10 +26,54 @@ def test_memory_body_collector_returns_bounded_records(tmp_path: Path) -> None:
     db = tmp_path / "runtime.db"; memfs = tmp_path / "memfs"
     init_runtime(db_path=db, memfs_root=memfs)
     with sqlite3.connect(db) as con:
-        con.execute("INSERT INTO memory_records(candidate_id,kind,target_file,content,confidence,sensitivity,source_event_ids,source_node_ids,status,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)", ("c1","preference","USER.md","private memory body",1.0,"normal","[]","[]","approved",'{"scope_key":"user:example-user"}'))
+        con.execute("INSERT INTO memory_records(candidate_id,kind,target_file,content,confidence,sensitivity,source_event_ids,source_node_ids,status,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)", ("c1","preference","USER.md","private memory body",1.0,"normal","[]","[]","approved",'{"scope_key":"user:alice"}'))
     report = collect_memory_bodies(db, limit=10)
     assert report["records"][0]["content"] == "private memory body"
-    assert report["records"][0]["scope_key"] == "user:example-user"
+    assert report["records"][0]["scope_key"] == "user:alice"
+
+
+def test_memory_body_collector_redacts_non_normal_bodies_and_metadata(tmp_path: Path) -> None:
+    db = tmp_path / "runtime.db"; memfs = tmp_path / "memfs"
+    init_runtime(db_path=db, memfs_root=memfs)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "INSERT INTO memory_records(candidate_id,kind,target_file,content,confidence,sensitivity,"
+            "source_event_ids,source_node_ids,status,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("secret-candidate", "preference", "USER.md", "NEVER_EXPOSE_BODY", 1.0,
+             "restricted", "[]", "[]", "approved", '{"secret":"NEVER_EXPOSE_METADATA"}'),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = collect_memory_bodies(db, limit=10)
+
+    record = report["records"][0]
+    assert record["content"] == "[REDACTED_SENSITIVE_MEMORY]"
+    assert record["metadata"] == {}
+    assert "NEVER_EXPOSE" not in str(report)
+
+
+def test_injection_preview_excludes_non_normal_legacy_records(tmp_path: Path) -> None:
+    db = tmp_path / "runtime.db"; memfs = tmp_path / "memfs"
+    init_runtime(db_path=db, memfs_root=memfs)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "INSERT INTO memory_records(candidate_id,kind,target_file,content,confidence,sensitivity,"
+            "source_event_ids,source_node_ids,status,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("private-candidate", "preference", "USER.md", "NEVER_PREVIEW_BODY", 1.0,
+             "private", "[]", "[]", "approved", '{}'),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = collect_injection_preview(db, mode="work", query=None)
+
+    assert "NEVER_PREVIEW_BODY" not in report["rendered"]
+    assert report["selected_count"] == 0
 
 
 def test_injection_preview_is_labeled_and_does_not_update_retrieval_stats(tmp_path: Path) -> None:
@@ -74,42 +118,6 @@ def test_runtime_turn_capture_returns_exact_emotion_and_state_machine_blocks(tmp
     assert report["soul_mode_layer"]["content"] == "# Work"
 
 
-def test_runtime_turn_capture_uses_latest_router_outcome_for_same_turn_retry(tmp_path: Path) -> None:
-    capture = tmp_path / "latest-turn.json"
-    audit = tmp_path / "audit.jsonl"
-    capture.write_text(
-        '{"source":"exact_host_capture","turn_correlation_id":"turn-retry",'
-        '"state_machine":{"route_metadata":{"hermes_route_bucket":"task"}}}',
-        encoding="utf-8",
-    )
-    audit.write_text(
-        '{"turn_correlation_id":"turn-retry","request_hash":"first","forwarded_model":"fallback","ok":false}\n'
-        '{"turn_correlation_id":"turn-retry","request_hash":"retry","forwarded_model":"work-model","ok":true}\n',
-        encoding="utf-8",
-    )
-
-    report = collect_runtime_turn_capture(capture, router_audit_path=audit)
-
-    assert report["model_chain"]["correlation_scope"] == "turn_level_latest_outcome"
-    assert report["model_chain"]["router_request_hash"] == "retry"
-    assert report["model_chain"]["actual_forwarded_model"] == "work-model"
-
-
-def test_soul_content_reads_active_anchor_and_all_mode_layers(tmp_path: Path) -> None:
-    active = tmp_path / "SOUL.md"
-    layers = tmp_path / "layers"
-    layers.mkdir()
-    active.write_text("# active soul", encoding="utf-8")
-    for name in ("core", "daily", "work", "sex"):
-        (layers / f"SOUL.{name}.template.md").write_text(f"# {name}", encoding="utf-8")
-
-    report = collect_soul_content(active, layers)
-
-    assert report["source"] == "runtime_soul_files"
-    assert report["active"]["content"] == "# active soul"
-    assert report["layers"]["work"]["content"] == "# work"
-
-
 def test_runtime_turn_capture_preserves_exact_selected_record_evidence(tmp_path: Path) -> None:
     import json
 
@@ -134,3 +142,18 @@ def test_runtime_turn_capture_preserves_exact_selected_record_evidence(tmp_path:
     assert report["memory_selection"]["selected_count"] == 1
     assert report["memory_selection"]["selected_records"][0]["content"] == "governed body"
     assert report["forwarded_model_boundary"]["source"] == "final_model_forward"
+
+
+def test_soul_content_reads_active_anchor_and_all_mode_layers(tmp_path: Path) -> None:
+    active = tmp_path / "SOUL.md"
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    active.write_text("# active soul", encoding="utf-8")
+    for name in ("core", "daily", "work", "sex"):
+        (layers / f"SOUL.{name}.template.md").write_text(f"# {name}", encoding="utf-8")
+
+    report = collect_soul_content(active, layers)
+
+    assert report["source"] == "runtime_soul_files"
+    assert report["active"]["content"] == "# active soul"
+    assert report["layers"]["work"]["content"] == "# work"

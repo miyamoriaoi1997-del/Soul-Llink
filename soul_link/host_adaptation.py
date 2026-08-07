@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -14,6 +16,23 @@ from uuid import uuid4
 import yaml
 
 CommandRunner = Callable[[Sequence[str], Path], int]
+
+
+def _reject_reparse_path(path: Path, *, label: str, allow_missing_leaf: bool = False) -> Path:
+    """Reject symlink/junction/reparse components before canonicalization."""
+    raw = Path(path).absolute()
+    missing_leaf = allow_missing_leaf and not raw.exists() and not raw.is_symlink()
+    limit = raw.parent if missing_leaf else raw
+    current = Path(limit.anchor)
+    for part in limit.parts[1:]:
+        current /= part
+        try:
+            stat = current.lstat()
+        except FileNotFoundError:
+            continue
+        if current.is_symlink() or bool(getattr(stat, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError(f"unsafe {label}: symlink or reparse component: {current}")
+    return raw.resolve(strict=not missing_leaf)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +110,7 @@ class AdaptationReceipt:
     host_root: Path
     backup_path: Path
     adapter_version: str
+    fingerprints: dict[str, str] | None = None
 
     def write(self, path: Path) -> None:
         destination = Path(path).resolve()
@@ -103,6 +123,7 @@ class AdaptationReceipt:
                         "host_root": str(self.host_root),
                         "backup_path": str(self.backup_path),
                         "adapter_version": self.adapter_version,
+                        "fingerprints": self.fingerprints,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -121,6 +142,7 @@ class AdaptationReceipt:
             host_root=Path(data["host_root"]).resolve(),
             backup_path=Path(data["backup_path"]).resolve(),
             adapter_version=str(data["adapter_version"]),
+            fingerprints=data.get("fingerprints"),
         )
 
 
@@ -163,6 +185,7 @@ class HostAdapterController:
         host_root: Path,
         *,
         verifier: Callable[[Path], bool],
+        backup_root: Path | None = None,
     ) -> tuple[CompatibilityResult, AdaptationReceipt | None]:
         root = Path(host_root).resolve()
         detected = self.detect(root)
@@ -173,18 +196,25 @@ class HostAdapterController:
         if detected.classification != "transformable":
             raise RuntimeError("host is incompatible with this adapter")
 
-        backup = root / f".soullink-adapter-backup-{uuid4().hex}"
+        backup_parent = Path(backup_root).resolve() if backup_root is not None else root
+        backup_prefix = ".host-" if backup_root is not None else ".soullink-adapter-backup-"
+        backup = backup_parent / f"{backup_prefix}{uuid4().hex[:12]}"
         try:
             backup.mkdir()
-            (backup / ".soullink-backup.json").write_text(
-                json.dumps({"host_root": str(root), "adapter_version": self.manifest.adapter_version}),
-                encoding="utf-8",
-            )
+            fingerprints: dict[str, str] = {}
             for relative in self.manifest.required_paths:
                 source = self._host_path(root, relative)
                 destination = backup / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
+                fingerprints[relative] = self._file_hash(destination)
+            (backup / ".soullink-backup.json").write_text(
+                json.dumps({
+                    "host_root": str(root),
+                    "adapter_version": self.manifest.adapter_version,
+                    "fingerprints": fingerprints,
+                }), encoding="utf-8",
+            )
 
             command = ("git", "apply", str(self.manifest.patch_path))
             if self._run(command, root) != 0:
@@ -194,23 +224,25 @@ class HostAdapterController:
             result = self.detect(root)
             if result.classification != "supported":
                 raise RuntimeError("adapter verification failed: patch state is not applied")
-            receipt = AdaptationReceipt(root, backup, self.manifest.adapter_version)
+            receipt = AdaptationReceipt(root, backup, self.manifest.adapter_version, fingerprints)
             return result, receipt
         except BaseException:
             self._restore_backup(root, backup)
             shutil.rmtree(backup, ignore_errors=True)
             raise
 
-    def rollback(self, receipt: AdaptationReceipt) -> bool:
+    def rollback(self, receipt: AdaptationReceipt, *, trusted_backup_root: Path | None = None) -> bool:
         root = Path(receipt.host_root).resolve()
         backup = Path(receipt.backup_path).resolve()
         if receipt.adapter_version != self.manifest.adapter_version:
             raise RuntimeError("adaptation receipt version does not match manifest")
         marker_path = backup / ".soullink-backup.json"
+        expected_parent = Path(trusted_backup_root).resolve() if trusted_backup_root is not None else root
+        valid_prefix = ".host-" if trusted_backup_root is not None else ".soullink-adapter-backup-"
         if (
             not backup.is_dir()
-            or backup.parent != root
-            or not backup.name.startswith(".soullink-adapter-backup-")
+            or backup.parent != expected_parent
+            or not backup.name.startswith(valid_prefix)
             or not marker_path.is_file()
         ):
             raise RuntimeError("invalid or missing adaptation backup")
@@ -218,8 +250,17 @@ class HostAdapterController:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError) as exc:
             raise RuntimeError("invalid adaptation backup marker") from exc
-        if marker != {"host_root": str(root), "adapter_version": self.manifest.adapter_version}:
-            raise RuntimeError("adaptation backup marker mismatch")
+        legacy_marker = {
+            "host_root": str(root),
+            "adapter_version": self.manifest.adapter_version,
+        }
+        if receipt.fingerprints is None:
+            if marker != legacy_marker:
+                raise RuntimeError("adaptation backup marker mismatch")
+        else:
+            expected_marker = {**legacy_marker, "fingerprints": receipt.fingerprints}
+            if marker != expected_marker:
+                raise RuntimeError("adaptation backup marker mismatch")
         missing_or_unsafe = []
         for relative in self.manifest.required_paths:
             saved = backup / relative
@@ -231,6 +272,8 @@ class HostAdapterController:
                 continue
             if saved.is_symlink() or not resolved.is_file():
                 missing_or_unsafe.append(relative)
+            elif receipt.fingerprints is not None and receipt.fingerprints.get(relative) != self._file_hash(resolved):
+                raise RuntimeError(f"adaptation backup fingerprint mismatch: {relative}")
         if missing_or_unsafe:
             raise RuntimeError(f"incomplete or unsafe adaptation backup: {missing_or_unsafe}")
         self._restore_backup(root, backup)
@@ -250,6 +293,10 @@ class HostAdapterController:
                 shutil.copy2(saved, destination)
 
     @staticmethod
+    def _file_hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
     def _host_path(root: Path, relative: str) -> Path:
         target = (root / relative).resolve()
         try:
@@ -264,13 +311,17 @@ class HostAdapterController:
 
     @staticmethod
     def _run_command(command: Sequence[str], cwd: Path) -> int:
-        completed = subprocess.run(
-            list(command),
-            cwd=cwd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                list(command),
+                cwd=cwd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            return 124
         return completed.returncode
 
 

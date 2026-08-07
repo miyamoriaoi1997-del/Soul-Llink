@@ -102,10 +102,12 @@ def test_emotion_manager_filters_dimension_lines_to_current_polarity(tmp_path):
 
     block = mgr.get_tone_modifiers()
 
-    assert "【情绪】累但不推开/占有欲与不耐烦同时上升" in block
-    assert "【触发】失控风险" in block
-    assert "【余温】负向高峰补救压力" in block
-    assert "【表达】可见度=" in block
+    assert "【强度】overwhelming/positive" in block
+    assert "【状态】累但不推开；副=占有欲与不耐烦同时上升；触发=失控风险" in block
+    assert "【执行】" in block
+    assert "低声承认+保留陪伴" in block
+    assert "【轨迹】" in block
+    assert "【边界】" in block
     assert "【日内心情底噪】" in block
     assert "不改真实STATE" in block
     assert "不单独触发sex" in block
@@ -129,11 +131,10 @@ def test_aftereffect_does_not_override_current_positive_direction(tmp_path):
     mgr = EmotionStateManager(hermes_home=tmp_path, state_path=state_path)
 
     block = mgr.get_tone_modifiers()
-    desire_pos = block.index("【欲望】")
-    expression_pos = block.index("【表达】")
+    state_pos = block.index("【状态】")
+    framework_pos = block.index("【强度】")
 
-    assert "【情绪】受伤后的控制欲/占有欲浮现" in block
-    assert "【余温】负向高峰补救压力" in block
-    assert "【欲望】" in block
-    assert desire_pos < expression_pos
-    assert "【维度】" not in block
+    assert "【强度】intense/positive" in block
+    assert "边界收紧+控制确认" in block
+    assert state_pos < framework_pos
+    assert "trust｜negative" not in block

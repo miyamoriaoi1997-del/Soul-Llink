@@ -3,7 +3,7 @@ index 180e1d971..a16db7e11 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -1582,6 +1582,11 @@ def init_agent(
- 
+
      if _selected_engine is not None:
          agent.context_compressor = _selected_engine
 +        if hasattr(agent.context_compressor, "configure"):
@@ -31,18 +31,54 @@ diff --git a/agent/turn_context.py b/agent/turn_context.py
 +            )
          except Exception:
              pass
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -8161,11 +8161,26 @@ class TestMemoryProviderTurnStart:
+             "so that memory providers have the correct turn count for cadence checks"
+         )
+
+-    def test_on_turn_start_uses_user_turn_count(self):
+-        """Source-level check: on_turn_start receives the user_turn_count."""
++    def test_on_turn_start_forwards_turn_context(self):
++        """AST-level check: the lifecycle hook receives count and unique turn identity."""
++        import ast
+         import inspect
++        import textwrap
+         from agent.turn_context import build_turn_context as _btc
+-        src = inspect.getsource(_btc)
+-        # The extracted body uses ``agent.X`` rather than ``self.X``;
+-        # assert the extracted-form spelling directly.
+-        assert "on_turn_start(agent._user_turn_count" in src
++
++        tree = ast.parse(textwrap.dedent(inspect.getsource(_btc)))
++        calls = [
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "on_turn_start"
++        ]
++        assert len(calls) == 1
++        call = calls[0]
++        assert ast.unparse(call.args[0]) == "agent._user_turn_count"
++        forwarded = {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
++        assert forwarded == {
++            "session_id": "agent.session_id",
++            "turn_id": "turn_id",
++        }
 diff --git a/agent/context_engine.py b/agent/context_engine.py
 index 79c31fb48..ef9b705a9 100644
 --- a/agent/context_engine.py
 +++ b/agent/context_engine.py
 @@ -26,7 +26,7 @@ Lifecycle:
  """
- 
+
  from abc import ABC, abstractmethod
 -from typing import Any, Dict, List
 +from typing import Any, Dict, List, Optional
- 
- 
+
+
  class ContextEngine(ABC):
 @@ -89,6 +89,8 @@ class ContextEngine(ABC):
          messages: List[Dict[str, Any]],
@@ -52,7 +88,7 @@ index 79c31fb48..ef9b705a9 100644
 +        request_budget: Optional[Dict[str, int]] = None,
      ) -> List[Dict[str, Any]]:
          """Compact the message list and return the new message list.
- 
+
 @@ -101,8 +103,10 @@ class ContextEngine(ABC):
          Args:
              focus_topic: Optional topic string from manual ``/compress <focus>``.
@@ -63,24 +99,24 @@ index 79c31fb48..ef9b705a9 100644
 +            force: Whether manual compression should bypass normal thresholds.
 +            request_budget: Optional host-accounted total request budget.
          """
- 
+
      # -- Optional: pre-flight check ----------------------------------------
 diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
 index 70d997631..bda2b0b9d 100644
 --- a/agent/conversation_compression.py
 +++ b/agent/conversation_compression.py
 @@ -28,6 +28,7 @@ these paths see no behavioural change.
- 
+
  from __future__ import annotations
- 
+
 +import inspect
  import logging
  import os
  import tempfile
 @@ -38,6 +39,65 @@ from typing import Any, Optional, Tuple
- 
+
  from agent.model_metadata import estimate_request_tokens_rough
- 
+
 +
 +def build_context_request_budget(agent: Any, system_prompt: str = "") -> dict[str, int]:
 +    """Account for the actual stable request buckets under one total budget."""
@@ -141,12 +177,12 @@ index 70d997631..bda2b0b9d 100644
 +    }
 +
  logger = logging.getLogger(__name__)
- 
+
  # Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
 @@ -460,12 +520,16 @@ def compress_context(
          except Exception:
              pass
- 
+
 +    request_budget = build_context_request_budget(agent, system_message)
 +    compress_kwargs = _compress_kwargs(
 +        agent.context_compressor,
@@ -171,8 +207,8 @@ index 0a5aa8c0f..df9262ccc 100644
 +++ b/hermes_cli/plugins_cmd.py
 @@ -925,16 +925,34 @@ def _discover_all_plugins() -> list:
      return list(seen.values())
- 
- 
+
+
 -def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str:
 -    """Return the user-facing activation state for a plugin name or key."""
 +def _plugin_status(
@@ -192,8 +228,8 @@ index 0a5aa8c0f..df9262ccc 100644
 +    if name in {memory_provider, context_engine} or key in {memory_provider, context_engine}:
 +        return "active provider"
      return "not enabled"
- 
- 
+
+
 -def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set) -> list:
 +def _filter_plugin_entries(
 +    entries: list,
@@ -219,9 +255,9 @@ index 0a5aa8c0f..df9262ccc 100644
 +            ) in {"enabled", "active provider"}
          ]
      return filtered
- 
+
 @@ -961,13 +983,32 @@ def cmd_list(args: Any | None = None) -> None:
- 
+
      enabled = _get_enabled_set()
      disabled = _get_disabled_set()
 -    entries = _filter_plugin_entries(entries, args, enabled, disabled)
@@ -245,7 +281,7 @@ index 0a5aa8c0f..df9262ccc 100644
 +            memory_provider=memory_provider,
 +            context_engine=context_engine,
 +        )
- 
+
      if getattr(args, "json", False):
          payload = [
              {
@@ -256,7 +292,7 @@ index 0a5aa8c0f..df9262ccc 100644
                  "description": description,
                  "source": source,
 @@ -979,8 +1020,8 @@ def cmd_list(args: Any | None = None) -> None:
- 
+
      if getattr(args, "plain", False):
          for name, version, _description, source, _dir, key in entries:
 -            status = _plugin_status(name, enabled, disabled, key=key)
@@ -264,11 +300,11 @@ index 0a5aa8c0f..df9262ccc 100644
 +            status = effective_status(name, key)
 +            print(f"{status:16} {source:8} {str(version):8} {name}")
          return
- 
+
      if not entries:
 @@ -995,11 +1036,11 @@ def cmd_list(args: Any | None = None) -> None:
      table.add_column("Source", style="dim")
- 
+
      for name, version, description, source, _dir, key in entries:
 -        status_name = _plugin_status(name, enabled, disabled, key=key)
 +        status_name = effective_status(name, key)
@@ -366,7 +402,7 @@ index e844a3671..68629de49 100644
                  self._request_budget_safety_margin_tokens = 512
 +        elif unified_budget > 0:
 +            self._request_budget_safety_margin_tokens = min(8192, max(1024, int(unified_budget * 0.03)))
- 
+
      def is_available(self) -> bool:
          return _IMPORT_ERROR is None
 @@ -388,7 +428,10 @@ class PCLTMContextCompressionEngine(ContextEngine):
@@ -378,7 +414,7 @@ index e844a3671..68629de49 100644
 +            self.threshold_tokens = self._configured_budget_tokens
 +        else:
 +            self.threshold_tokens = int(self.context_length * self.threshold_percent)
- 
+
      def update_from_response(self, usage: Dict[str, Any]) -> None:
          self.last_prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
 @@ -852,6 +895,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
@@ -588,7 +624,7 @@ index 8353324e9..aa257c857 100644
 @@ -536,6 +536,37 @@ class TestCmdRemove:
  class TestCmdList:
      """Test the list command."""
- 
+
 +    def test_provider_selected_in_config_is_reported_active(self, monkeypatch, capsys):
 +        from argparse import Namespace
 +        from hermes_cli.plugins_cmd import cmd_list
@@ -628,18 +664,18 @@ index 7285cb1f6..b15c7536b 100644
 --- a/tests/run_agent/test_plugin_context_engine_init.py
 +++ b/tests/run_agent/test_plugin_context_engine_init.py
 @@ -6,6 +6,8 @@ context_length, causing the CLI status bar to show 'ctx --'.
- 
+
  from unittest.mock import MagicMock, patch
- 
+
 +import pytest
 +
  from agent.context_engine import ContextEngine
- 
- 
+
+
 @@ -37,6 +39,15 @@ class _ToolEngine(_StubEngine):
          ]
- 
- 
+
+
 +class _ConfigurableEngine(_StubEngine):
 +    def __init__(self):
 +        super().__init__()
@@ -721,7 +757,7 @@ index 68629de49..bd3c83a21 100644
 +from datetime import datetime, timezone
  from pathlib import Path
  from typing import Any, Dict, List, Mapping
- 
+
 @@ -308,6 +309,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
          self.last_total_tokens = 0
          self.compression_count = 0
@@ -762,15 +798,15 @@ index 68629de49..bd3c83a21 100644
 +            os.replace(temp, path)
 +        except OSError:
 +            logger.debug("Failed to write SoulLink context usage telemetry", exc_info=True)
- 
+
      def should_compress(self, prompt_tokens: int = None) -> bool:
          tokens = int(prompt_tokens or self.last_prompt_tokens or 0)
 @@ -469,6 +499,8 @@ class PCLTMContextCompressionEngine(ContextEngine):
- 
+
      def on_session_start(self, session_id: str, **kwargs) -> None:
          self.session_id = session_id or self.session_id
 +        if kwargs.get("hermes_home"):
 +            self._hermes_home = Path(kwargs["hermes_home"])
- 
+
      def on_session_reset(self) -> None:
          super().on_session_reset()

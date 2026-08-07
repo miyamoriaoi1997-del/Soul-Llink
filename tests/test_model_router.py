@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from model_router import app
+from packages.model_router import app
 
 
 class _FakeConfig:

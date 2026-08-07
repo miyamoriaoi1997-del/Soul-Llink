@@ -1,13 +1,16 @@
 host: hermes-agent
-adapter_version: "memory-authority-v1"
+adapter_version: "memory-authority-v2-generic-exclusive-provider"
 patch: patches/memory-authority-host-adapter.patch
 required_paths:
   - model_tools.py
   - agent/agent_init.py
   - agent/tool_executor.py
   - agent/agent_runtime_helpers.py
+  - hermes_cli/memory_setup.py
+  - hermes_cli/subcommands/memory.py
 created_paths:
-  - agent/soullink_memory_authority.py
+  - agent/memory_authority.py
+  - tests/agent/test_exclusive_memory_authority_contract.py
   - tests/agent/test_soullink_memory_authority_adapter.py
 verify_commands:
-  - ["{python}", -m, pytest, tests/agent/test_soullink_memory_authority_adapter.py, -q]
+  - ["{python}", -m, pytest, tests/agent/test_exclusive_memory_authority_contract.py, tests/agent/test_soullink_memory_authority_adapter.py, -q]

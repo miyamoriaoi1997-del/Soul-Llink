@@ -148,11 +148,15 @@ class SentimentResult:
 
 
 class SentimentAnalyzer:
-    """Lazy-loading wrapper around Chinese-Emotion-Small.
+    """Lazy-loading wrapper around the configured sentiment model.
 
-    Thread-safety: model loading is protected so background warmup and the
-    first uncertain user message cannot load weights concurrently.
+    The active model comes from SOULLINK_SENTIMENT_MODEL_ID (default:
+    Johnson8187/Chinese-Emotion-Small). Runs fully local from the HF cache
+    when HF_HUB_OFFLINE=1; falls back to rules-only on load failure.
     """
+
+    # Thread-safety: model loading is protected so background warmup and the
+    # first uncertain user message cannot load weights concurrently.
 
     _instance: Optional["SentimentAnalyzer"] = None
     _instances: Dict[Tuple[Optional[str], str], "SentimentAnalyzer"] = {}
@@ -225,7 +229,20 @@ class SentimentAnalyzer:
             self._last_load_error = None
             try:
                 import torch
-                from transformers import AutoTokenizer, AutoModelForSequenceClassification
+                from transformers import AutoModelForSequenceClassification
+
+                if self.model_id == MULTILINGUAL_MODEL_ID:
+                    # This checkpoint ships tokenizer.json, so it can use the
+                    # Rust tokenizer backend directly. Importing AutoTokenizer
+                    # here would eagerly import SentencePiece's legacy SWIG
+                    # extension on Windows even though it is not needed.
+                    from transformers import PreTrainedTokenizerFast
+
+                    tokenizer_loader = PreTrainedTokenizerFast
+                else:
+                    from transformers import AutoTokenizer
+
+                    tokenizer_loader = AutoTokenizer
 
                 logger.info(f"Loading sentiment model: {self.model_id}...")
                 t0 = time.time()
@@ -236,7 +253,7 @@ class SentimentAnalyzer:
                 if self.model_revision:
                     kwargs["revision"] = self.model_revision
 
-                self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, **kwargs)
+                self._tokenizer = tokenizer_loader.from_pretrained(self.model_id, **kwargs)
                 self._model = AutoModelForSequenceClassification.from_pretrained(
                     self.model_id, **kwargs
                 )
@@ -260,7 +277,7 @@ class SentimentAnalyzer:
                 return True
 
             except Exception as e:
-                logger.warning(f"Chinese-Emotion-Small unavailable: {e}. "
+                logger.warning(f"Sentiment model {self.model_id!r} unavailable: {e}. "
                                "Emotion system will use rules only.")
                 self._available = False
                 self._last_load_failure_at = time.time()

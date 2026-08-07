@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 from .projections.runtime import drain_transcript_projections
+from .classifier import EventClassifier
 from .store import EventStore
 
 _PROMPT_ROLES = {"system", "developer"}
@@ -30,11 +31,12 @@ class HermesHistoryIngestor:
         self.store = store
         self.hermes_db = Path(hermes_db)
 
-    def ingest(self, *, session_id: str | None = None) -> dict[str, int]:
+    def ingest(self, *, session_id: str | None = None, persona_mode: str | None = None) -> dict[str, int]:
         if not self.hermes_db.is_file():
             raise FileNotFoundError(f"Hermes session database is missing: {self.hermes_db}")
         uri = self.hermes_db.resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True) as conn:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
             conn.row_factory = sqlite3.Row
             session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
             message_columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
@@ -45,17 +47,19 @@ class HermesHistoryIngestor:
             sessions = self._sessions(conn, session_id=session_id)
             scanned = inserted = updated = existing = 0
             for session in sessions.values():
-                status = self._ingest_session(session)
+                status = self._ingest_session(session, persona_mode=persona_mode)
                 inserted += status == "inserted"
                 updated += status == "updated"
                 existing += status == "existing"
             for row in self._messages(conn, session_id=session_id):
                 scanned += 1
                 session = sessions.get(str(row["session_id"]), {})
-                status = self._ingest_message(dict(row), session)
+                status = self._ingest_message(dict(row), session, persona_mode=persona_mode)
                 inserted += status == "inserted"
                 updated += status == "updated"
                 existing += status == "existing"
+        finally:
+            conn.close()
         drain_transcript_projections(self.store)
         return {"scanned": scanned, "inserted": inserted, "updated": updated, "existing": existing, "sessions": len(sessions)}
 
@@ -73,19 +77,27 @@ class HermesHistoryIngestor:
             sql, params = sql + " WHERE session_id = ?", (session_id,)
         return conn.execute(sql + " ORDER BY id ASC", params)
 
-    def _event(self, *, external_id: str, kind: str, metadata: dict[str, Any], session_id: str, platform: str, role: str, content: str, sensitivity: str, subcategory: str) -> str:
+    def _event(self, *, external_id: str, kind: str, metadata: dict[str, Any], session_id: str, platform: str, role: str, content: str, sensitivity: str, subcategory: str, persona_mode: str | None = None) -> str:
         source_hash = _sha256(json.dumps({"external_id": external_id, "session_id": session_id, "role": role, "content": content, "metadata": metadata}, ensure_ascii=False, sort_keys=True))
+        classification = EventClassifier().classify(
+            role=role,
+            source="chat" if role == "user" else "hermes_state_db",
+            content=content,
+            persona_mode=persona_mode,
+            sensitivity=sensitivity,
+        )
         _, status = self.store.upsert_external_event(
             external_id=external_id, source_hash=source_hash, kind=kind, payload_metadata=metadata,
             session_id=session_id, conversation_id=session_id, platform=platform, role=role,
-            source="hermes_state_db", content=content, persona_mode=None, route_bucket=None,
-            model_hint=None, sensitivity=sensitivity, category="raw_conversation",
-            subcategory=subcategory, inject_policy="retrieve_only", classification_confidence=None,
-            classifier_version="hermes-history-v1",
+            source="hermes_state_db", content=content, persona_mode=persona_mode, route_bucket=None,
+            model_hint=None, sensitivity=classification.sensitivity if sensitivity == "normal" else sensitivity,
+            category=classification.category, subcategory=subcategory, inject_policy=classification.inject_policy,
+            classification_confidence=classification.confidence,
+            classifier_version=classification.classifier_version,
         )
         return status
 
-    def _ingest_session(self, session: dict[str, Any]) -> str:
+    def _ingest_session(self, session: dict[str, Any], *, persona_mode: str | None = None) -> str:
         session_id = str(session["id"])
         metadata = {
             "hermes_session_id": session_id, "source": session.get("source"),
@@ -97,14 +109,14 @@ class HermesHistoryIngestor:
         if prompt:
             metadata["system_prompt"] = {"storage": "hash_only", "sha256": _sha256(prompt), "chars": len(prompt)}
         content = json.dumps({"session_id": session_id, "state": "ended" if session.get("ended_at") else "active"}, ensure_ascii=False, sort_keys=True)
-        return self._event(external_id=f"hermes-session:{session_id}", kind="hermes_session", metadata=metadata, session_id=session_id, platform=str(session.get("source") or "unknown"), role="lifecycle", content=content, sensitivity="restricted", subcategory="session_lifecycle")
+        return self._event(external_id=f"hermes-session:{session_id}", kind="hermes_session", metadata=metadata, session_id=session_id, platform=str(session.get("source") or "unknown"), role="lifecycle", content=content, sensitivity="restricted", subcategory="session_lifecycle", persona_mode=persona_mode)
 
-    def _ingest_message(self, message: dict[str, Any], session: dict[str, Any]) -> str:
+    def _ingest_message(self, message: dict[str, Any], session: dict[str, Any], *, persona_mode: str | None = None) -> str:
         role = str(message.get("role") or "unknown")
         raw_content = str(message.get("content") or "")
         content = _prompt_reference(role, raw_content) if role in _PROMPT_ROLES else raw_content
         metadata = self._metadata(message, session)
-        return self._event(external_id=f"hermes-message:{int(message['id'])}", kind="hermes_message", metadata=metadata, session_id=str(message.get("session_id") or ""), platform=str(session.get("source") or "unknown"), role=role, content=content, sensitivity="restricted" if role in _PROMPT_ROLES else "normal", subcategory=role)
+        return self._event(external_id=f"hermes-message:{int(message['id'])}", kind="hermes_message", metadata=metadata, session_id=str(message.get("session_id") or ""), platform=str(session.get("source") or "unknown"), role=role, content=content, sensitivity="restricted" if role in _PROMPT_ROLES else "normal", subcategory=role, persona_mode=persona_mode)
 
     @staticmethod
     def _metadata(message: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:

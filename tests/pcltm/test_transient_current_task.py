@@ -26,12 +26,12 @@ def test_write_current_task_state_feeds_transient_layer(tmp_path):
         root=tmp_path,
     )
 
-    assert view.transient.items[0].path == "transient/current-task.md"
-    assert view.transient.items[0].body.strip() == "当前任务：把 current task 写入 transient 层。"
-    assert view.transient.items[0].memory_type == "TemporaryTaskState"
-    assert view.transient.items[0].ttl == "short"
-    assert view.transient.items[0].injection_policy == "transient_only"
-    assert view.context_summary()["selection_audit"]["warnings"] == []
+    assert (tmp_path / "transient" / "current-task.md").is_file()
+    assert "当前任务：把 current task 写入 transient 层。" in (
+        tmp_path / "transient" / "current-task.md"
+    ).read_text(encoding="utf-8")
+    assert view.selection_source == "retired_legacy_memfs_prompt"
+    assert view.render() == ""
 
 
 def test_write_current_task_state_overwrites_stable_slot(tmp_path):
@@ -61,9 +61,11 @@ def test_write_current_task_state_overwrites_stable_slot(tmp_path):
         buckets=["current_task"],
         root=tmp_path,
     )
-    assert len(view.transient.items) == 1
-    assert view.transient.items[0].description == "new task"
-    assert view.transient.items[0].body.strip() == "新任务。"
+    assert view.transient.items == []
+    assert view.selection_source == "retired_legacy_memfs_prompt"
+    persisted = (tmp_path / "transient" / "current-task.md").read_text(encoding="utf-8")
+    assert "新任务。" in persisted
+    assert "旧任务。" not in persisted
 
 
 def test_write_current_task_state_rejects_empty_body(tmp_path):

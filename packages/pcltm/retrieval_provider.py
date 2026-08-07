@@ -47,6 +47,12 @@ class AuthorityReference:
                 raise TypeError(f"{field} must be str")
             if len(value) != 64 or any(char not in "0123456789abcdefABCDEF" for char in value):
                 raise ValueError(f"{field} must be a 64-character hexadecimal digest")
+        for field in ("source_hash", "source_created_at"):
+            value = getattr(self, field)
+            if value is not None and type(value) is not str:
+                raise TypeError(f"{field} must be str or None")
+            if value == "":
+                raise ValueError(f"{field} must be non-empty when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +73,35 @@ class RetrievalRequest:
             raise ValueError("limit must be a positive integer")
         if type(self.include_sensitive) is not bool:
             raise TypeError("include_sensitive must be bool")
+        for field in ("session_id", "conversation_id", "platform", "persona_mode", "source"):
+            value = getattr(self, field)
+            if value is not None and type(value) is not str:
+                raise TypeError(f"{field} must be str or None")
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelScoreEvidence:
+    """Immutable evidence for one channel's ranked observation.
+
+    ``raw_score`` is deliberately retained as evidence only.  SoulLink's
+    rank fusion never compares or adds raw scores from different channels.
+    """
+
+    channel: str
+    channel_rank: int
+    raw_score: float
+
+    def __post_init__(self) -> None:
+        if type(self.channel) is not str or not self.channel:
+            raise ValueError("channel must be a non-empty string")
+        if type(self.channel_rank) is not int or isinstance(self.channel_rank, bool):
+            raise TypeError("channel_rank must be an exact int")
+        if self.channel_rank <= 0:
+            raise ValueError("channel_rank must be positive")
+        if type(self.raw_score) not in (int, float) or isinstance(self.raw_score, bool):
+            raise TypeError("raw_score must be numeric")
+        if not math.isfinite(float(self.raw_score)):
+            raise ValueError("raw_score must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +110,7 @@ class Candidate:
     score: float
     provider: str
     quote: str = ""
+    channel_evidence: tuple[ChannelScoreEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.reference) is not AuthorityReference:
@@ -85,6 +121,12 @@ class Candidate:
             raise ValueError("score must be finite")
         if type(self.provider) is not str or not self.provider:
             raise ValueError("provider must be a non-empty string")
+        if type(self.quote) is not str:
+            raise TypeError("quote must be str")
+        if type(self.channel_evidence) is not tuple or not all(
+            type(item) is ChannelScoreEvidence for item in self.channel_evidence
+        ):
+            raise TypeError("channel_evidence must be a tuple of ChannelScoreEvidence")
 
 
 @dataclass(frozen=True, slots=True)

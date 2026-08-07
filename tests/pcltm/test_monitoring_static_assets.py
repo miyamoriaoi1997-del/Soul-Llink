@@ -27,7 +27,7 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
         assert expected in html
     assert "MOCK SNAPSHOT" not in html
     assert "CONCEPT PROTOTYPE" not in html
-    assert "最近一次权威轮次捕获，以及它如何形成。" in html
+    assert "Soul 状态与决策权威" in html
     assert "对话处理中代表本轮实时数据；回复完成后代表最近已完成轮次" in html
     assert "此刻的状态，以及它如何形成。" not in html
     assert "上一轮对话的真实权威快照，以及它如何形成。" not in html
@@ -97,7 +97,7 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
     assert ".architecture-map" in css
     assert ".policy-grid" in css
     assert ".payload-grid" in css
-    assert ".emotion-axes{grid-template-columns:1fr" in css
+    assert ".emotion-axes{display:grid" in css
     assert "$('context-board').innerHTML=renderContextComposition" in js
     assert "$('emotion-board').innerHTML" in js
     assert '<details class="context-section' not in js
@@ -106,3 +106,17 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
     assert ".emotion-board{display:grid" in css
     assert "观测冲突" in js
     assert "selectedRecords(capture).length" in js
+    assert 'id="status-rail"' in html
+    assert 'id="posture-core"' in html
+    assert 'id="authority-core"' in html
+    assert 'id="semantic-core"' in html
+    assert "renderDecisionSurface" in js
+    assert "capture?.host_turn_count ?? capture?.turn_number" in js
+    assert "semantic_shadow" in js
+    assert "semantic_fusion" in js
+    assert "authority_source" in js
+    assert ".command-grid" in css
+    assert ".authority-track" in css
+    assert ".semantic-bar" in css
+    assert 'style="--confidence:' not in js
+    assert "mode-ring" in js

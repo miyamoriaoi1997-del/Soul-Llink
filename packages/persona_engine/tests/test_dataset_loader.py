@@ -4,8 +4,8 @@ import json
 import pytest
 from pathlib import Path
 
-from packages.persona_engine.persona_orchestrator.dataset_loader import DatasetLoader, DatasetValidator
-from packages.persona_engine.persona_orchestrator.evaluation_schema import EvaluationDataset, SingleTurnCase
+from persona_orchestrator.dataset_loader import DatasetLoader, DatasetValidator
+from persona_orchestrator.evaluation_schema import EvaluationDataset, SingleTurnCase
 
 
 class TestDatasetLoader:

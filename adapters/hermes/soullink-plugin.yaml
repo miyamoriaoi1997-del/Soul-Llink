@@ -2,3 +2,7 @@ name: soullink
 version: 0.1.0
 description: SoulLink/PCLTM local long-term memory provider backed by SoulLink var/pcltm-prod.db and var/memfs.
 kind: exclusive
+authority: soullink/pcltm
+blocked_host_tools:
+  - memory
+  - session_search
