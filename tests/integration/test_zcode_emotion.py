@@ -70,3 +70,28 @@ def test_emotion_bridge_isolation_between_roots(tmp_path: Path) -> None:
     a.update("你太厉害了")
     assert a.emotion_state().get("affection", 60) != 60 or a.emotion_state().get("emotion_score", 0) != 0
     assert b.emotion_state().get("affection") == 60
+
+
+def test_emotion_disabled_writes_nothing(tmp_path: Path) -> None:
+    """With emotion_enabled=false in adapter.json the bridge is inert: no
+    state, no files, no continuation — matching a deployment that stripped
+    the emotion layer."""
+    soullink = tmp_path / "zcode" / "soullink"
+    soullink.mkdir(parents=True)
+    (soullink / "adapter.json").write_text(
+        json.dumps({"emotion_enabled": False}), encoding="utf-8"
+    )
+    bridge = EmotionBridge(tmp_path / "zcode")
+    assert bridge.update("你太厉害了，我爱你！") == {}
+    assert bridge.emotion_state() == {}
+    assert bridge.tone_modifier() == ""
+    assert bridge.continuation_request() == {}
+    assert not (soullink / "STATE.md").exists()
+    assert not (soullink / "emotion-state.json").exists()
+
+
+def test_emotion_enabled_default_when_adapter_absent(tmp_path: Path) -> None:
+    """No adapter.json means enabled (the PR default keeps emotion on)."""
+    bridge = EmotionBridge(tmp_path / "zcode")
+    state = bridge.emotion_state()
+    assert state.get("affection") == 60

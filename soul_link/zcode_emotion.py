@@ -63,6 +63,8 @@ class EmotionBridge:
     def _manager_or_none(self) -> Any:
         if self._manager is not None:
             return self._manager
+        if not self._enabled():
+            return None
         try:
             from persona_engine.emotion_state_manager import EmotionStateManager
 
@@ -74,6 +76,18 @@ class EmotionBridge:
             self._init_error = str(exc)
             return None
         return self._manager
+
+    def _enabled(self) -> bool:
+        """Whether the emotion layer is enabled for this deployment.
+
+        Reads ``soullink/adapter.json``; absent or ``true`` means enabled,
+        ``false`` strips the emotion layer for the deployment while leaving
+        the code intact (the persona engine is never imported)."""
+        try:
+            adapter = json.loads((self.soullink_dir / "adapter.json").read_text(encoding="utf-8"))
+            return bool(adapter.get("emotion_enabled", True))
+        except (OSError, json.JSONDecodeError):
+            return True
 
     def update(self, prompt: str, *, session_id: str = "") -> dict[str, Any]:
         """Detect emotion from the user turn, persist state, and update the
