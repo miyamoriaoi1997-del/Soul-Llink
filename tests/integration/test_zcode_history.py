@@ -70,7 +70,7 @@ def test_ingest_zcode_history_into_pcltm(tmp_path: Path) -> None:
         assert result["inserted"] == 3
         first = store.find_ingest_event("zcode-message:1")
         assert first is not None
-        assert first["payload_metadata"]["zcode_message_id"] == 1
+        assert first["payload_metadata"]["zcode_message_id"] == "1"
         from pcltm.transcript_search import search_exact_evidence
 
         exact = search_exact_evidence(store, "hello soul", limit=1)
