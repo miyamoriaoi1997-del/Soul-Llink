@@ -160,10 +160,28 @@ def _serialize_brief(item: Any) -> dict[str, Any]:
     }
 
 
+WRITE_TOOLS = ("soullink_memory_remember",)
+
+
+def _is_write_tool(name: str) -> bool:
+    return name in WRITE_TOOLS
+
+
 def _pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     event = "PreToolUse"
     name = _tool_name(payload)
     _audit(payload, event, tool_name=name, tool_use_id=_tool_use_id(payload))
+    # Read tools always pass; only memory writes are gated. Deny with a
+    # decision only when the agent attempts a governed write without
+    # operator authorization.
+    if not _is_write_tool(name):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "SoulLink/PCLTM read tool",
+            }
+        }
     if not _write_gated():
         return {
             "hookSpecificOutput": {
@@ -187,6 +205,9 @@ def _permission_request(payload: dict[str, Any]) -> dict[str, Any]:
     event = "PermissionRequest"
     name = _tool_name(payload)
     _audit(payload, event, tool_name=name, tool_use_id=_tool_use_id(payload))
+    # Only memory-write tools are gated; other tools pass through untouched.
+    if not _is_write_tool(name):
+        return {}
     return {
         "hookSpecificOutput": {
             "hookEventName": event,

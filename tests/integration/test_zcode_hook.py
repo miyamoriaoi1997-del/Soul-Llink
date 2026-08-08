@@ -115,6 +115,25 @@ def test_permission_request_decision_matches_authorization(tmp_path: Path, monke
     assert result["hookSpecificOutput"]["decision"]["behavior"] == "allow"
 
 
+def test_pre_tool_use_read_tools_always_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    monkeypatch.delenv("SOULLINK_ZCODE_ALLOW_MEMORY_WRITES", raising=False)
+    result = handle_hook({
+        "hook_event_name": "PreToolUse", "session_id": "s1",
+        "tool_name": "soullink_memory_search", "tool_use_id": "call_1",
+    })
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+def test_permission_request_non_write_tool_is_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    result = handle_hook({
+        "hook_event_name": "PermissionRequest", "session_id": "s1",
+        "tool_name": "Bash", "tool_use_id": "call_1",
+    })
+    assert result == {}
+
+
 def test_post_tool_use_captures_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
     captured: dict[str, object] = {}

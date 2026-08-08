@@ -113,13 +113,13 @@ class ZCodeHistoryIngestor:
 
     def _ingest_message(self, message: dict[str, Any], parts: list[dict[str, Any]], *, persona_mode: str | None = None) -> str:
         data = _json_value(message.get("data")) or {}
-        message_id = int(message["id"])
+        message_id = str(message["id"])
         session_id = str(message.get("session_id") or "")
         role = str(data.get("role") or "unknown")
         content = "".join(
             str(part["text"])
             for part in parts
-            if part["message_id"] == message_id and part.get("type") == "text" and part.get("text")
+            if str(part["message_id"]) == message_id and part.get("type") == "text" and part.get("text")
         )
         raw_content = content
         content = _prompt_reference(role, raw_content) if role in _PROMPT_ROLES else raw_content
