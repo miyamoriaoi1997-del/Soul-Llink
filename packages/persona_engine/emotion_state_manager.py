@@ -661,9 +661,9 @@ class EmotionStateManager:
         modifier_result = self.calculator.get_tone_modifiers(current_state, mood_bias=mood_bias)
 
         dimensions = modifier_result.get("dimensions", {})
-        if not dimensions and not mood_entry.active:
-            return ""
-
+        # Always emit the compact control anchor.  A neutral state still needs
+        # the explicit trajectory and boundary contract so the final prompt
+        # cannot accidentally inherit stale emotion text from an earlier turn.
         overall_intensity = modifier_result["overall_intensity"]
         overall_direction = modifier_result.get("overall_direction", "positive")
         desire = modifier_result.get("desire", "")
@@ -788,6 +788,7 @@ class EmotionStateManager:
         if mood_text:
             parts.append(mood_text)
         parts.append("【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。")
+        parts.append("【范围】不改真实STATE，不单独触发sex，不覆盖work或crisis边界。")
 
         modifier_body = "\n".join(parts)
         return f"<emotion_modifier>\n{modifier_body}\n</emotion_modifier>"
