@@ -32,6 +32,27 @@ def test_session_start_injects_bounded_identity_context(tmp_path: Path, monkeypa
     assert len(context) <= 12000
 
 
+def test_session_start_emotion_block_is_not_double_nested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    result = handle_hook({"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"})
+    context = result["hookSpecificOutput"]["additionalContext"]
+    # The persona engine already wraps the tone in <emotion_modifier> tags;
+    # a second wrapper would double-nest the block.
+    assert context.count("<emotion_modifier>") <= 1
+
+
+def test_user_prompt_emotion_block_is_not_double_nested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    monkeypatch.setenv("HERMES_PCLTM_MEMFS_ROOT", str(tmp_path / "memfs"))
+    monkeypatch.setenv("HERMES_PCLTM_DB", str(tmp_path / "pcltm.db"))
+    result = handle_hook({
+        "hook_event_name": "UserPromptSubmit", "session_id": "s1",
+        "prompt": "你太厉害了，我爱你！",
+    })
+    context = result.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert context.count("<emotion_modifier>") <= 1
+
+
 class _FakeItem:
     claim_id = 1
     target = "memory"
