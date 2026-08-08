@@ -18,6 +18,8 @@ ALL_EVENTS = {
 def _isolated_zcode_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every hook test must write audits to a temp ZCode root, never the real user dir."""
     monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    monkeypatch.setenv("HERMES_PCLTM_MEMFS_ROOT", str(tmp_path / "memfs"))
+    monkeypatch.setenv("HERMES_PCLTM_DB", str(tmp_path / "pcltm.db"))
 
 
 def test_session_start_injects_bounded_identity_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

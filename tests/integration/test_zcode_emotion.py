@@ -11,6 +11,8 @@ from soul_link.zcode_emotion import EmotionBridge
 @pytest.fixture(autouse=True)
 def _isolated_zcode_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    monkeypatch.setenv("HERMES_PCLTM_MEMFS_ROOT", str(tmp_path / "memfs"))
+    monkeypatch.setenv("HERMES_PCLTM_DB", str(tmp_path / "pcltm.db"))
 
 
 def test_emotion_bridge_updates_state_and_writes_files(tmp_path: Path) -> None:
