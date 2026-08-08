@@ -48,7 +48,6 @@ HOOK_EVENTS = (
     "PostToolUseFailure",
     "Stop",
 )
-HOOK_DESCRIPTION = "SoulLink/PCLTM managed hook"
 MCP_SERVER_NAME = "soullink"
 ENABLED_TOOLS = (
     "soullink_memory_search",
@@ -255,7 +254,7 @@ class ZCodeDeployment:
         hooks_valid = (
             isinstance(hooks, dict)
             and hooks.get("enabled") is True
-            and all(self._event_hook_valid(events.get(event), command, args) for event in HOOK_EVENTS)
+            and all(self._event_hook_valid(event, events.get(event), command, args) for event in HOOK_EVENTS)
         )
         agents_ok = True
         if self.manage_agents:
@@ -331,12 +330,13 @@ class ZCodeDeployment:
             groups = events.setdefault(event, [])
             if not isinstance(groups, list):
                 raise RuntimeError(f"hooks.events.{event} is not a list; refusing to rewrite")
-            groups[:] = [g for g in groups if g.get("description") != HOOK_DESCRIPTION]
-            groups.append({
-                "description": HOOK_DESCRIPTION,
-                "matcher": WRITE_TOOL if event in ("PreToolUse", "PermissionRequest") else None,
+            groups[:] = [g for g in groups if not self._is_managed_group(g, command, args)]
+            group: dict[str, object] = {
                 "hooks": [{"type": "process", "command": command, "args": args, "timeoutMs": 30000}],
-            })
+            }
+            if event in ("PreToolUse", "PermissionRequest"):
+                group["matcher"] = WRITE_TOOL
+            groups.append(group)
         config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if self.manage_agents:
             agents_path = root / AGENTS_MANAGED
@@ -508,11 +508,32 @@ class ZCodeDeployment:
             raise RuntimeError("deployment marker has invalid fingerprints")
 
     @staticmethod
-    def _event_hook_valid(groups: object, command: str, args: list[str]) -> bool:
+    def _is_managed_group(group: object, command: str, args: list[str]) -> bool:
+        """A group is SoulLink-managed when its handler matches our launch command."""
+        handlers = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(handlers, list):
+            return False
+        return any(
+            isinstance(handler, dict)
+            and handler.get("type") == "process"
+            and handler.get("command") == command
+            and handler.get("args") == args
+            for handler in handlers
+        )
+
+    @staticmethod
+    def _event_hook_valid(event: str, groups: object, command: str, args: list[str]) -> bool:
         if not isinstance(groups, list):
             return False
         for group in groups:
-            if not isinstance(group, dict) or group.get("description") != HOOK_DESCRIPTION:
+            if not isinstance(group, dict) or "description" in group:
+                continue
+            # Write-gated events must pin a string matcher; other events must
+            # omit the matcher entirely (a null matcher fails ZCode validation).
+            if event in ("PreToolUse", "PermissionRequest"):
+                if group.get("matcher") != WRITE_TOOL:
+                    continue
+            elif "matcher" in group:
                 continue
             handlers = group.get("hooks")
             if not isinstance(handlers, list):
