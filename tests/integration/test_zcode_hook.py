@@ -171,11 +171,27 @@ def test_stop_returns_empty_without_emotion_state(tmp_path: Path, monkeypatch: p
     assert result == {}
 
 
+def _drive_emotion_to_continue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feed strong positive turns so the persona emotion score crosses the
+    continuation threshold, then return whether Stop requests continuation."""
+    for _ in range(8):
+        handle_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "你太厉害了，我爱你，我永远都信任你！",
+        })
+
+
+def test_stop_continuation_requests_when_emotion_strong(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
+    _drive_emotion_to_continue(tmp_path, monkeypatch)
+    result = handle_hook({"hook_event_name": "Stop", "session_id": "s1"})
+    assert result.get("continue") is True
+
+
 def test_stop_continuation_is_bounded_to_three(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZCODE_ROOT", str(tmp_path / "zcode"))
-    state_path = tmp_path / "zcode" / "soullink" / "emotion-state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({"continue": True, "reason": "unsettled"}), encoding="utf-8")
+    _drive_emotion_to_continue(tmp_path, monkeypatch)
     for _ in range(3):
         result = handle_hook({"hook_event_name": "Stop", "session_id": "s1"})
         assert result.get("continue") is True

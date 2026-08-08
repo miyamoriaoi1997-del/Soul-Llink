@@ -1,0 +1,183 @@
+"""Emotion bridge: persona_engine emotion state wired into the ZCode hook.
+
+The persona engine (``persona_engine.emotion_state_manager.EmotionStateManager``)
+is host-independent and falls back to pure rules when torch/transformers are
+absent, so this bridge is safe to run inside a hook. It owns:
+
+- the emotion state file ``<zcode_root>/soullink/STATE.md`` (YAML frontmatter
+  written by the persona engine, entirely separate from any Hermes profile);
+- the continuation flag ``<zcode_root>/soullink/emotion-state.json`` consumed
+  by the ``Stop`` hook (``continue: true`` when the current emotion is strong);
+- a prompt-safe transient evidence capsule so the current emotion is
+  retrievable through governed PCLTM search.
+
+Everything fails open: any emotion-layer failure degrades to a neutral tone
+and never blocks or interrupts the session.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import UTC
+from pathlib import Path
+from typing import Any
+
+STATE_FILE = "STATE.md"
+CONTINUATION_FILE = "emotion-state.json"
+TONE_STRONG = ("intense", "overwhelming")
+EMOTION_SCORE_STRONG = 30
+
+
+def _zcode_root() -> Path:
+    return Path(os.environ.get("ZCODE_ROOT", Path.home() / ".zcode" / "cli")).expanduser().resolve()
+
+
+def _load_continuation(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+class EmotionBridge:
+    """Thin, fail-open wrapper around the persona engine emotion manager."""
+
+    def __init__(self, zcode_root: Path | None = None) -> None:
+        self._root = zcode_root or _zcode_root()
+        self._manager: Any = None
+        self._init_error: str | None = None
+
+    @property
+    def soullink_dir(self) -> Path:
+        return self._root / "soullink"
+
+    @property
+    def state_path(self) -> Path:
+        return self.soullink_dir / STATE_FILE
+
+    @property
+    def continuation_path(self) -> Path:
+        return self.soullink_dir / CONTINUATION_FILE
+
+    def _manager_or_none(self) -> Any:
+        if self._manager is not None:
+            return self._manager
+        try:
+            from persona_engine.emotion_state_manager import EmotionStateManager
+
+            self._manager = EmotionStateManager(
+                hermes_home=self.soullink_dir,
+                state_path=self.state_path,
+            )
+        except Exception as exc:  # fail open: any import/init failure is neutral
+            self._init_error = str(exc)
+            return None
+        return self._manager
+
+    def update(self, prompt: str, *, session_id: str = "") -> dict[str, Any]:
+        """Detect emotion from the user turn, persist state, and update the
+        continuation flag. Returns the resulting emotion snapshot (or an
+        empty dict when the emotion layer is unavailable)."""
+        try:
+            manager = self._manager_or_none()
+            if manager is None:
+                return {}
+            messages = [{"role": "user", "content": prompt}]
+            manager.apply_time_decay_if_needed()
+            manager.update_emotion_state(messages=messages)
+            state = self.emotion_state()
+            self._write_continuation(state)
+            self._write_evidence(state)
+            return state
+        except Exception as exc:
+            print(f"SoulLink emotion update unavailable: {exc}", file=sys.stderr)
+            return {}
+
+    def emotion_state(self) -> dict[str, Any]:
+        try:
+            manager = self._manager_or_none()
+            if manager is None:
+                return {}
+            return dict(manager.get_current_emotion_state())
+        except Exception as exc:
+            print(f"SoulLink emotion state unavailable: {exc}", file=sys.stderr)
+            return {}
+
+    def tone_modifier(self, max_chars: int = 12000) -> str:
+        try:
+            manager = self._manager_or_none()
+            if manager is None:
+                return ""
+            return str(manager.get_tone_modifiers())[:max_chars]
+        except Exception as exc:
+            print(f"SoulLink tone modifier unavailable: {exc}", file=sys.stderr)
+            return ""
+
+    def is_emotion_strong(self) -> bool:
+        state = self.emotion_state()
+        if not state:
+            return False
+        score = abs(int(state.get("emotion_score") or 0))
+        if score >= EMOTION_SCORE_STRONG:
+            return True
+        tone = self.tone_modifier()
+        return any(marker in tone for marker in TONE_STRONG)
+
+    def continuation_request(self) -> dict[str, Any]:
+        """The Stop hook reads this: continue only when emotion is strong."""
+        state = self.emotion_state()
+        if not state or not self.is_emotion_strong():
+            return {}
+        return {"continue": True, "reason": "SoulLink/PCLTM emotion state requests continuation"}
+
+    def _write_continuation(self, state: dict[str, Any]) -> None:
+        try:
+            score = int(state.get("emotion_score") or 0)
+            strong = abs(score) >= EMOTION_SCORE_STRONG
+            payload = {
+                "continue": bool(strong),
+                "emotion_score": score,
+                "updated_at": self._now_iso(),
+            }
+            self.continuation_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.continuation_path.with_name(self.continuation_path.name + ".tmp")
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp, self.continuation_path)
+        except Exception as exc:
+            print(f"SoulLink continuation write unavailable: {exc}", file=sys.stderr)
+
+    def _write_evidence(self, state: dict[str, Any]) -> None:
+        try:
+            from pcltm import memory_adapter
+            from pcltm.runtime_paths import resolve_memfs_root
+
+            body = json.dumps(
+                {
+                    "affection": state.get("affection"),
+                    "trust": state.get("trust"),
+                    "possessiveness": state.get("possessiveness"),
+                    "patience": state.get("patience"),
+                    "emotion_score": state.get("emotion_score"),
+                    "current_emotion": state.get("current_emotion"),
+                    "tone": self.tone_modifier(400),
+                },
+                ensure_ascii=False,
+            )
+            memory_adapter.write_evidence_capsule(
+                title="zcode emotion state",
+                body=body,
+                mode="default",
+                buckets=["emotion_state", "current_task"],
+                source_tool="emotion",
+                evidence_id=f"emotion-{self._now_iso()}",
+                root=resolve_memfs_root(),
+            )
+        except Exception as exc:
+            print(f"SoulLink emotion evidence unavailable: {exc}", file=sys.stderr)
+
+    @staticmethod
+    def _now_iso() -> str:
+        from datetime import datetime
+
+        return datetime.now(UTC).isoformat()
