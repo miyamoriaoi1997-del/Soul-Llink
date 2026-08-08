@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 6f89ed237..1227b95c7 100644
+index 6f89ed23..1227b95c 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -1679,8 +1679,12 @@ def init_agent(
@@ -58,7 +58,7 @@ index 6f89ed237..1227b95c7 100644
          # threshold (including the Codex gpt-5.5 autoraise above) only
          # configures the built-in ContextCompressor and never reaches the
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 062549ed7..0019e0a09 100644
+index 062549ed..0019e0a0 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -2816,6 +2816,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
@@ -74,6 +74,349 @@ index 062549ed7..0019e0a09 100644
      try:
          from hermes_cli.middleware import apply_tool_request_middleware
  
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index f2f48f53..619186aa 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2388,6 +2388,24 @@ def run_conversation(
+                             is_github_responses=agent._is_copilot_url(),
+                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                         )
++
++                    # Execution middleware has completed and transport preflight
++                    # is final. Observe the exact message array this attempt will
++                    # forward; observers are best-effort and never block I/O.
++                    _final_forward_messages = next_api_kwargs.get("messages")
++                    if not isinstance(_final_forward_messages, list):
++                        _final_forward_messages = next_api_kwargs.get("input")
++                    if isinstance(_final_forward_messages, list):
++                        try:
++                            agent._memory_manager.on_before_model_forward(
++                                _final_forward_messages
++                            )
++                        except Exception:
++                            logger.debug(
++                                "Memory final-forward observers failed",
++                                exc_info=True,
++                            )
++
+                     if _use_streaming:
+                         return agent._interruptible_streaming_api_call(
+                             next_api_kwargs, on_first_delta=_stop_spinner
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 6f3bbadd..e5d0a8d7 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -621,6 +621,17 @@ class MemoryManager:
+ 
+         self._submit_background(_run, kind="prefetch")
+ 
++    def on_before_model_forward(self, api_messages: List[Dict[str, Any]]) -> None:
++        """Notify providers after final host request rewriting, before outbound I/O."""
++        for provider in self._providers:
++            try:
++                provider.on_before_model_forward(api_messages)
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' final-forward observer failed: %s",
++                    provider.name, e,
++                )
++
+     # -- Sync ----------------------------------------------------------------
+ 
+     @staticmethod
+@@ -848,6 +859,37 @@ class MemoryManager:
+ 
+     # -- Lifecycle hooks -----------------------------------------------------
+ 
++    @staticmethod
++    def _merge_request_mappings(target: Dict[str, Any], source: Dict[str, Any]) -> None:
++        for key, value in source.items():
++            if isinstance(value, dict) and isinstance(target.get(key), dict):
++                MemoryManager._merge_request_mappings(target[key], value)
++            elif isinstance(value, dict):
++                nested: Dict[str, Any] = {}
++                MemoryManager._merge_request_mappings(nested, value)
++                target[key] = nested
++            else:
++                target[key] = value
++
++    def request_overrides(self) -> Dict[str, Any]:
++        """Merge request-scoped overrides from all providers.
++
++        Later providers win on scalar conflicts while nested mappings such as
++        ``extra_body.metadata`` are merged rather than replaced.
++        """
++        merged: Dict[str, Any] = {}
++        for provider in self._providers:
++            try:
++                value = provider.request_overrides()
++                if isinstance(value, dict):
++                    self._merge_request_mappings(merged, value)
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' request_overrides failed: %s",
++                    provider.name, e,
++                )
++        return merged
++
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Notify all providers of a new turn.
+ 
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 559fc3df..ad87b817 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -192,6 +192,21 @@ class MemoryProvider(ABC):
+ 
+     # -- Optional hooks (override to opt in) ---------------------------------
+ 
++    def request_overrides(self) -> Dict[str, Any]:
++        """Return request-scoped API kwargs derived from this provider's turn state.
++
++        Providers must return only data for the current turn and clear stale
++        values before computing a new turn. The manager merges nested mappings.
++        """
++        return {}
++
++    def on_before_model_forward(self, api_messages: List[Dict[str, Any]], **kwargs) -> None:
++        """Observe final host API messages immediately before model forwarding.
++
++        Implementations must treat this as observational: exceptions are
++        contained by MemoryManager and never block the outbound request.
++        """
++
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Called at the start of each turn with the user message.
+ 
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index 49ef5a9c..e1ed01aa 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -580,9 +580,19 @@ class ChatCompletionsTransport(ProviderTransport):
+         if extra_body:
+             api_kwargs["extra_body"] = extra_body
+ 
+-        # Request overrides last (service_tier etc.)
++        # Request overrides last (service_tier, request metadata, etc.).
++        # Merge nested extra_body instead of replacing provider additions.
+         overrides = params.get("request_overrides")
+         if overrides:
++            overrides = dict(overrides)
++            override_extra_body = overrides.pop("extra_body", None)
++            if isinstance(override_extra_body, dict):
++                for key, value in override_extra_body.items():
++                    if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
++                        extra_body[key] = {**extra_body[key], **value}
++                    else:
++                        extra_body[key] = value
++                api_kwargs["extra_body"] = extra_body
+             api_kwargs.update(overrides)
+ 
+         _add_prompt_cache_key(
+@@ -703,12 +713,16 @@ class ChatCompletionsTransport(ProviderTransport):
+         if additions:
+             extra_body.update(additions)
+ 
+-        # Request overrides (user config)
++        # Request overrides (user config and current-turn provider metadata)
+         overrides = params.get("request_overrides")
+         if overrides:
+             for k, v in overrides.items():
+                 if k == "extra_body" and isinstance(v, dict):
+-                    extra_body.update(v)
++                    for body_key, body_value in v.items():
++                        if isinstance(body_value, dict) and isinstance(extra_body.get(body_key), dict):
++                            extra_body[body_key] = {**extra_body[body_key], **body_value}
++                        else:
++                            extra_body[body_key] = body_value
+                 else:
+                     api_kwargs[k] = v
+ 
+diff --git a/agent/verification_stop.py b/agent/verification_stop.py
+index dc669448..0499b58f 100644
+--- a/agent/verification_stop.py
++++ b/agent/verification_stop.py
+@@ -202,6 +202,40 @@ def _status_detail(status: dict[str, Any]) -> str:
+     return "\n".join(parts)
+ 
+ 
++def _top_level_subsystems(paths: list[str], root: str | None) -> set[str]:
++    """Return changed top-level directories that are inside the project root."""
++    if not root:
++        return set()
++    try:
++        root_path = Path(root).resolve()
++    except Exception:
++        return set()
++    subsystems: set[str] = set()
++    for raw in paths:
++        try:
++            relative = Path(raw).resolve().relative_to(root_path)
++        except (OSError, ValueError):
++            continue
++        if len(relative.parts) > 1:
++            subsystems.add(relative.parts[0])
++    return subsystems
++
++
++def _verification_scope_instruction(paths: list[str], facts: dict[str, Any]) -> str:
++    """Recommend the least costly check justified by the edit's blast radius."""
++    subsystems = _top_level_subsystems(paths, str(facts.get("root") or ""))
++    if len(subsystems) >= 3:
++        return (
++            "This edit crosses multiple top-level subsystems, so broader verification "
++            "is recommended after focused checks pass."
++        )
++    return (
++        "Prefer the smallest focused check that exercises the changed behavior. "
++        "A passing targeted test is sufficient for this gate when it covers the final "
++        "edit. Do not run the full suite solely to satisfy this gate."
++    )
++
++
+ def build_verify_on_stop_nudge(
+     *,
+     session_id: str | None,
+@@ -232,6 +266,8 @@ def build_verify_on_stop_nudge(
+     if state == "passed":
+         return None
+ 
++    scope_instruction = _verification_scope_instruction(paths, facts)
++
+     # Optional shipped coding guidance, only paid when this evidence gate fires.
+     try:
+         from agent.verify_hooks import coding_verify_guidance
+@@ -264,7 +300,7 @@ def build_verify_on_stop_nudge(
+         "fresh passing verification evidence yet.\n\n"
+         f"Verification status: {_status_detail(status)}\n\n"
+         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
+-        f"{command_instruction} If verification is not possible, explain the "
++        f"{scope_instruction}\n\n{command_instruction} If verification is not possible, explain the "
+         "concrete blocker instead of claiming the work is fully verified."
+         f"{addendum}]"
+     )
+diff --git a/hermes_cli/subcommands/memory.py b/hermes_cli/subcommands/memory.py
+index 23fe0b85..d9cff01e 100644
+--- a/hermes_cli/subcommands/memory.py
++++ b/hermes_cli/subcommands/memory.py
+@@ -18,8 +18,8 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
+             "Set up and manage external memory provider plugins.\n\n"
+             "Available providers: honcho, openviking, mem0, hindsight,\n"
+             "holographic, retaindb, byterover.\n\n"
+-            "Only one external provider can be active at a time.\n"
+-            "Built-in memory (MEMORY.md/USER.md) is always active."
++            "Only one provider can be active at a time. Providers declared\n"
++            "exclusive (including SoulLink/PCLTM) disable built-in memory and recall."
+         ),
+     )
+     memory_sub = memory_parser.add_subparsers(dest="memory_command")
+diff --git a/model_tools.py b/model_tools.py
+index a4ed0c20..ef5ab075 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -483,6 +483,20 @@ def _compute_tool_definitions(
+     # Ask the registry for schemas (only returns tools whose check_fn passes)
+     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+ 
++    # An exclusive provider is the canonical memory authority when configured.
++    # Hide retired host fallbacks even if provider loading later fails; that
++    # failure is an unavailable authority state, never permission to fallback.
++    try:
++        from agent.memory_authority import filter_tool_definitions
++        from hermes_cli.config import load_config_readonly
++
++        filtered_tools = filter_tool_definitions(
++            filtered_tools,
++            config=load_config_readonly(),
++        )
++    except Exception as exc:
++        logger.warning("Exclusive memory-authority schema gate unavailable: %s", exc)
++
+     # The set of tool names that actually passed check_fn filtering.
+     # Use this (not tools_to_include) for any downstream schema that references
+     # other tools by name — otherwise the model sees tools mentioned in
+diff --git a/tests/agent/test_memory_final_forward_observer.py b/tests/agent/test_memory_final_forward_observer.py
+new file mode 100644
+index 00000000..f986a932
+--- /dev/null
++++ b/tests/agent/test_memory_final_forward_observer.py
+@@ -0,0 +1,75 @@
++"""Regression contract for the final pre-model memory observer seam."""
++
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++from unittest.mock import MagicMock
++
++from agent.memory_manager import MemoryManager
++from agent.memory_provider import MemoryProvider
++
++
++class ObservingProvider(MemoryProvider):
++    def __init__(self, name: str = "observer") -> None:
++        self._name = name
++
++    @property
++    def name(self) -> str:
++        return self._name
++
++    def is_available(self) -> bool:
++        return True
++
++    def initialize(self, session_id: str, **kwargs) -> None:
++        return None
++
++    def sync_turn(self, user_content: str, assistant_content: str, **kwargs) -> None:
++        return None
++
++    def get_tool_schemas(self):
++        return []
++
++    def handle_tool_call(self, tool_name, args, **kwargs):
++        return "{}"
++
++
++def test_memory_manager_final_forward_observer_fans_out_and_contains_failures():
++    manager = MemoryManager()
++    broken = ObservingProvider("builtin")
++    broken.on_before_model_forward = MagicMock(side_effect=RuntimeError("boom"))
++    observed = ObservingProvider("observer")
++    observed.on_before_model_forward = MagicMock()
++    manager.add_provider(broken)
++    manager.add_provider(observed)
++    final_messages = [{"role": "user", "content": "final outbound"}]
++
++    manager.on_before_model_forward(final_messages)
++
++    broken.on_before_model_forward.assert_called_once_with(final_messages)
++    observed.on_before_model_forward.assert_called_once_with(final_messages)
++
++
++def test_conversation_loop_observes_after_execution_middleware_at_final_forward_boundary():
++    source = Path(__file__).parents[2] / "agent" / "conversation_loop.py"
++    text = source.read_text(encoding="utf-8")
++    tree = ast.parse(text)
++    calls = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr == "on_before_model_forward"
++    ]
++    assert calls, "final host request never notifies memory observers"
++    observer_line = min(node.lineno for node in calls)
++
++    final_forward = next(
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.FunctionDef) and node.name == "_perform_api_call"
++    )
++    assert final_forward.lineno < observer_line < final_forward.end_lineno
++    observer_offset = text.index("on_before_model_forward")
++    assert text.index("preflight_kwargs", observer_offset - 1200) < observer_offset
++    assert observer_offset < text.index("_interruptible_streaming_api_call", observer_offset)
 diff --git a/agent/memory_authority.py b/agent/memory_authority.py
 new file mode 100644
 index 000000000..11581122a
@@ -226,239 +569,6 @@ index 000000000..11581122a
 +        },
 +        ensure_ascii=False,
 +    )
-diff --git a/agent/memory_manager.py b/agent/memory_manager.py
-index 6f3bbadd6..e5d0a8d78 100644
---- a/agent/memory_manager.py
-+++ b/agent/memory_manager.py
-@@ -621,6 +621,17 @@ class MemoryManager:
- 
-         self._submit_background(_run, kind="prefetch")
- 
-+    def on_before_model_forward(self, api_messages: List[Dict[str, Any]]) -> None:
-+        """Notify providers after final host request rewriting, before outbound I/O."""
-+        for provider in self._providers:
-+            try:
-+                provider.on_before_model_forward(api_messages)
-+            except Exception as e:
-+                logger.debug(
-+                    "Memory provider '%s' final-forward observer failed: %s",
-+                    provider.name, e,
-+                )
-+
-     # -- Sync ----------------------------------------------------------------
- 
-     @staticmethod
-@@ -848,6 +859,37 @@ class MemoryManager:
- 
-     # -- Lifecycle hooks -----------------------------------------------------
- 
-+    @staticmethod
-+    def _merge_request_mappings(target: Dict[str, Any], source: Dict[str, Any]) -> None:
-+        for key, value in source.items():
-+            if isinstance(value, dict) and isinstance(target.get(key), dict):
-+                MemoryManager._merge_request_mappings(target[key], value)
-+            elif isinstance(value, dict):
-+                nested: Dict[str, Any] = {}
-+                MemoryManager._merge_request_mappings(nested, value)
-+                target[key] = nested
-+            else:
-+                target[key] = value
-+
-+    def request_overrides(self) -> Dict[str, Any]:
-+        """Merge request-scoped overrides from all providers.
-+
-+        Later providers win on scalar conflicts while nested mappings such as
-+        ``extra_body.metadata`` are merged rather than replaced.
-+        """
-+        merged: Dict[str, Any] = {}
-+        for provider in self._providers:
-+            try:
-+                value = provider.request_overrides()
-+                if isinstance(value, dict):
-+                    self._merge_request_mappings(merged, value)
-+            except Exception as e:
-+                logger.debug(
-+                    "Memory provider '%s' request_overrides failed: %s",
-+                    provider.name, e,
-+                )
-+        return merged
-+
-     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-         """Notify all providers of a new turn.
- 
-diff --git a/agent/memory_provider.py b/agent/memory_provider.py
-index 559fc3df6..ad87b8172 100644
---- a/agent/memory_provider.py
-+++ b/agent/memory_provider.py
-@@ -192,6 +192,21 @@ class MemoryProvider(ABC):
- 
-     # -- Optional hooks (override to opt in) ---------------------------------
- 
-+    def request_overrides(self) -> Dict[str, Any]:
-+        """Return request-scoped API kwargs derived from this provider's turn state.
-+
-+        Providers must return only data for the current turn and clear stale
-+        values before computing a new turn. The manager merges nested mappings.
-+        """
-+        return {}
-+
-+    def on_before_model_forward(self, api_messages: List[Dict[str, Any]], **kwargs) -> None:
-+        """Observe final host API messages immediately before model forwarding.
-+
-+        Implementations must treat this as observational: exceptions are
-+        contained by MemoryManager and never block the outbound request.
-+        """
-+
-     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-         """Called at the start of each turn with the user message.
- 
-diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
-index 49ef5a9c5..e1ed01aa5 100644
---- a/agent/transports/chat_completions.py
-+++ b/agent/transports/chat_completions.py
-@@ -580,9 +580,19 @@ class ChatCompletionsTransport(ProviderTransport):
-         if extra_body:
-             api_kwargs["extra_body"] = extra_body
- 
--        # Request overrides last (service_tier etc.)
-+        # Request overrides last (service_tier, request metadata, etc.).
-+        # Merge nested extra_body instead of replacing provider additions.
-         overrides = params.get("request_overrides")
-         if overrides:
-+            overrides = dict(overrides)
-+            override_extra_body = overrides.pop("extra_body", None)
-+            if isinstance(override_extra_body, dict):
-+                for key, value in override_extra_body.items():
-+                    if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
-+                        extra_body[key] = {**extra_body[key], **value}
-+                    else:
-+                        extra_body[key] = value
-+                api_kwargs["extra_body"] = extra_body
-             api_kwargs.update(overrides)
- 
-         _add_prompt_cache_key(
-@@ -703,12 +713,16 @@ class ChatCompletionsTransport(ProviderTransport):
-         if additions:
-             extra_body.update(additions)
- 
--        # Request overrides (user config)
-+        # Request overrides (user config and current-turn provider metadata)
-         overrides = params.get("request_overrides")
-         if overrides:
-             for k, v in overrides.items():
-                 if k == "extra_body" and isinstance(v, dict):
--                    extra_body.update(v)
-+                    for body_key, body_value in v.items():
-+                        if isinstance(body_value, dict) and isinstance(extra_body.get(body_key), dict):
-+                            extra_body[body_key] = {**extra_body[body_key], **body_value}
-+                        else:
-+                            extra_body[body_key] = body_value
-                 else:
-                     api_kwargs[k] = v
- 
-diff --git a/agent/verification_stop.py b/agent/verification_stop.py
-index dc6694488..0499b58fb 100644
---- a/agent/verification_stop.py
-+++ b/agent/verification_stop.py
-@@ -202,6 +202,40 @@ def _status_detail(status: dict[str, Any]) -> str:
-     return "\n".join(parts)
- 
- 
-+def _top_level_subsystems(paths: list[str], root: str | None) -> set[str]:
-+    """Return changed top-level directories that are inside the project root."""
-+    if not root:
-+        return set()
-+    try:
-+        root_path = Path(root).resolve()
-+    except Exception:
-+        return set()
-+    subsystems: set[str] = set()
-+    for raw in paths:
-+        try:
-+            relative = Path(raw).resolve().relative_to(root_path)
-+        except (OSError, ValueError):
-+            continue
-+        if len(relative.parts) > 1:
-+            subsystems.add(relative.parts[0])
-+    return subsystems
-+
-+
-+def _verification_scope_instruction(paths: list[str], facts: dict[str, Any]) -> str:
-+    """Recommend the least costly check justified by the edit's blast radius."""
-+    subsystems = _top_level_subsystems(paths, str(facts.get("root") or ""))
-+    if len(subsystems) >= 3:
-+        return (
-+            "This edit crosses multiple top-level subsystems, so broader verification "
-+            "is recommended after focused checks pass."
-+        )
-+    return (
-+        "Prefer the smallest focused check that exercises the changed behavior. "
-+        "A passing targeted test is sufficient for this gate when it covers the final "
-+        "edit. Do not run the full suite solely to satisfy this gate."
-+    )
-+
-+
- def build_verify_on_stop_nudge(
-     *,
-     session_id: str | None,
-@@ -232,6 +266,8 @@ def build_verify_on_stop_nudge(
-     if state == "passed":
-         return None
- 
-+    scope_instruction = _verification_scope_instruction(paths, facts)
-+
-     # Optional shipped coding guidance, only paid when this evidence gate fires.
-     try:
-         from agent.verify_hooks import coding_verify_guidance
-@@ -264,7 +300,7 @@ def build_verify_on_stop_nudge(
-         "fresh passing verification evidence yet.\n\n"
-         f"Verification status: {_status_detail(status)}\n\n"
-         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
--        f"{command_instruction} If verification is not possible, explain the "
-+        f"{scope_instruction}\n\n{command_instruction} If verification is not possible, explain the "
-         "concrete blocker instead of claiming the work is fully verified."
-         f"{addendum}]"
-     )
-diff --git a/hermes_cli/subcommands/memory.py b/hermes_cli/subcommands/memory.py
-index 23fe0b857..d9cff01e6 100644
---- a/hermes_cli/subcommands/memory.py
-+++ b/hermes_cli/subcommands/memory.py
-@@ -18,8 +18,8 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
-             "Set up and manage external memory provider plugins.\n\n"
-             "Available providers: honcho, openviking, mem0, hindsight,\n"
-             "holographic, retaindb, byterover.\n\n"
--            "Only one external provider can be active at a time.\n"
--            "Built-in memory (MEMORY.md/USER.md) is always active."
-+            "Only one provider can be active at a time. Providers declared\n"
-+            "exclusive (including SoulLink/PCLTM) disable built-in memory and recall."
-         ),
-     )
-     memory_sub = memory_parser.add_subparsers(dest="memory_command")
-diff --git a/model_tools.py b/model_tools.py
-index a4ed0c20c..ef5ab075b 100644
---- a/model_tools.py
-+++ b/model_tools.py
-@@ -483,6 +483,20 @@ def _compute_tool_definitions(
-     # Ask the registry for schemas (only returns tools whose check_fn passes)
-     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
- 
-+    # An exclusive provider is the canonical memory authority when configured.
-+    # Hide retired host fallbacks even if provider loading later fails; that
-+    # failure is an unavailable authority state, never permission to fallback.
-+    try:
-+        from agent.memory_authority import filter_tool_definitions
-+        from hermes_cli.config import load_config_readonly
-+
-+        filtered_tools = filter_tool_definitions(
-+            filtered_tools,
-+            config=load_config_readonly(),
-+        )
-+    except Exception as exc:
-+        logger.warning("Exclusive memory-authority schema gate unavailable: %s", exc)
-+
-     # The set of tool names that actually passed check_fn filtering.
-     # Use this (not tools_to_include) for any downstream schema that references
-     # other tools by name — otherwise the model sees tools mentioned in
 diff --git a/tests/agent/test_exclusive_memory_authority_contract.py b/tests/agent/test_exclusive_memory_authority_contract.py
 new file mode 100644
 index 000000000..ac7bfc917

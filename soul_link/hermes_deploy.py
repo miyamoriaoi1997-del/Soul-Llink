@@ -69,6 +69,9 @@ class DeploymentReceipt:
         )
 
 
+PCLTM_CONTEXT_BUDGET_TOKENS = 200_000
+
+
 class HermesDeployment:
     adapter_version = "3"
     rollback_compatible_versions = frozenset({"2", "3"})
@@ -337,6 +340,8 @@ class HermesDeployment:
             and (context_plugin / "soullink-root.txt").read_text(encoding="utf-8").strip() == str(self.root)
             and (config.get("memory") or {}).get("provider") == "soullink"
             and (config.get("context") or {}).get("engine") == "pcltm-context"
+            and (config.get("context") or {}).get("budget_tokens") == PCLTM_CONTEXT_BUDGET_TOKENS
+            and (config.get("compression") or {}).get("threshold_tokens") == PCLTM_CONTEXT_BUDGET_TOKENS
             and "pcltm-context" in ((config.get("plugins") or {}).get("enabled") or [])
             and "managed-by: SoulLink/PCLTM" in (home / "SOUL.md").read_text(encoding="utf-8")
         ) if (plugin / "soullink-root.txt").is_file() and (home / "SOUL.md").is_file() else False
@@ -353,11 +358,18 @@ class HermesDeployment:
         path = home / "config.yaml"
         config = self._read_yaml(path)
         config.setdefault("memory", {})["provider"] = "soullink"
-        config.setdefault("context", {})["engine"] = "pcltm-context"
+        context = config.setdefault("context", {})
+        context["engine"] = "pcltm-context"
+        # One public deployment policy controls both the PCLTM engine budget
+        # and the host compression trigger.  The host patch passes context
+        # configuration to plugin engines before model metadata is resolved.
+        context["budget_tokens"] = PCLTM_CONTEXT_BUDGET_TOKENS
+        compression = config.setdefault("compression", {})
+        compression["threshold_tokens"] = PCLTM_CONTEXT_BUDGET_TOKENS
         # Hermes gates every context-engine lifecycle behind this host switch.
         # With context.engine=pcltm-context, enabling it activates PCLTM; it
         # does not select the built-in ContextCompressor.
-        config.setdefault("compression", {})["enabled"] = True
+        compression["enabled"] = True
         plugins = config.setdefault("plugins", {})
         enabled = list(plugins.get("enabled") or [])
         if "pcltm-context" not in enabled:

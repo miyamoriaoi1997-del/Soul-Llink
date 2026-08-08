@@ -1,9 +1,10 @@
 host: hermes-agent
-adapter_version: "soullink-runtime-v3-upstream-01a1037"
+adapter_version: "soullink-runtime-v4-upstream-01a1037-final-forward"
 patch: patches/soullink-runtime-host-adapter.patch
 required_paths:
   - agent/agent_init.py
   - agent/agent_runtime_helpers.py
+  - agent/conversation_loop.py
   - agent/memory_manager.py
   - agent/memory_provider.py
   - agent/transports/chat_completions.py
@@ -11,8 +12,9 @@ required_paths:
   - hermes_cli/subcommands/memory.py
   - model_tools.py
 created_paths:
+  - tests/agent/test_memory_final_forward_observer.py
   - agent/memory_authority.py
   - tests/agent/test_exclusive_memory_authority_contract.py
   - tests/agent/test_soullink_memory_authority_adapter.py
 verify_commands:
-  - ["{python}", -m, pytest, tests/agent/test_exclusive_memory_authority_contract.py, tests/agent/test_soullink_memory_authority_adapter.py, tests/agent/test_memory_provider.py, tests/agent/test_verification_stop.py, tests/agent/transports/test_chat_completions.py, -q]
+  - ["{python}", -m, pytest, tests/agent/test_exclusive_memory_authority_contract.py, tests/agent/test_soullink_memory_authority_adapter.py, tests/agent/test_memory_final_forward_observer.py, tests/agent/test_memory_provider.py, tests/agent/test_verification_stop.py, tests/agent/transports/test_chat_completions.py, -q]

@@ -257,7 +257,7 @@ def test_repository_soullink_runtime_manifest_owns_every_live_host_delta() -> No
     )
 
     assert manifest.host == "hermes-agent"
-    assert manifest.adapter_version == "soullink-runtime-v3-upstream-01a1037"
+    assert manifest.adapter_version == "soullink-runtime-v4-upstream-01a1037-final-forward"
     patch_text = manifest.patch_path.read_text(encoding="utf-8")
     patch_targets = tuple(re.findall(r"^\+\+\+ b/(.+)$", patch_text, re.MULTILINE))
     assert set(patch_targets) == set(manifest.required_paths + manifest.created_paths)
@@ -265,6 +265,9 @@ def test_repository_soullink_runtime_manifest_owns_every_live_host_delta() -> No
     assert "tests/agent/test_exclusive_memory_authority_contract.py" in manifest.created_paths
     assert "tests/agent/test_soullink_memory_authority_adapter.py" in manifest.created_paths
     assert "agent/memory_manager.py" in manifest.required_paths
+    assert "agent/conversation_loop.py" in manifest.required_paths
+    assert "tests/agent/test_memory_final_forward_observer.py" in manifest.created_paths
+    assert "_final_forward_messages" in patch_text
     assert "agent/verification_stop.py" in manifest.required_paths
     assert "hermes_cli/subcommands/memory.py" in manifest.required_paths
 
