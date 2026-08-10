@@ -23,6 +23,9 @@ def test_memory_library_stats_counts_only_persistent_entities(tmp_path: Path) ->
     stats = collect_memory_library_stats(db)
 
     assert stats["event_count"] == 0
+    assert stats["active_memory_count"] == 0
+    assert stats["active_event_derived_count"] == 0
+    assert stats["active_other_lineage_count"] == 0
     assert stats["derived_memory_count"] == 1
     assert stats["persistent_memory_total"] == 1
     assert stats["evidence_chunk_count"] == 0
@@ -38,6 +41,8 @@ def test_memory_library_stats_empty_database_is_zero_and_read_only(tmp_path: Pat
     stats = collect_memory_library_stats(db)
 
     assert stats["event_count"] == 0
+    assert stats["active_memory_count"] == 0
+    assert stats["active_event_derived_count"] == 0
     assert stats["derived_memory_count"] == 0
     assert stats["persistent_memory_total"] == 0
     assert stats["evidence_chunk_count"] == 0

@@ -230,7 +230,7 @@ def test_existing_canonical_key_does_not_bypass_derived_authority(tmp_path: Path
     assert after == before
 
 
-def test_source_ref_cardinality_is_rejected_for_every_lineage(tmp_path: Path) -> None:
+def test_duplicate_source_refs_are_rejected_and_explicit_refs_remain_forbidden(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "source-cardinality.db")
     try:
         event_id = store.append_event(
@@ -250,7 +250,7 @@ def test_source_ref_cardinality_is_rejected_for_every_lineage(tmp_path: Path) ->
     assert explicit.success is False
     assert explicit.reason_code == "source_snapshot_missing"
     assert derived.success is False
-    assert derived.reason_code == "source_snapshot_missing"
+    assert derived.reason_code == "source_snapshot_mismatch"
 
 
 def test_non_numeric_derived_event_id_is_typed_rejection(tmp_path: Path) -> None:

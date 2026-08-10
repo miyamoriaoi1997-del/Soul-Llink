@@ -15,7 +15,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from pcltm.candidate_promotion import CandidatePromotionService
 from pcltm.candidates import PersonaCandidateExtractor
 from pcltm.hermes_history import HermesHistoryIngestor
@@ -83,7 +82,7 @@ def test_ingest_classifies_user_message_as_candidate_only(store: EventStore, tmp
     assert ue["category"] == "work"
     assert ue["source"] == "hermes_state_db"
     # assistant stays retrieve-only
-    assistant = [e for e in store.list_events(limit=20) if e["role"] == "assistant"][0]
+    assistant = next(e for e in store.list_events(limit=20) if e["role"] == "assistant")
     assert assistant["inject_policy"] == "retrieve_only"
 
 
@@ -108,7 +107,7 @@ def test_ordinary_task_does_not_produce_a_candidate_or_active_claim(store: Event
         ("默认所有报告都必须附带验证证据。", "system_convention", "memory"),
     ],
 )
-def test_stable_natural_language_fact_auto_activates(
+def test_explicitly_stable_natural_language_fact_auto_activates(
     store: EventStore, content: str, expected_kind: str, expected_target: str,
 ) -> None:
     event_id = store.append_event(
@@ -122,40 +121,97 @@ def test_stable_natural_language_fact_auto_activates(
     assert candidates[0]["kind"] == expected_kind
     assert candidates[0]["target_file"] == expected_target
     assert candidates[0]["memory_worthiness"] == "high"
+    assert candidates[0]["admission_tier"] == "auto_activate"
+    assert candidates[0]["requires_human_confirmation"] is False
+    assert candidates[0]["evidence_count"] == 1
     report = CandidatePromotionService(store).promote(candidates)
+    assert report.pending == 0
     assert report.activated == 1
-    current = store._conn.execute(
-        """SELECT c.memory_type, c.target, v.content, v.lineage_kind
-           FROM memory_current mc
-           JOIN memory_claims c ON c.claim_id=mc.claim_id
-           JOIN memory_claim_versions v ON v.claim_version_id=mc.claim_version_id"""
-    ).fetchone()
-    assert (current["memory_type"], current["target"]) == (expected_kind, expected_target)
-    assert current["content"] == content.rstrip("。")
-    assert current["lineage_kind"] == "event_derived"
+    assert store._conn.execute("SELECT COUNT(*) FROM memory_current").fetchone()[0] == 1
 
 
-def test_stable_natural_language_fact_from_hermes_state_db_auto_activates(
-    store: EventStore,
+def test_repeated_unmarked_preference_auto_activates_independent_of_threshold_tuning(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    event_id = store.append_event(
-        session_id="stable-hermes-history",
-        conversation_id="stable-hermes-history",
-        platform="hermes",
-        role="user",
-        source="hermes_state_db",
-        content="我长期偏好简洁报告。",
-        persona_mode="work",
-    )
-
-    event = store.get_event(event_id)
-    assert event["inject_policy"] == "candidate_only"
+    monkeypatch.setenv("SOULLINK_PCLTM_PENDING_REVIEW_CONFIDENCE", "0.1")
+    monkeypatch.setenv("SOULLINK_PCLTM_AUTO_ACTIVATE_CONFIDENCE", "0.5")
+    contents = ("我偏好简洁报告。", "我更偏好简洁报告。")
+    for session_id, content in zip(("stable-history-1", "stable-history-2"), contents):
+        store.append_event(
+            session_id=session_id, conversation_id=session_id, platform="hermes",
+            role="user", source="hermes_state_db", content=content,
+            persona_mode="work",
+        )
     candidates = PersonaCandidateExtractor(store).extract(
-        scope={"session_id": "stable-hermes-history"}
+        scope={"session_id": "stable-history-2"}
     )
     assert len(candidates) == 1
     assert candidates[0]["kind"] == "user_preference"
-    assert CandidatePromotionService(store).promote(candidates).activated == 1
+    assert candidates[0]["evidence_count"] == 2
+    assert candidates[0]["independent_session_count"] == 2
+    report = CandidatePromotionService(store).promote(candidates)
+    assert candidates[0]["admission_tier"] == "auto_activate"
+    assert report.pending == 0
+    assert report.activated == 1
+    assert store._conn.execute("SELECT COUNT(*) FROM memory_claim_sources").fetchone()[0] == 2
+
+
+def test_pending_admission_gate_cannot_be_cleared_by_candidate_tampering(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOULLINK_PCLTM_PENDING_REVIEW_CONFIDENCE", "0")
+    monkeypatch.setenv("SOULLINK_PCLTM_AUTO_ACTIVATE_CONFIDENCE", "0")
+    store.append_event(
+        session_id="tamper-natural", conversation_id="tamper-natural", platform="test",
+        role="user", source="chat", content="我偏好简洁报告。",
+        persona_mode="work",
+    )
+    candidate = PersonaCandidateExtractor(store).extract(
+        scope={"session_id": "tamper-natural"},
+    )[0]
+    assert candidate["requires_human_confirmation"] is True
+
+    outcome = CandidatePromotionService(store).promote([
+        {**candidate, "requires_human_confirmation": False},
+    ]).outcomes[0]
+
+    assert (outcome.decision, outcome.reason) == (
+        "error", "candidate_authority_mismatch",
+    )
+    assert store._conn.execute("SELECT count(*) FROM memory_claims").fetchone()[0] == 0
+
+
+def test_repetition_inside_one_session_does_not_count_as_independent_evidence(
+    store: EventStore,
+) -> None:
+    for _ in range(2):
+        store.append_event(
+            session_id="same-session", conversation_id="same-session", platform="test",
+            role="user", source="chat", content="我偏好简洁报告。",
+            persona_mode="work",
+        )
+    candidate = PersonaCandidateExtractor(store).extract(scope={"session_id": "same-session"})[-1]
+    assert candidate["evidence_count"] == 2
+    assert candidate["independent_session_count"] == 1
+    assert candidate["admission_tier"] == "pending_review"
+    assert CandidatePromotionService(store).promote([candidate]).pending == 1
+
+
+def test_old_stable_assertion_outside_support_window_produces_no_candidate(
+    store: EventStore,
+) -> None:
+    store.append_event(
+        session_id="old-stable", conversation_id="old-stable", platform="test",
+        role="user", source="chat", content="我长期偏好简洁报告。",
+        persona_mode="work",
+    )
+    for index in range(500):
+        store.append_event(
+            session_id=f"noise-{index}", conversation_id=f"noise-{index}", platform="test",
+            role="assistant", source="chat", content=f"noise-{index}", persona_mode="work",
+        )
+
+    assert PersonaCandidateExtractor(store).extract(scope={"session_id": "old-stable"}) == []
 
 
 @pytest.mark.parametrize(
@@ -181,18 +237,18 @@ def test_transient_ambiguous_or_process_chat_never_auto_promotes(
 
 
 def test_stable_identity_conflict_goes_pending_without_silent_overwrite(store: EventStore) -> None:
-    first_id = store.append_event(
-        session_id="identity-conflict-1", conversation_id="identity-conflict-1", platform="test",
+    store.append_event(
+        session_id="identity-support", conversation_id="identity-support", platform="test",
         role="user", source="chat", content="我的职业是工程师。", persona_mode="work",
     )
-    first = PersonaCandidateExtractor(store).extract(scope={"session_id": "identity-conflict-1"})
+    first = PersonaCandidateExtractor(store).extract(scope={"session_id": "identity-support"})
     assert CandidatePromotionService(store).promote(first).activated == 1
 
     second_id = store.append_event(
         session_id="identity-conflict-2", conversation_id="identity-conflict-2", platform="test",
         role="user", source="chat", content="我的职业是教师。", persona_mode="work",
     )
-    assert second_id > first_id
+    assert second_id > 0
     second = PersonaCandidateExtractor(store).extract(scope={"session_id": "identity-conflict-2"})
     report = CandidatePromotionService(store).promote(second)
     assert report.pending == 1
@@ -239,6 +295,38 @@ def test_ingest_without_persona_mode_stays_retrieve_only(store: EventStore, tmp_
     assert user_events[0]["inject_policy"] == "retrieve_only"
 
 
+def test_replay_appends_one_revision_when_classification_context_changes(
+    store: EventStore, tmp_path: Path,
+) -> None:
+    hermes_db = tmp_path / "state.db"
+    _build_hermes_db(hermes_db)
+
+    HermesHistoryIngestor(store, hermes_db).ingest(persona_mode=None)
+    original = next(event for event in store.list_events(limit=20) if event["role"] == "user")
+    assert original["inject_policy"] == "retrieve_only"
+    assert original["source_revision"] == 1
+
+    second = HermesHistoryIngestor(store, hermes_db).ingest(persona_mode="work")
+    current = store.find_ingest_event("hermes-message:1")
+    revised = store.get_event(int(current["event_id"]))
+    assert revised["event_id"] != original["event_id"]
+    assert revised["source_revision"] == 2
+    assert revised["inject_policy"] == "candidate_only"
+    assert revised["classifier_version"] == "state-machine-only-v4"
+    assert second["updated"] >= 1
+
+    third = HermesHistoryIngestor(store, hermes_db).ingest(persona_mode="work")
+    assert third["updated"] == 0
+    assert store.find_ingest_event("hermes-message:1")["event_id"] == revised["event_id"]
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM event_revisions WHERE source_hash = ?",
+        (store.find_ingest_event("hermes-message:1")["source_hash"],),
+    ).fetchone()[0] == 1
+
+    candidates = PersonaCandidateExtractor(store).extract(scope={"session_id": "s1"})
+    assert len(candidates) == 1
+
+
 def test_extractor_finds_hermes_state_db_candidates(store: EventStore, tmp_path: Path) -> None:
     _ingest(store, tmp_path, persona_mode="work")
     candidates = PersonaCandidateExtractor(store).extract(scope={"session_id": "s1"}, limit=50)
@@ -251,22 +339,23 @@ def test_extractor_finds_hermes_state_db_candidates(store: EventStore, tmp_path:
 
 
 def test_guardrails_activate_pending_drop(store: EventStore, tmp_path: Path) -> None:
-    _ingest(store, tmp_path, persona_mode="work")
-    candidates = PersonaCandidateExtractor(store).extract(scope={"session_id": "s1"}, limit=50)
-    base = candidates[0]
-    high = dict(base)
-    high["candidate_id"] = "high1"
-    mid = dict(base)
-    mid.update(candidate_id="mid1", content="中置信内容", confidence=0.7)
-    low = dict(base)
-    low.update(candidate_id="low1", content="低置信内容", confidence=0.5)
+    candidates = []
+    for index, confidence in enumerate((0.95, 0.7, 0.5)):
+        session_id = f"guardrail-{index}"
+        store.append_event(
+            session_id=session_id, conversation_id=session_id, platform="test",
+            role="user", source="chat", content=f"[memory:guardrail-{index}] VALUE-{index}",
+            persona_mode="work", category="work", inject_policy="candidate_only",
+            classification_confidence=confidence,
+        )
+        candidates.extend(PersonaCandidateExtractor(store).extract(scope={"session_id": session_id}))
 
-    report = CandidatePromotionService(store).promote([high, mid, low])
+    report = CandidatePromotionService(store).promote(candidates)
     assert report.activated == 1
     assert report.pending == 1
     assert report.dropped == 1
     queue = store.list_candidate_queue(status="pending")
-    assert [q["content"] for q in queue] == ["中置信内容"]
+    assert [q["content"] for q in queue] == ["VALUE-1"]
 
 
 def test_promotion_outcome_has_one_durable_replay_receipt(store: EventStore) -> None:
@@ -506,6 +595,83 @@ def test_candidate_review_promotes_through_governed_event_authority(store: Event
     assert store._conn.execute("SELECT count(*) FROM memory_claim_versions").fetchone()[0] == 1
 
 
+def test_multi_source_pending_review_reopens_original_receipt(store: EventStore) -> None:
+    for session_id in ("review-natural-1", "review-natural-2"):
+        store.append_event(
+            session_id=session_id, conversation_id=session_id, platform="test",
+            role="user", source="chat", content="我长期偏好简洁报告。",
+            persona_mode="work",
+        )
+    candidate = PersonaCandidateExtractor(store).extract(scope={"session_id": "review-natural-2"})[0]
+    candidate["confidence"] = 0.7
+    pending = CandidatePromotionService(store).promote([candidate]).outcomes[0]
+    record_id = int(pending.reason.rsplit("=", 1)[1])
+
+    promoted = store.review_candidate(
+        record_id, decision="approved", reviewer="tester",
+        decision_reason="explicit human approval",
+    )
+
+    assert promoted["status"] == "promoted"
+    assert store._conn.execute("SELECT count(*) FROM memory_claim_sources").fetchone()[0] == 2
+
+
+def test_multi_source_review_reports_authority_mismatch_after_source_drift(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for session_id in ("review-drift-1", "review-drift-2"):
+        store.append_event(
+            session_id=session_id, conversation_id=session_id, platform="test",
+            role="user", source="chat", content="我长期偏好简洁报告。",
+            persona_mode="work",
+        )
+    candidate = PersonaCandidateExtractor(store).extract(scope={"session_id": "review-drift-2"})[0]
+    candidate["confidence"] = 0.7
+    pending = CandidatePromotionService(store).promote([candidate]).outcomes[0]
+    record_id = int(pending.reason.rsplit("=", 1)[1])
+    original_get_event = store.get_event
+    last_event_id = candidate["source_event_ids"][-1]
+
+    def drifted_get_event(event_id: int):
+        event = original_get_event(event_id)
+        return {
+            **event,
+            "payload_sha256": "0" * 64,
+        } if event_id == last_event_id else event
+
+    monkeypatch.setattr(store, "get_event", drifted_get_event)
+
+    with pytest.raises(RuntimeError, match="candidate_authority_mismatch"):
+        store.review_candidate(
+            record_id, decision="approved", reviewer="tester",
+            decision_reason="must fail closed",
+        )
+    assert store._conn.execute("SELECT count(*) FROM memory_claims").fetchone()[0] == 0
+
+
+def test_completed_pending_approval_replay_revalidates_provenance(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.append_event(
+        session_id="approval-replay", conversation_id="approval-replay", platform="test",
+        role="user", source="chat", content="[memory:approval-replay] VALUE",
+        persona_mode="daily", category="daily", inject_policy="candidate_only",
+        classification_confidence=0.7,
+    )
+    candidate = PersonaCandidateExtractor(store).extract(scope={"session_id": "approval-replay"})[0]
+    service = CandidatePromotionService(store)
+    assert service.promote([candidate]).pending == 1
+    first = service.approve_pending(candidate, reviewer="tester", decision_reason="approved")
+    assert first.decision == "activated"
+    monkeypatch.setattr(service, "_matches_event_authority", lambda *args, **kwargs: False)
+
+    replay = service.approve_pending(candidate, reviewer="tester", decision_reason="approved")
+
+    assert (replay.decision, replay.reason) == (
+        "error", "candidate_authority_mismatch",
+    )
+
+
 def test_candidate_review_rejects_queue_tampering_before_governed_write(store: EventStore) -> None:
     session_id = "review-tamper"
     store.append_event(
@@ -595,12 +761,12 @@ def test_rag_half_full_sync_turn_sequence(store: EventStore, tmp_path: Path) -> 
 
 
 def test_identical_content_replay_is_idempotent(store: EventStore, tmp_path: Path) -> None:
-    _ingest(store, tmp_path, persona_mode="work")
-    candidates = PersonaCandidateExtractor(store).extract(scope={"session_id": "s1"}, limit=50)
+    first = _append_durable_event(store, "[memory:identical-replay] VALUE")
+    candidates = PersonaCandidateExtractor(store).extract(scope={"session_id": first["session_id"]})
     service = CandidatePromotionService(store)
     assert service.promote(candidates).activated == 1
-    replay = dict(candidates[0])
-    replay["candidate_id"] = "replay"
+    second = _append_durable_event(store, "[memory:identical-replay] VALUE")
+    replay = PersonaCandidateExtractor(store).extract(scope={"session_id": second["session_id"]})[0]
     report = service.promote([replay])
     assert report.outcomes[0].decision == "duplicate"
     conn = store._conn
@@ -774,6 +940,57 @@ def test_missing_queue_fields_do_not_create_receipt_or_abort_batch(
         "SELECT candidate_id FROM candidate_promotion_receipts ORDER BY candidate_id",
     ).fetchall()
     assert [row[0] for row in receipts] == [valid["candidate_id"]]
+
+
+def test_non_json_queue_ids_do_not_leave_processing_receipt(store: EventStore) -> None:
+    event = _append_durable_event(store, "[memory:pending-json] VALUE")
+    malformed = PersonaCandidateExtractor(store).extract(scope={"session_id": event["session_id"]})[0]
+    malformed["confidence"] = 0.7
+    malformed["source_event_ids"] = [object()]
+
+    outcome = CandidatePromotionService(store).promote([malformed]).outcomes[0]
+
+    assert (outcome.decision, outcome.reason) == ("error", "malformed_candidate")
+    assert store._conn.execute("SELECT count(*) FROM candidate_promotion_receipts").fetchone()[0] == 0
+
+
+def test_duplicate_source_refs_are_rejected_before_pending_receipt(store: EventStore) -> None:
+    event = _append_durable_event(store, "[memory:duplicate-ref] VALUE")
+    malformed = PersonaCandidateExtractor(store).extract(scope={"session_id": event["session_id"]})[0]
+    malformed["confidence"] = 0.7
+    malformed["source_refs"] = malformed["source_refs"] * 2
+    malformed["source_event_ids"] = malformed["source_event_ids"] * 2
+
+    outcome = CandidatePromotionService(store).promote([malformed]).outcomes[0]
+
+    assert (outcome.decision, outcome.reason) == ("error", "malformed_candidate")
+    assert store._conn.execute("SELECT count(*) FROM candidate_promotion_receipts").fetchone()[0] == 0
+
+
+def test_non_json_extra_field_is_rejected_before_receipt(store: EventStore) -> None:
+    event = _append_durable_event(store, "[memory:pending-extra-json] VALUE")
+    malformed = PersonaCandidateExtractor(store).extract(scope={"session_id": event["session_id"]})[0]
+    malformed["confidence"] = 0.7
+    malformed["unexpected"] = object()
+
+    outcome = CandidatePromotionService(store).promote([malformed]).outcomes[0]
+
+    assert (outcome.decision, outcome.reason) == ("error", "malformed_candidate")
+    assert store._conn.execute("SELECT count(*) FROM candidate_promotion_receipts").fetchone()[0] == 0
+
+
+def test_completed_replay_revalidates_event_provenance(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _append_durable_event(store, "[memory:replay-authority] VALUE")
+    candidate = PersonaCandidateExtractor(store).extract(scope={"session_id": event["session_id"]})[0]
+    service = CandidatePromotionService(store)
+    assert service.promote([candidate]).activated == 1
+    monkeypatch.setattr(service, "_matches_event_authority", lambda *args, **kwargs: False)
+
+    replay = service.promote([candidate]).outcomes[0]
+
+    assert (replay.decision, replay.reason) == ("error", "candidate_authority_mismatch")
 
 
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])

@@ -1,12 +1,14 @@
 """Idempotent ingestion of Hermes' canonical session database into PCLTM."""
 from __future__ import annotations
+
 import hashlib
 import json
 import sqlite3
 from pathlib import Path
 from typing import Any
-from .projections.runtime import drain_transcript_projections
+
 from .classifier import EventClassifier
+from .projections.runtime import drain_transcript_projections
 from .store import EventStore
 
 _PROMPT_ROLES = {"system", "developer"}
@@ -78,7 +80,6 @@ class HermesHistoryIngestor:
         return conn.execute(sql + " ORDER BY id ASC", params)
 
     def _event(self, *, external_id: str, kind: str, metadata: dict[str, Any], session_id: str, platform: str, role: str, content: str, sensitivity: str, subcategory: str, persona_mode: str | None = None) -> str:
-        source_hash = _sha256(json.dumps({"external_id": external_id, "session_id": session_id, "role": role, "content": content, "metadata": metadata}, ensure_ascii=False, sort_keys=True))
         classification = EventClassifier().classify(
             role=role,
             source="chat" if role == "user" else "hermes_state_db",
@@ -86,6 +87,22 @@ class HermesHistoryIngestor:
             persona_mode=persona_mode,
             sensitivity=sensitivity,
         )
+        source_hash = _sha256(json.dumps({
+            "external_id": external_id,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "metadata": metadata,
+            "classification": {
+                "persona_mode": persona_mode,
+                "category": classification.category,
+                "subcategory": classification.subcategory,
+                "inject_policy": classification.inject_policy,
+                "sensitivity": classification.sensitivity,
+                "confidence": classification.confidence,
+                "classifier_version": classification.classifier_version,
+            },
+        }, ensure_ascii=False, sort_keys=True))
         _, status = self.store.upsert_external_event(
             external_id=external_id, source_hash=source_hash, kind=kind, payload_metadata=metadata,
             session_id=session_id, conversation_id=session_id, platform=platform, role=role,

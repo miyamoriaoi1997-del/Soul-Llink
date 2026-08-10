@@ -44,8 +44,13 @@ def test_v124_static_assets_expose_five_live_views_without_mock_claims() -> None
     assert "FINAL FORWARD" in js
     assert "SHA-256" in js
     assert "sidecar reconstruction" in js
-    assert "persistent_memory_total" in js
-    assert "event_chunks excluded" in js
+    assert "当前生效记忆" in js
+    assert "active_memory_count" in js
+    assert "active_event_derived_count" in js
+    assert "生效来源拆分" in js
+    assert "当前旧记录列表" in js
+    assert "原始事件证据" in js
+    assert "来源证据，不计入生效记忆" in js
     assert "renderMemoryPath" in js
     assert "candidate_records" in js
     assert "judgment_workset" in js
