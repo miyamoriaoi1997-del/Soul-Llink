@@ -22,9 +22,10 @@ def _readonly_connection(db_path: Path) -> sqlite3.Connection:
 def collect_memory_library_stats(db_path: str | Path) -> dict[str, Any]:
     """Count persistent-memory entities from one stable read-only SQLite snapshot.
 
-    ``events`` are canonical original events and ``memory_records`` are derived
-    governed memories. ``event_chunks`` are evidence projections and deliberately
-    remain a separate metric so they cannot inflate the persistent-memory total.
+    ``events`` are canonical original evidence. The user-facing durable-memory
+    inventory is the governed ``memory_current`` projection, not the legacy
+    ``memory_records`` candidate table. Lineage is counted only as a breakdown
+    of active claims so it cannot be mistaken for another lifecycle stage.
     """
     db = Path(db_path)
     with stable_sqlite_snapshot(db) as stable_db:
@@ -43,11 +44,28 @@ def collect_memory_library_stats(db_path: str | Path) -> dict[str, Any]:
             event_count = count("events")
             derived_memory_count = count("memory_records")
             evidence_chunk_count = count("event_chunks")
+            active_memory_count = 0
+            active_event_derived_count = 0
+            if "memory_current" in tables:
+                active_memory_count = int(connection.execute(
+                    "SELECT count(*) FROM memory_current WHERE lifecycle_state = 'active'"
+                ).fetchone()[0])
+            if {"memory_current", "memory_claim_versions"}.issubset(tables):
+                active_event_derived_count = int(connection.execute(
+                    """SELECT count(*) FROM memory_current mc
+                       JOIN memory_claim_versions v
+                         ON v.claim_version_id = mc.claim_version_id
+                       WHERE mc.lifecycle_state = 'active'
+                         AND v.lineage_kind = 'event_derived'"""
+                ).fetchone()[0])
         finally:
             connection.close()
     return {
         "source": "stable_sqlite_snapshot",
         "event_count": event_count,
+        "active_memory_count": active_memory_count,
+        "active_event_derived_count": active_event_derived_count,
+        "active_other_lineage_count": active_memory_count - active_event_derived_count,
         "derived_memory_count": derived_memory_count,
         "persistent_memory_total": event_count + derived_memory_count,
         "evidence_chunk_count": evidence_chunk_count,
@@ -55,9 +73,12 @@ def collect_memory_library_stats(db_path: str | Path) -> dict[str, Any]:
             "database": "pcltm_runtime_db",
             "snapshot": "stable read-only SQLite DB+WAL copy",
             "event_table": "events",
+            "active_table": "memory_current",
+            "lineage_table": "memory_claim_versions",
             "derived_memory_table": "memory_records",
             "evidence_table": "event_chunks",
             "counting_rule": "persistent_memory_total = events + memory_records; event_chunks excluded",
+            "active_counting_rule": "active_memory_count = memory_current where lifecycle_state = active; lineage is a breakdown of active claims",
         },
     }
 

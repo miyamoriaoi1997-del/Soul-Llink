@@ -275,6 +275,7 @@ def collect_runtime_memory(
         "events": 0, "event_fts": 0, "event_chunks": 0, "summaries": 0,
         "summary_fts": 0, "memory_records": 0,
         "approved_memory_records": 0, "pending_memory_records": 0,
+        "active_memory": 0, "active_event_derived_memory": 0,
     }
     schema_version: int | None = None
     semantic_query_ok = False
@@ -315,7 +316,17 @@ def collect_runtime_memory(
                 "memory_records": count("memory_records"),
                 "approved_memory_records": count("memory_records", "WHERE status = ?", ("approved",)),
                 "pending_memory_records": count("memory_records", "WHERE status = ?", ("pending",)),
+                "active_memory": count("memory_current", "WHERE lifecycle_state = ?", ("active",)),
             })
+            if {"memory_current", "memory_claim_versions"}.issubset(tables):
+                row = connection.execute(
+                    """SELECT count(*) FROM memory_current mc
+                       JOIN memory_claim_versions v
+                         ON v.claim_version_id = mc.claim_version_id
+                       WHERE mc.lifecycle_state = 'active'
+                         AND v.lineage_kind = 'event_derived'"""
+                ).fetchone()
+                counts["active_event_derived_memory"] = int(row[0] if row else 0)
             if "schema_migrations" in tables:
                 row = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()
                 schema_version = int(row[0]) if row and row[0] is not None else 0
@@ -357,6 +368,9 @@ def collect_runtime_memory(
     memory = sanitize_source("memory", {
         "event_count": events, "summary_count": summaries,
         "record_count": counts["memory_records"],
+        "active_memory_count": counts["active_memory"],
+        "active_event_derived_count": counts["active_event_derived_memory"],
+        "active_other_lineage_count": counts["active_memory"] - counts["active_event_derived_memory"],
         "derived_memory_count": counts["memory_records"],
         "persistent_memory_total": events + counts["memory_records"],
         "evidence_chunk_count": counts["event_chunks"],

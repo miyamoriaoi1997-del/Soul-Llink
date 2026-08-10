@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +41,14 @@ from .store import EventStore
 # confidence thresholds (guardrail policy)
 AUTO_ACTIVATE_CONFIDENCE = 0.85
 PENDING_REVIEW_CONFIDENCE = 0.6
+
+
+def _policy_threshold(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else default
 
 # map state-machine modes to the narrower PersonaMode enum used by claims
 _PERSONA_MODE_BY_STATE = {
@@ -141,15 +151,50 @@ class CandidatePromotionService:
             return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
         if not source_refs:
             return PromotionOutcome(candidate_id, "rejected", "source_snapshot_missing", target_file=target_file)
+        ref_keys = []
+        for ref in source_refs:
+            raw_id = ref.object_id
+            if (
+                ref.authority_kind != "event"
+                or type(raw_id) is not str
+                or not raw_id.isascii()
+                or not raw_id.isdecimal()
+                or raw_id != str(int(raw_id))
+                or int(raw_id) <= 0
+                or type(ref.object_version) is not int
+                or ref.object_version <= 0
+                or type(ref.payload_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", ref.payload_sha256) is None
+            ):
+                return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
+            ref_keys.append((
+                ref.authority_kind, raw_id, ref.object_version, ref.payload_sha256,
+            ))
+        if len(set(ref_keys)) != len(ref_keys):
+            return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
         if (
             type(candidate.get("source_event_ids")) is not list
             or type(candidate.get("source_node_ids")) is not list
+            or not all(
+                type(item) is int and item > 0
+                for item in candidate.get("source_event_ids", [])
+            )
+            or not all(
+                type(item) is int and item > 0
+                for item in candidate.get("source_node_ids", [])
+            )
         ):
+            return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
+        if candidate["source_event_ids"] != [int(ref.object_id) for ref in source_refs]:
+            return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
+        try:
+            CandidatePromotionService._request_payload_json(candidate)
+        except (TypeError, ValueError):
             return PromotionOutcome(candidate_id, "error", "malformed_candidate", target_file=target_file)
         return None
 
     @staticmethod
-    def _request_sha256(candidate: dict[str, Any]) -> str:
+    def _request_payload_json(candidate: dict[str, Any]) -> str:
         source_refs = candidate.get("source_refs") or ()
         payload = {
             **{key: value for key, value in candidate.items() if key != "source_refs"},
@@ -158,7 +203,11 @@ class CandidatePromotionService:
                 for ref in source_refs
             ],
         }
-        return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _request_sha256(candidate: dict[str, Any]) -> str:
+        return sha256_text(CandidatePromotionService._request_payload_json(candidate))
 
     def _finalize_receipt(
         self,
@@ -214,10 +263,7 @@ class CandidatePromotionService:
             if str(existing["request_sha256"]) != request_sha256:
                 return PromotionOutcome(candidate_id, "error", "idempotency_conflict")
             if str(existing["decision"]) != "processing":
-                return PromotionOutcome(
-                    candidate_id, str(existing["decision"]), str(existing["reason"]),
-                    existing["claim_id"], existing["claim_version"], str(existing["target_file"]),
-                )
+                return self._completed_receipt_outcome(candidate, existing)
         else:
             inserted = self._store._conn.execute(
                 """INSERT OR IGNORE INTO candidate_promotion_receipts(
@@ -236,15 +282,33 @@ class CandidatePromotionService:
             if str(existing["request_sha256"]) != request_sha256:
                 return PromotionOutcome(candidate_id, "error", "idempotency_conflict")
             if str(existing["decision"]) != "processing":
-                return PromotionOutcome(
-                    candidate_id, str(existing["decision"]), str(existing["reason"]),
-                    existing["claim_id"], existing["claim_version"], str(existing["target_file"]),
-                )
+                return self._completed_receipt_outcome(candidate, existing)
         outcome = self._promote_one(candidate)
         if recovering:
             outcome = self._recover_processing_outcome(candidate, outcome)
         self._finalize_receipt(candidate_id, request_sha256, outcome)
         return outcome
+
+    def _completed_receipt_outcome(
+        self, candidate: dict[str, Any], receipt: Any,
+    ) -> PromotionOutcome:
+        """Return a completed receipt only after reopening its event authority."""
+        candidate_id = str(candidate.get("candidate_id") or "")
+        decision = str(receipt["decision"])
+        if (
+            decision in {"activated", "duplicate", "superseded", "retracted"}
+            and not self._matches_event_authority(
+                candidate, reviewed=bool(receipt["reviewer"]),
+            )
+        ):
+            return PromotionOutcome(
+                candidate_id, "error", "candidate_authority_mismatch",
+                target_file=str(candidate.get("target_file") or "USER.md"),
+            )
+        return PromotionOutcome(
+            candidate_id, decision, str(receipt["reason"]),
+            receipt["claim_id"], receipt["claim_version"], str(receipt["target_file"]),
+        )
 
     @staticmethod
     def _recover_processing_outcome(
@@ -267,6 +331,14 @@ class CandidatePromotionService:
     ) -> PromotionOutcome:
         """Promote a reviewed queue item without making the queue authoritative."""
         candidate_id = str(candidate.get("candidate_id") or "")
+        invalid = self._validate_candidate(candidate)
+        if invalid is not None:
+            return invalid
+        if not self._matches_event_authority(candidate, reviewed=True):
+            return PromotionOutcome(
+                candidate_id, "error", "candidate_authority_mismatch",
+                target_file=str(candidate.get("target_file") or "USER.md"),
+            )
         request_sha256 = self._request_sha256(candidate)
         receipt = self._store._conn.execute(
             "SELECT * FROM candidate_promotion_receipts WHERE candidate_id=?",
@@ -287,8 +359,9 @@ class CandidatePromotionService:
             return PromotionOutcome(candidate_id, "error", "pending_receipt_conflict")
         approved = {
             **candidate,
-            "confidence": AUTO_ACTIVATE_CONFIDENCE,
-            "requires_human_confirmation": False,
+            "confidence": _policy_threshold(
+                "SOULLINK_PCLTM_AUTO_ACTIVATE_CONFIDENCE", AUTO_ACTIVATE_CONFIDENCE,
+            ),
         }
         outcome = self._promote_one(approved, reviewed=True)
         if outcome.decision in {"activated", "duplicate", "superseded"}:
@@ -332,15 +405,24 @@ class CandidatePromotionService:
         if type(sensitivity) is not str or sensitivity not in {item.value for item in Sensitivity}:
             return PromotionOutcome(candidate_id, "error", "invalid_sensitivity", target_file=target_file)
 
-        if confidence < PENDING_REVIEW_CONFIDENCE:
+        pending_threshold = _policy_threshold(
+            "SOULLINK_PCLTM_PENDING_REVIEW_CONFIDENCE", PENDING_REVIEW_CONFIDENCE,
+        )
+        activate_threshold = _policy_threshold(
+            "SOULLINK_PCLTM_AUTO_ACTIVATE_CONFIDENCE", AUTO_ACTIVATE_CONFIDENCE,
+        )
+        if activate_threshold < pending_threshold:
+            activate_threshold = AUTO_ACTIVATE_CONFIDENCE
+            pending_threshold = PENDING_REVIEW_CONFIDENCE
+        if confidence < pending_threshold:
             return PromotionOutcome(candidate_id, "dropped", "confidence_below_pending_threshold", target_file=target_file)
-        if candidate.get("requires_human_confirmation") is True:
+        if candidate.get("requires_human_confirmation") is True and not reviewed:
             record_id = self._store.enqueue_candidate(candidate)
             return PromotionOutcome(
                 candidate_id, "pending", f"human_confirmation_required:record={record_id}",
                 target_file=target_file,
             )
-        if confidence < AUTO_ACTIVATE_CONFIDENCE:
+        if confidence < activate_threshold:
             record_id = self._store.enqueue_candidate(candidate)
             return PromotionOutcome(
                 candidate_id, "pending", f"queued_for_review:record={record_id}",
@@ -553,33 +635,44 @@ class CandidatePromotionService:
         from .candidates import PersonaCandidateExtractor
 
         refs = tuple(candidate.get("source_refs") or ())
-        if len(refs) != 1:
+        if not refs:
             return False
-        ref = refs[0]
-        if ref.authority_kind != "event":
-            return False
-        raw_id = ref.object_id
-        if (
-            type(raw_id) is not str
-            or not raw_id.isascii()
-            or not raw_id.isdecimal()
-            or raw_id != str(int(raw_id))
-            or int(raw_id) <= 0
-        ):
-            return False
-        event = self._store.get_event(int(raw_id))
-        if event is None:
-            return False
-        expected = PersonaCandidateExtractor(self._store)._candidate_from_event(event)
+        events = []
+        for ref in refs:
+            raw_id = ref.object_id
+            if (
+                ref.authority_kind != "event"
+                or type(raw_id) is not str
+                or not raw_id.isascii()
+                or not raw_id.isdecimal()
+                or raw_id != str(int(raw_id))
+                or int(raw_id) <= 0
+            ):
+                return False
+            event = self._store.get_event(int(raw_id))
+            if event is None:
+                return False
+            events.append(event)
+        expected = PersonaCandidateExtractor(self._store)._candidate_from_event(events[-1])
         if expected is None:
             return False
         if refs != tuple(expected.get("source_refs") or ()):
             return False
         bound_fields = (
-            "kind", "target_file", "content", "mode", "sensitivity",
-            "identity_action", "semantic_key", "canonical_key",
+            "candidate_id", "kind", "target_file", "content", "mode",
+            "sensitivity", "identity_action", "semantic_key", "canonical_key",
+            "source_event_ids", "source_node_ids", "evidence_count",
+            "independent_session_count", "requires_human_confirmation",
+            "rationale", "lexical_score", "semantic_score",
+            "stability_score", "future_value_score",
         )
         if not all(candidate.get(field) == expected.get(field) for field in bound_fields):
+            return False
+        if any(
+            int(ref.object_version) != int(event.get("source_revision") or 0)
+            or ref.payload_sha256 != event.get("payload_sha256")
+            for ref, event in zip(refs, events, strict=True)
+        ):
             return False
         return reviewed or candidate.get("confidence") == expected.get("confidence")
 

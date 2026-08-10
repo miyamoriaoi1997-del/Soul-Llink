@@ -1543,6 +1543,10 @@ class EventStore:
                 }
                 for ref in source_refs
             ],
+            "promotion_candidate": {
+                key: value for key, value in candidate.items()
+                if key != "source_refs"
+            },
         }
         insert = self._conn.execute(
             """
@@ -1594,42 +1598,38 @@ class EventStore:
             raise KeyError(f"memory record not found: {record_id}")
         if decision == "approved":
             from .candidate_promotion import CandidatePromotionService
-            from .candidates import PersonaCandidateExtractor
             from .memory_contracts import AuthorityRef
 
             record = self._memory_record_from_row(row)
             metadata = record["metadata"]
             raw_refs = metadata.get("source_refs")
-            if not isinstance(raw_refs, list) or len(raw_refs) != 1:
+            if not isinstance(raw_refs, list) or not raw_refs:
                 raise RuntimeError("candidate has no reopenable event provenance")
             try:
                 source_refs = tuple(AuthorityRef(**ref) for ref in raw_refs)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("candidate has no reopenable event provenance") from exc
-            source_ref = source_refs[0]
-            if source_ref.authority_kind != "event":
+            if any(source_ref.authority_kind != "event" for source_ref in source_refs):
                 raise RuntimeError("candidate has no reopenable event provenance")
-            source_event = self.get_event(int(source_ref.object_id))
-            authoritative = PersonaCandidateExtractor(self).extract(
-                scope={"session_id": source_event["session_id"]}, limit=500,
-            )
-            candidate = next(
-                (item for item in authoritative if item["candidate_id"] == record["candidate_id"]),
-                None,
-            )
-            if candidate is None:
+            promotion_candidate = metadata.get("promotion_candidate")
+            if not isinstance(promotion_candidate, dict):
                 raise RuntimeError("candidate has no reopenable event provenance")
+            candidate = {**promotion_candidate, "source_refs": source_refs}
             if (
-                candidate["content"] != record["content"]
+                candidate.get("candidate_id") != record["candidate_id"]
+                or candidate["content"] != record["content"]
                 or candidate["target_file"] != record["target_file"]
                 or candidate["kind"] != record["kind"]
+                or candidate["confidence"] != record["confidence"]
+                or candidate["source_event_ids"] != record["source_event_ids"]
+                or candidate["source_node_ids"] != record["source_node_ids"]
             ):
                 raise RuntimeError("candidate queue commitment mismatch")
             outcome = CandidatePromotionService(self).approve_pending(
                 candidate, reviewer=reviewer, decision_reason=decision_reason,
             )
             if outcome.decision not in {"activated", "duplicate", "superseded"}:
-                raise RuntimeError(f"governed promotion failed: {outcome.reason}")
+                raise RuntimeError(outcome.reason)
             self._conn.execute(
                 """UPDATE memory_records SET status='promoted', reviewer=?,
                        reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),

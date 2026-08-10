@@ -153,24 +153,27 @@ class MemoryWriteService:
             return self._reject(policy.REASON_SECRET_WRITE)
         derived = request.lineage_kind is LineageKind.EVENT_DERIVED
         if derived:
-            if len(request.source_refs) != 1 or request.source_refs[0].authority_kind != "event":
-                return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISSING)
-            raw_event_id = request.source_refs[0].object_id
-            if (
-                type(raw_event_id) is not str
-                or not raw_event_id.isascii()
-                or not raw_event_id.isdecimal()
-                or raw_event_id.startswith("0")
+            if not request.source_refs or any(
+                ref.authority_kind != "event" for ref in request.source_refs
             ):
-                return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
-            try:
-                derived_event_id = int(raw_event_id)
-            except (TypeError, ValueError):
+                return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISSING)
+            derived_event_ids = []
+            for ref in request.source_refs:
+                raw_event_id = ref.object_id
+                if (
+                    type(raw_event_id) is not str
+                    or not raw_event_id.isascii()
+                    or not raw_event_id.isdecimal()
+                    or raw_event_id.startswith("0")
+                ):
+                    return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
+                derived_event_ids.append(int(raw_event_id))
+            if len(set(derived_event_ids)) != len(derived_event_ids):
                 return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
         else:
             if request.source_refs:
                 return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISSING)
-            derived_event_id = None
+            derived_event_ids = []
         external_id = f"memory-derived:{request.idempotency_key}" if derived else f"memory-assertion:{request.idempotency_key}"
         ingest_kind = "memory_derived" if derived else "memory_assertion"
         source_hash = self._command_source_hash(request)
@@ -192,41 +195,51 @@ class MemoryWriteService:
                 receipt = self._receipt_from_authority(external_id, kind=ingest_kind)
                 conn.commit()
                 return receipt
-            source_row = None
-            source_ref = request.source_refs[0] if derived else None
+            source_rows = []
+            source_refs = request.source_refs if derived else ()
+            request_assertion = parse_stable_memory_assertion(request.content) if derived else None
             if derived:
-                source_row = conn.execute(
-                    """SELECT event_id, source_revision, payload_sha256, sensitivity,
-                              evidence_state, inject_policy, role, source, content
-                       FROM events WHERE event_id = ?""",
-                    (derived_event_id,),
-                ).fetchone()
-                parsed = None if source_row is None else parse_memory_command(str(source_row["content"]))
-                stable_assertion = (
-                    None if source_row is None
-                    else parse_stable_memory_assertion(str(source_row["content"]))
-                )
-                source_body = (
-                    parsed[2] if parsed is not None
-                    else stable_assertion.content if stable_assertion is not None
-                    else None
-                )
-                source_action_allowed = (
-                    parsed is not None and parsed[0] in {"memory", "replace"}
-                ) or stable_assertion is not None
-                if (
-                    source_row is None
-                    or str(source_row["evidence_state"]) != "active"
-                    or str(source_row["inject_policy"]) != "candidate_only"
-                    or str(source_row["role"]) != "user"
-                    or str(source_row["source"]) not in {"chat", "hermes_state_db"}
-                    or not source_action_allowed
-                    or source_body != request.content
-                    or int(source_row["source_revision"]) != source_ref.object_version
-                    or str(source_row["payload_sha256"]) != source_ref.payload_sha256
-                ):
-                    conn.rollback()
-                    return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
+                for derived_event_id, source_ref in zip(derived_event_ids, source_refs):
+                    source_row = conn.execute(
+                        """SELECT event_id, source_revision, payload_sha256, sensitivity,
+                                  evidence_state, inject_policy, role, source, content
+                           FROM events WHERE event_id = ?""",
+                        (derived_event_id,),
+                    ).fetchone()
+                    parsed = None if source_row is None else parse_memory_command(str(source_row["content"]))
+                    stable_assertion = (
+                        None if source_row is None
+                        else parse_stable_memory_assertion(str(source_row["content"]))
+                    )
+                    source_body = (
+                        parsed[2] if parsed is not None
+                        else stable_assertion.content if stable_assertion is not None
+                        else None
+                    )
+                    source_action_allowed = (
+                        parsed is not None and parsed[0] in {"memory", "replace"}
+                    ) or stable_assertion is not None
+                    source_body_matches = source_body == request.content
+                    if stable_assertion is not None and request_assertion is not None:
+                        source_body_matches = (
+                            stable_assertion.kind == request_assertion.kind
+                            and stable_assertion.target_file == request_assertion.target_file
+                            and stable_assertion.semantic_key == request_assertion.semantic_key
+                        )
+                    if (
+                        source_row is None
+                        or str(source_row["evidence_state"]) != "active"
+                        or str(source_row["inject_policy"]) != "candidate_only"
+                        or str(source_row["role"]) != "user"
+                        or str(source_row["source"]) not in {"chat", "hermes_state_db"}
+                        or not source_action_allowed
+                        or not source_body_matches
+                        or int(source_row["source_revision"]) != source_ref.object_version
+                        or str(source_row["payload_sha256"]) != source_ref.payload_sha256
+                    ):
+                        conn.rollback()
+                        return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
+                    source_rows.append(source_row)
             canonical_claim = conn.execute(
                 "SELECT claim_id FROM memory_claims WHERE canonical_key = ?",
                 (request.canonical_key,),
@@ -236,7 +249,9 @@ class MemoryWriteService:
                 if not derived:
                     return self._reject("canonical_key_conflict")
                 exact_replay = None
-                if source_ref is not None:
+                if source_refs:
+                    latest_ref = source_refs[-1]
+                    latest_event_id = derived_event_ids[-1]
                     exact_replay = conn.execute(
                         """SELECT 1 FROM memory_claims c
                            JOIN memory_claim_versions v ON v.claim_id=c.claim_id
@@ -244,41 +259,42 @@ class MemoryWriteService:
                            WHERE c.canonical_key=? AND v.content_sha256=?
                              AND s.source_kind='event' AND s.event_id=?
                              AND s.event_revision=? AND s.event_payload_sha256=? LIMIT 1""",
-                        (request.canonical_key, sha256_text(request.content), derived_event_id,
-                         source_ref.object_version, source_ref.payload_sha256),
+                        (request.canonical_key, sha256_text(request.content), latest_event_id,
+                         latest_ref.object_version, latest_ref.payload_sha256),
                     ).fetchone()
                 return self._receipt_by_canonical_key(
                     request.canonical_key,
                     reason_code="write_allowed" if exact_replay is not None else "canonical_key_exists",
                 )
             if derived:
-                event_id = int(source_row["event_id"])
-                event_row = source_row
-                ref = source_ref
-                event_governance = conn.execute(
-                    """SELECT governance_id, new_state FROM event_governance
-                       WHERE event_id=? ORDER BY governance_id DESC LIMIT 1""",
-                    (event_id,),
-                ).fetchone()
-                if event_governance is None:
-                    inserted_governance = conn.execute(
-                        """INSERT INTO event_governance(
-                               event_id, action, previous_state, new_state, actor, reason
-                           ) VALUES (?, 'activate', NULL, 'active', 'memory_write_service',
-                                     'derived memory source admitted')""",
+                snapshots = []
+                for source_row, ref in zip(source_rows, source_refs):
+                    event_id = int(source_row["event_id"])
+                    event_governance = conn.execute(
+                        """SELECT governance_id, new_state FROM event_governance
+                           WHERE event_id=? ORDER BY governance_id DESC LIMIT 1""",
                         (event_id,),
-                    )
-                    event_governance_id = int(inserted_governance.lastrowid)
-                elif str(event_governance["new_state"]) == LifecycleState.ACTIVE.value:
-                    event_governance_id = int(event_governance["governance_id"])
-                else:
-                    conn.rollback()
-                    return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
-                snapshot = AuthoritySnapshot(
-                    "event", str(event_id), int(source_row["source_revision"]), str(source_row["payload_sha256"]),
-                    event_governance_id, LifecycleState.ACTIVE,
-                    Sensitivity(str(source_row["sensitivity"])), LifecycleState.ACTIVE, (), None,
-                )
+                    ).fetchone()
+                    if event_governance is None:
+                        inserted_governance = conn.execute(
+                            """INSERT INTO event_governance(
+                                   event_id, action, previous_state, new_state, actor, reason
+                               ) VALUES (?, 'activate', NULL, 'active', 'memory_write_service',
+                                         'derived memory source admitted')""",
+                            (event_id,),
+                        )
+                        event_governance_id = int(inserted_governance.lastrowid)
+                    elif str(event_governance["new_state"]) == LifecycleState.ACTIVE.value:
+                        event_governance_id = int(event_governance["governance_id"])
+                    else:
+                        conn.rollback()
+                        return self._reject(policy.REASON_SOURCE_SNAPSHOT_MISMATCH)
+                    snapshots.append(AuthoritySnapshot(
+                        "event", str(event_id), int(source_row["source_revision"]),
+                        str(source_row["payload_sha256"]), event_governance_id,
+                        LifecycleState.ACTIVE, Sensitivity(str(source_row["sensitivity"])),
+                        LifecycleState.ACTIVE, (), None,
+                    ))
             else:
                 event_id = self._store.ingest_external_event_in_transaction(
                 external_id=external_id, source_hash=source_hash, kind=ingest_kind,
@@ -309,13 +325,13 @@ class MemoryWriteService:
                 event_governance_id, LifecycleState.ACTIVE, Sensitivity(str(event_row["sensitivity"])),
                 LifecycleState.ACTIVE, (), None,
                 )
+                source_refs = (ref,)
+                snapshots = [snapshot]
             command = MemoryWriteCommand(
                 request.lineage_kind, request.sensitivity, request.mode_scope,
-                (ref,), LifecycleState.ACTIVE,
+                tuple(source_refs), LifecycleState.ACTIVE,
             )
-            decision = policy.admit_write(
-                command, (snapshot,)
-            )
+            decision = policy.admit_write(command, tuple(snapshots))
             if not decision.allowed:
                 conn.rollback()
                 return self._reject(decision.reason_code)
@@ -339,13 +355,14 @@ class MemoryWriteService:
             )
             version_id = int(version.lastrowid)
             self._checkpoint("claim_version_after")
-            conn.execute(
-                """
-                INSERT INTO memory_claim_sources(
-                    claim_version_id, source_kind, event_id, event_revision, event_payload_sha256
-                ) VALUES (?, 'event', ?, ?, ?)
-                """,
-                (version_id, event_id, int(event_row["source_revision"]), str(event_row["payload_sha256"])),
+            conn.executemany(
+                """INSERT INTO memory_claim_sources(
+                       claim_version_id, source_kind, event_id, event_revision, event_payload_sha256
+                   ) VALUES (?, 'event', ?, ?, ?)""",
+                [
+                    (version_id, int(ref.object_id), ref.object_version, ref.payload_sha256)
+                    for ref in source_refs
+                ],
             )
             governance = conn.execute(
                 """
@@ -362,8 +379,8 @@ class MemoryWriteService:
                 (claim_id, version_id, governance_id),
             )
             enqueue_memory_projections(
-                conn, event_id=event_id, authority_kind="event",
-                authority_id=str(event_id), aggregate_id=f"memory:{claim_id}",
+                conn, event_id=int(source_refs[-1].object_id), authority_kind="event",
+                authority_id=source_refs[-1].object_id, aggregate_id=f"memory:{claim_id}",
                 aggregate_version=1, payload_sha256=content_sha256,
             )
             self._checkpoint("outbox_before_commit")
