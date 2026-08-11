@@ -406,6 +406,39 @@ def test_claim_projection_is_not_consumed_by_legacy_prompt_layers(tmp_path: Path
         assert legacy.search("UTC", layers=(layer,)) == []
 
 
+def test_memory_memfs_projects_all_multi_source_authority_refs(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "multi-source.db")
+    root = tmp_path / "memfs"
+    try:
+        for session_id in ("multi-memfs-1", "multi-memfs-2"):
+            store.append_event(
+                session_id=session_id, conversation_id=session_id, platform="test",
+                role="user", source="chat", content="我长期偏好简洁报告。",
+                persona_mode="work",
+            )
+        from pcltm.candidates import PersonaCandidateExtractor
+        from pcltm.candidate_promotion import CandidatePromotionService
+
+        candidate = PersonaCandidateExtractor(store).extract(
+            scope={"session_id": "multi-memfs-2"},
+        )[0]
+        assert CandidatePromotionService(store).promote([candidate]).activated == 1
+        result = MemoryMemfsProjector(
+            store, memfs_root=root, worker_id="memfs-worker",
+        ).run_once(now="2026-07-29T00:00:00Z", lease_until="2026-07-29T00:01:00Z")
+        claim_id = store._conn.execute("SELECT claim_id FROM memory_claims").fetchone()[0]
+        frontmatter = yaml.safe_load(
+            (root / "claims" / f"{claim_id:016d}.md").read_text(encoding="utf-8")
+            .split("---", 2)[1],
+        )
+    finally:
+        store.close()
+
+    assert result == {"claimed": 1, "applied": 1, "failed": 0, "obsolete": 0}
+    assert len(frontmatter["authority_refs"]) == 2
+    assert frontmatter["authority_refs"] == frontmatter["evidence_refs"]
+
+
 def test_memory_memfs_rejects_symlinked_claims_directory(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "authority.db")
     root = tmp_path / "memfs"

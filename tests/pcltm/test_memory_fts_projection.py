@@ -215,6 +215,37 @@ def test_memory_fts_rejects_missing_event_authority_id_in_claimed_job(
     assert fts_count == 0
 
 
+def test_memory_fts_projects_multi_source_claim(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "multi-source.db")
+    try:
+        for session_id in ("multi-fts-1", "multi-fts-2"):
+            store.append_event(
+                session_id=session_id, conversation_id=session_id, platform="test",
+                role="user", source="chat", content="我长期偏好简洁报告。",
+                persona_mode="work",
+            )
+        from pcltm.candidates import PersonaCandidateExtractor
+        from pcltm.candidate_promotion import CandidatePromotionService
+
+        candidate = PersonaCandidateExtractor(store).extract(
+            scope={"session_id": "multi-fts-2"},
+        )[0]
+        assert CandidatePromotionService(store).promote([candidate]).activated == 1
+        result = MemoryFtsProjector(store, worker_id="fts-worker").run_once(
+            now="2026-07-29T00:00:00Z", lease_until="2026-07-29T00:01:00Z",
+        )
+        source_count = store._conn.execute(
+            "SELECT count(*) FROM memory_claim_sources",
+        ).fetchone()[0]
+        fts_count = _fts_count(store)
+    finally:
+        store.close()
+
+    assert source_count == 2
+    assert result == {"claimed": 1, "applied": 1, "failed": 0, "obsolete": 0}
+    assert fts_count == 1
+
+
 def test_memory_fts_ownership_loss_does_not_release_reclaimed_lease(tmp_path: Path, monkeypatch) -> None:
     store = EventStore(tmp_path / "authority.db")
     try:

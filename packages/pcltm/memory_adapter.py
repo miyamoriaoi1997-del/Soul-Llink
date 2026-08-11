@@ -1282,8 +1282,8 @@ def _load_system_core_entries(*, mode: str | None, query: str | None, budget_cha
             budget_chars=budget_chars,
             buckets=None,
         )
-    except Exception:
-        return []
+    except (ImportError, OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+        raise RuntimeError("MemFS system layer unavailable") from exc
     entries = [item.body.strip() for item in layer.items if item.body and item.body.strip()]
     content, _ = _compact_entries(entries, budget_chars)
     return [entry.strip() for entry in content.split(ENTRY_DELIMITER) if entry.strip()]
@@ -1301,6 +1301,7 @@ def _update_retrieval_stats(record_ids: list[int]) -> None:
     path = db_path()
     if not path.exists():
         return
+    con = None
     try:
         con = sqlite3.connect(path)
         now_iso = sqlite3.connect(":memory:").execute(
@@ -1315,9 +1316,11 @@ def _update_retrieval_stats(record_ids: list[int]) -> None:
             [now_iso] + record_ids,
         )
         con.commit()
-        con.close()
-    except Exception:
-        pass  # Non-critical — don't break prompt assembly on stats failure
+    except sqlite3.Error as exc:
+        raise RuntimeError("memory retrieval stats update failed") from exc
+    finally:
+        if con is not None:
+            con.close()
 
 
 def track_citations(response_text: str, injected_ids: list[int]) -> list[int]:
@@ -1334,6 +1337,7 @@ def track_citations(response_text: str, injected_ids: list[int]) -> list[int]:
     if not path.exists():
         return []
 
+    con = None
     try:
         con = sqlite3.connect(path)
         con.row_factory = sqlite3.Row
@@ -1370,10 +1374,12 @@ def track_citations(response_text: str, injected_ids: list[int]) -> list[int]:
                 [now_iso] + cited_ids,
             )
             con.commit()
-        con.close()
         return cited_ids
-    except Exception:
-        return []
+    except sqlite3.Error as exc:
+        raise RuntimeError("memory citation tracking failed") from exc
+    finally:
+        if con is not None:
+            con.close()
 
 
 def get_last_injected_ids() -> list[int]:

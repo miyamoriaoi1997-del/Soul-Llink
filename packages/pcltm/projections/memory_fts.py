@@ -161,27 +161,31 @@ class MemoryFtsProjector:
                 if source["source_kind"] == "legacy_record"
             ]
             if str(job["authority_kind"]) == "event":
-                if len(event_sources) != 1 or legacy_sources:
+                if not event_sources or legacy_sources:
                     raise ValueError("memory projection source commitment mismatch")
                 try:
                     event_seq = require_event_projection_authority(job)
                 except ValueError as exc:
                     raise ValueError("memory projection source commitment mismatch") from exc
-                event_source = event_sources[0]
-                persisted_event = conn.execute(
-                    """
-                    SELECT source_revision, payload_sha256
-                    FROM events WHERE event_id = ?
-                    """,
-                    (event_seq,),
-                ).fetchone()
-                if (
-                    int(event_source["event_id"]) != event_seq
-                    or persisted_event is None
-                    or int(event_source["event_revision"]) != int(persisted_event["source_revision"])
-                    or str(event_source["event_payload_sha256"]) != str(persisted_event["payload_sha256"])
-                ):
+                committed_event_ids = {int(source["event_id"]) for source in event_sources}
+                if event_seq not in committed_event_ids:
                     raise ValueError("memory projection source commitment mismatch")
+                for event_source in event_sources:
+                    persisted_event = conn.execute(
+                        """
+                        SELECT source_revision, payload_sha256
+                        FROM events WHERE event_id = ?
+                        """,
+                        (int(event_source["event_id"]),),
+                    ).fetchone()
+                    if (
+                        persisted_event is None
+                        or int(event_source["event_revision"])
+                        != int(persisted_event["source_revision"])
+                        or str(event_source["event_payload_sha256"])
+                        != str(persisted_event["payload_sha256"])
+                    ):
+                        raise ValueError("memory projection source commitment mismatch")
             elif str(job["authority_kind"]) == "legacy_record":
                 if len(legacy_sources) != 1 or event_sources:
                     raise ValueError("memory projection source commitment mismatch")

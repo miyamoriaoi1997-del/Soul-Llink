@@ -356,38 +356,42 @@ class MemoryMemfsProjector:
             source for source in row if source["source_kind"] == "legacy_record"
         ]
         if str(job["authority_kind"]) == "event":
-            if len(event_sources) != 1 or legacy_sources:
+            if not event_sources or legacy_sources:
                 raise ValueError("memory projection source commitment mismatch")
             try:
                 event_seq = require_event_projection_authority(job)
             except ValueError as exc:
                 raise ValueError("memory projection source commitment mismatch") from exc
-            source = event_sources[0]
-            source_ref = {
-                "authority_kind": "event",
-                "object_id": str(source["event_id"]),
-                "object_version": int(source["event_revision"]),
-                "payload_sha256": str(source["event_payload_sha256"]),
-            }
-            if (
-                int(source["event_id"]) != event_seq
-                or source["persisted_revision"] is None
-                or int(source["event_revision"]) != int(source["persisted_revision"])
-                or str(source["event_payload_sha256"]) != str(source["persisted_payload_sha256"])
-            ):
+            committed_event_ids = {int(source["event_id"]) for source in event_sources}
+            if event_seq not in committed_event_ids:
                 raise ValueError("memory projection source commitment mismatch")
+            source_refs = []
+            for source in event_sources:
+                if (
+                    source["persisted_revision"] is None
+                    or int(source["event_revision"]) != int(source["persisted_revision"])
+                    or str(source["event_payload_sha256"])
+                    != str(source["persisted_payload_sha256"])
+                ):
+                    raise ValueError("memory projection source commitment mismatch")
+                source_refs.append({
+                    "authority_kind": "event",
+                    "object_id": str(source["event_id"]),
+                    "object_version": int(source["event_revision"]),
+                    "payload_sha256": str(source["event_payload_sha256"]),
+                })
         elif str(job["authority_kind"]) == "legacy_record":
             if len(legacy_sources) != 1 or event_sources:
                 raise ValueError("memory projection source commitment mismatch")
             if job["event_seq"] is not None or not str(job["authority_id"]):
                 raise ValueError("memory projection source commitment mismatch")
             source = legacy_sources[0]
-            source_ref = {
+            source_refs = [{
                 "authority_kind": "legacy_record",
                 "object_id": str(source["legacy_record_id"]),
                 "object_version": 1,
                 "payload_sha256": str(source["legacy_content_sha256"]),
-            }
+            }]
             if (
                 int(source["legacy_record_id"]) != int(job["authority_id"])
                 or source["persisted_legacy_content"] is None
@@ -421,8 +425,8 @@ class MemoryMemfsProjector:
             "injection_policy": str(authority["injection_policy"]),
             "read_only_projection": True,
             "read_only": True,
-            "authority_refs": [source_ref],
-            "evidence_refs": [source_ref],
+            "authority_refs": source_refs,
+            "evidence_refs": source_refs,
             "content": str(authority["content"]),
         }
 
