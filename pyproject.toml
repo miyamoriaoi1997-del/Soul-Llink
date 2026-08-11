@@ -44,6 +44,11 @@ soullink-hermes-update = "soul_link.hermes_update:main"
 soullink-codex-deploy = "soul_link.codex_deploy:main"
 soullink-codex-mcp = "soul_link.codex_mcp:main"
 soullink-codex-hook = "soul_link.codex_hook:main"
+soullink-zcode-deploy = "soul_link.zcode_deploy:main"
+soullink-zcode-mcp = "soul_link.zcode_mcp:main"
+soullink-zcode-hook = "soul_link.zcode_hook:main"
+soullink-zcode-observer = "soul_link.zcode_observer:main"
+soullink-zcode-history = "pcltm.zcode_history:main"
 
 [project.urls]
 Homepage = "https://github.com/miyamoriaoi1997-del/Soul-Llink"

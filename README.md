@@ -325,7 +325,7 @@ export HERMES_PCLTM_MEMFS_ROOT=/srv/soullink/memfs
 
 ## Command-Line Interface
 
-The wheel installs the core commands plus managed Hermes and Codex adapter commands:
+The wheel installs the core commands plus managed Hermes, Codex, and ZCode adapter commands:
 
 | Command | Purpose |
 |---|---|
@@ -338,6 +338,11 @@ The wheel installs the core commands plus managed Hermes and Codex adapter comma
 | `soullink-codex-deploy` | Detect, apply, verify, and byte-exactly roll back a Codex installation |
 | `soullink-codex-mcp` | SoulLink/PCLTM STDIO MCP server used by Codex |
 | `soullink-codex-hook` | Codex lifecycle hook entrypoint |
+| `soullink-zcode-deploy` | Detect, apply, verify, and byte-exactly roll back a ZCode installation |
+| `soullink-zcode-mcp` | SoulLink/PCLTM STDIO MCP server used by ZCode |
+| `soullink-zcode-hook` | ZCode lifecycle hook entrypoint |
+| `soullink-zcode-history` | Import ZCode session history into PCLTM |
+| `soullink-zcode-observer` | Local opt-in model-io observation for ZCode (default disabled) |
 
 Useful health and evidence commands:
 
@@ -437,6 +442,58 @@ Treat the generated hook commands as executable local code and review them befor
 The installer creates a receipt and hash-checked backup before mutation. Failed apply/verify/receipt writes
 restore the original managed file set automatically; explicit rollback restores pre-existing files byte for
 byte and removes the receipt.
+
+## ZCode Host Integration
+
+The ZCode adapter manages a user-scope `~/.zcode/cli/config.json` (an `mcp.servers.soullink` entry plus the
+seven supported hook events) and a `soullink/` runtime directory; with `--manage-agents` it also manages a
+`SOULLINK MANAGED` block in `~/.zcode/AGENTS.md`. It does not patch host source, and it never touches the
+ZCode application installation. Existing config and hook entries are retained; a pre-existing foreign
+`mcp.servers.soullink` server is treated as an incompatibility instead of being overwritten.
+
+```bash
+soullink-zcode-deploy detect --zcode-root ~/.zcode/cli
+
+soullink-zcode-deploy apply \
+  --zcode-root ~/.zcode/cli \
+  --db /srv/soullink/pcltm.db \
+  --memfs /srv/soullink/memfs \
+  --receipt /safe/path/soullink-zcode-receipt.json
+
+soullink-zcode-deploy verify --zcode-root ~/.zcode/cli
+soullink-zcode-deploy rollback --receipt /safe/path/soullink-zcode-receipt.json
+
+# Optionally manage a SOULLINK MANAGED block in ~/.zcode/AGENTS.md:
+soullink-zcode-deploy apply --manage-agents --zcode-root ~/.zcode/cli \
+  --db /srv/soullink/pcltm.db --memfs /srv/soullink/memfs \
+  --receipt /safe/path/soullink-zcode-receipt.json
+```
+
+The MCP server exposes governed `search`, `open`, `exact recall`, `remember`, identity-status, and
+runtime-status tools. The hook covers all seven ZCode events, going beyond the Codex lifecycle surface:
+
+- `SessionStart` / `UserPromptSubmit` inject bounded identity and memory context; the new user turn closes
+  the previous assistant-tool chain, enforcing PCLTM's tool-chain hygiene invariant.
+- `PreToolUse` / `PermissionRequest` gate the memory-write tool: reads are allowed, writes are denied unless
+  `SOULLINK_ZCODE_ALLOW_MEMORY_WRITES=1` is set, and the denial is reported through the tool-level
+  permission decision rather than a write that silently no-ops.
+- `PostToolUse` captures prompt-safe evidence capsules for tool results, and `PostToolUseFailure` closes the
+  chain. Tool results never become authoritative memory.
+- `Stop` may request continuation (bounded to three) when the persona layer writes
+  `soullink/emotion-state.json` with `continue: true`.
+
+History import is available from ZCode's own session database (the `message`/`part` tables in
+`~/.zcode/cli/db/db.sqlite`), mirroring the Hermes history ingestor:
+
+```bash
+soullink-zcode-history --zcode-db ~/.zcode/cli/db/db.sqlite --db /srv/soullink/pcltm.db
+```
+
+As with Codex, ZCode does not expose an exact final-model-input boundary, so the adapter reports
+`final_forward_observation = unavailable_host_boundary` and never labels hook output or retrieval previews
+as captured final-forward evidence. An optional local observer (`soullink-zcode-observer`) can read ZCode's
+official `rollout/model-io-*.jsonl` request log when `SOULLINK_ZCODE_OBSERVER=1`; it reports only what it
+literally observed in that log and never changes the default evidence claim.
 
 ## Model Router
 
