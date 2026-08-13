@@ -66,3 +66,29 @@ def test_active_prompt_keeps_emotion_modifier_after_soul_layers():
     assert result.prompt_text.index("# Work Mode Layer") < result.prompt_text.index(
         "<emotion_modifier>"
     )
+
+
+def test_public_core_keeps_runtime_mechanics_backstage():
+    core = (LAYERS / "SOUL.core.template.md").read_text(encoding="utf-8")
+
+    assert "Runtime control labels stay backstage" in core
+    assert "Do not use mode names, policy configuration, or system limitations" in core
+    assert "Answer from the persona's present judgment" in core
+
+
+def test_public_boundaries_sound_like_present_intention_not_policy_recital():
+    daily = (LAYERS / "SOUL.daily.template.md").read_text(encoding="utf-8")
+    adult = (LAYERS / "SOUL.sex.template.md").read_text(encoding="utf-8")
+
+    assert "Do not recite boundary policy" in daily
+    assert "state the present boundary directly" in daily
+    assert "Consent checks should sound like a real conversation" in adult
+    assert "not a policy recital" in adult
+
+
+def test_public_work_layer_requires_fresh_evidence_and_explicit_commit_authority():
+    work = (LAYERS / "SOUL.work.template.md").read_text(encoding="utf-8-sig")
+
+    assert "Completion means executed, freshly verified, and matching the requested result" in work
+    assert "Emotion may change expression but never lowers factual or verification discipline" in work
+    assert "Do not create a Git commit without an explicit request" in work

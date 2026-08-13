@@ -22,6 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+from soul_link.hermes_plugin.continuity_capsules import (
+    continuity_line as _continuity_line_impl,
+)
+from soul_link.hermes_plugin.tool_capsules import (
+    render_tool_capsule as _render_tool_capsule_impl,
+    tool_capsule_indicates_error as _tool_capsule_indicates_error_impl,
+    tool_capsule_kind as _tool_capsule_kind_impl,
+)
+
 try:
     from agent.context_engine import ContextEngine
     try:
@@ -1186,19 +1195,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
         self._last_continuity_summary = _truncate(" | ".join(item["text"] for item in selected), 500)
 
     def _continuity_line(self, msg: Mapping[str, Any]) -> str:
-        role = str(msg.get("role") or "unknown").lower()
-        text = _content_text(msg.get("content"))
-        if not text:
-            return ""
-        text = _truncate(" ".join(text.split()), 900)
-        if role == "tool":
-            name = str(msg.get("name") or msg.get("tool_call_id") or "tool")
-            return f"- tool[{name}]: {text}"
-        if role == "system":
-            if "[PCLTM" not in text and "<pcltm_context>" not in text:
-                return ""
-            return f"- system_memory: {_truncate(text, 700)}"
-        return f"- {role}: {text}"
+        return _continuity_line_impl(msg)
 
     def _clean_tail_message(
         self,
@@ -1238,7 +1235,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
         tool_name = str(cleaned.get("name") or cleaned.get("tool_name") or "tool")
         tool_call_id = cleaned.get("tool_call_id") or cleaned.get("id") or "unknown"
 
-        capsule_kind = _tool_capsule_kind(tool_name, text)
+        capsule_kind = _tool_capsule_kind_impl(tool_name, text)
         if capsule_kind == "skill":
             dropped = len(text)
             cleaned["content"] = "\n".join([
@@ -1257,13 +1254,14 @@ class PCLTMContextCompressionEngine(ContextEngine):
         max_chars = int(self.governance.tool_result_capsule_threshold_chars or 2400)
         if len(text) <= max_chars:
             return cleaned
-        capsule_text = _render_tool_capsule(
+        capsule_text = _render_tool_capsule_impl(
             tool_name=tool_name,
             tool_call_id=str(tool_call_id),
             text=text,
             raw_content=raw_content,
             kind=capsule_kind,
             preserve_edges=preserve_edges,
+            redact=_redact_tool_evidence,
         )
         cleaned["content"] = capsule_text
         self._maybe_write_evidence_capsule(tool_name=tool_name, tool_call_id=str(tool_call_id), kind=capsule_kind, original_text=text, capsule_text=capsule_text)
@@ -1281,16 +1279,17 @@ class PCLTMContextCompressionEngine(ContextEngine):
                 continue
             tool_name = str(msg.get("name") or msg.get("tool_name") or "tool")
             tool_call_id = str(msg.get("tool_call_id") or msg.get("id") or "unknown")
-            kind = _tool_capsule_kind(tool_name, text)
+            kind = _tool_capsule_kind_impl(tool_name, text)
             if kind == "skill":
                 continue
-            capsule_text = _render_tool_capsule(
+            capsule_text = _render_tool_capsule_impl(
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
                 text=text,
                 raw_content=msg.get("content"),
                 kind=kind,
                 preserve_edges=True,
+                redact=_redact_tool_evidence,
             )
             self._maybe_write_evidence_capsule(
                 tool_name=tool_name,
@@ -1322,7 +1321,7 @@ class PCLTMContextCompressionEngine(ContextEngine):
         if kind not in {"terminal", "file", "web", "json"}:
             return
         if os.getenv("HERMES_PCLTM_EVIDENCE_ERROR_ONLY", "1").lower() not in {"0", "false", "no", "off"}:
-            if not _tool_capsule_indicates_error(kind, capsule_text, original_text):
+            if not _tool_capsule_indicates_error_impl(kind, capsule_text, original_text):
                 return
         try:
             pcltm_memory_adapter = import_pcltm_memory_adapter()
