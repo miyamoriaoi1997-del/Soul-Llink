@@ -1,4 +1,4 @@
-# SoulLink Public 2.2
+# SoulLink Public 2.3
 
 **Persistent identity, continuous emotion, governed memory, and auditable context for long-running AI personas.**
 
@@ -10,15 +10,15 @@ SoulLink is an open-source runtime for agents that should feel like the **same p
 
 > A memory is not automatically an instruction. An emotion is not only a style adjective. A summary is not the latest user request. SoulLink makes those distinctions executable and auditable.
 
-![SoulLink Observatory 2.2 public demo](docs/assets/soullink-observatory-demo.png)
+![SoulLink Observatory 2.3 public demo](docs/assets/soullink-observatory-demo.png)
 
-*SoulLink Public 2.2 WebUI, captured from the production-served frontend after replacing the live values in the browser with an explicit public-demo fixture. The image preserves the shipped layout and rendering, but contains no production turn, timestamp, emotion, relationship, memory, token, conversation, or host data.*
+*SoulLink Public 2.3 WebUI, captured from the production-served frontend after replacing the live values in the browser with an explicit public-demo fixture. The image preserves the shipped layout and rendering, but contains no production turn, timestamp, emotion, relationship, memory, token, conversation, or host data.*
 
-## What changed in 2.2
+## What changed in 2.3
 
-SoulLink Public 2.2 is not a version-label-only refresh. It synchronizes the public runtime with the production architecture and closes the paths between durable memory, governed retrieval, prompt influence, observability, host updates, and rollback.
+SoulLink Public 2.3 is not a version-label-only refresh. It synchronizes the public runtime with the production architecture and closes the paths between durable memory, governed retrieval, prompt influence, observability, host updates, and rollback.
 
-| Area | 2.2 behavior |
+| Area | 2.3 behavior |
 |---|---|
 | **Memory authority** | Governed claims and their evidence/provenance are the durable authority; legacy tables, files, and retrieval indexes are migration or projection surfaces, not competing sources of truth. |
 | **Write path** | Candidate records move through explicit validation and policy judgment before promotion. Projection updates follow the authoritative write instead of becoming an independent write channel. |
@@ -236,7 +236,7 @@ Lexical, episodic, MemFS, and optional local-semantic retrieval can contribute c
 
 ### Migration, rebuild, and recovery
 
-2.2 includes legacy-shadow migration, projection rebuild, restore rehearsal, and lineage-recovery components. Back up deployment-owned data first, run migration/rebuild in dry-run or isolated mode when available, retain evidence and receipts, and verify both authoritative records and each projection afterward. A clean source checkout is not evidence that a production runtime directory is safe to rewrite.
+2.3 includes legacy-shadow migration, projection rebuild, restore rehearsal, and lineage-recovery components. Back up deployment-owned data first, run migration/rebuild in dry-run or isolated mode when available, retain evidence and receipts, and verify both authoritative records and each projection afterward. A clean source checkout is not evidence that a production runtime directory is safe to rewrite.
 
 ## Model Router
 
@@ -554,7 +554,7 @@ The audit rejects private identity markers, host-local absolute paths, runtime d
 
 ## WebUI evidence model
 
-The monitor is an observability surface, not an administrative control plane. It binds to loopback and stays read-only by default. The 2.2 dashboard reports evidence with explicit strength and freshness:
+The monitor is an observability surface, not an administrative control plane. It binds to loopback and stays read-only by default. The 2.3 dashboard reports evidence with explicit strength and freshness:
 
 | Evidence label | Meaning |
 |---|---|
@@ -565,7 +565,7 @@ The monitor is an observability surface, not an administrative control plane. It
 
 The overview connects posture, decision authority, semantic fusion, memory causality, affective state, causal trace, governance selection, context architecture, and the fact base. Private deployments may expose local memory and emotion details on the loopback page; do not publish a raw production screenshot without reviewing those values. See [`docs/webui-monitoring.md`](docs/webui-monitoring.md) for the API, freshness rules, Windows login-start task, and rollback behavior.
 
-The README image above was captured from the production-served 2.2 frontend, then converted in-browser to an explicit public demo before capture. It is not evidence of the private runtime values and does not contain them.
+The README image above was captured from the production-served 2.3 frontend, then converted in-browser to an explicit public demo before capture. It is not evidence of the private runtime values and does not contain them.
 
 ## Security Model
 
@@ -718,4 +718,4 @@ python scripts/public_release_audit.py --root .
 
 ## License
 
-SoulLink Public 2.2 is released under the MIT License. See [LICENSE](LICENSE).
+SoulLink Public 2.3 is released under the MIT License. See [LICENSE](LICENSE).
