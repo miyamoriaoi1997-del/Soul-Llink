@@ -47,8 +47,61 @@ def test_emotion_bridge_continuation_requests_after_strong_turns(tmp_path: Path)
     for _ in range(8):
         bridge.update("你太厉害了，我爱你，我永远都信任你！")
     request = bridge.continuation_request()
-    if request:
-        assert request.get("continue") is True
+    assert request.get("continue") is True
+
+
+def test_emotion_state_json_continue_matches_stop_decision(tmp_path: Path) -> None:
+    """The persisted continuation flag and the Stop decision must agree: the
+    file is the single source of truth written by update() and read by Stop."""
+    bridge = EmotionBridge()
+    for _ in range(8):
+        bridge.update("你太厉害了，我爱你，我永远都信任你！")
+    payload = json.loads(bridge.continuation_path.read_text(encoding="utf-8"))
+    assert payload.get("continue") is True
+    assert bridge.continuation_request().get("continue") is True
+
+
+def test_emotion_score_saturation_does_not_trigger_weak_tone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """emotion_score is synthesised in [-5, +5]; a saturated score must not
+    drive continuation — the tone tier is the sole decision input."""
+    bridge = EmotionBridge()
+    saturated = {
+        "affection": 120, "trust": 120, "possessiveness": 120, "patience": 120,
+        "emotion_score": 5.0,
+    }
+    monkeypatch.setattr(
+        "soul_link.zcode_emotion.EmotionBridge.tone_modifier",
+        lambda self, max_chars=12000: "【强度】mild / positive。",
+    )
+    assert bridge._decide_continue(saturated) is False
+    assert bridge.is_emotion_strong() is False
+
+
+@pytest.mark.parametrize(
+    "tone,expected",
+    [
+        ("【强度】mild / positive。", False),
+        ("【强度】intense / positive。", True),
+        ("【强度】overwhelming / negative。", True),
+    ],
+)
+def test_continuation_decision_follows_tone_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tone: str, expected: bool
+) -> None:
+    """The continuation boundary is the tone tier (intense/overwhelming),
+    independent of emotion_score."""
+    bridge = EmotionBridge()
+    neutral = {
+        "affection": 60, "trust": 60, "possessiveness": 60, "patience": 60,
+        "emotion_score": 0.0,
+    }
+    monkeypatch.setattr(
+        "soul_link.zcode_emotion.EmotionBridge.tone_modifier",
+        lambda self, max_chars=12000: tone,
+    )
+    assert bridge._decide_continue(neutral) is expected
 
 
 def test_emotion_bridge_continues_after_stop_bounded(tmp_path: Path) -> None:

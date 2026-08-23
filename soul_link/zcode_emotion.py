@@ -26,7 +26,6 @@ from typing import Any
 STATE_FILE = "STATE.md"
 CONTINUATION_FILE = "emotion-state.json"
 TONE_STRONG = ("intense", "overwhelming")
-EMOTION_SCORE_STRONG = 30
 
 
 def _zcode_root() -> Path:
@@ -128,27 +127,35 @@ class EmotionBridge:
             print(f"SoulLink tone modifier unavailable: {exc}", file=sys.stderr)
             return ""
 
-    def is_emotion_strong(self) -> bool:
-        state = self.emotion_state()
+    def _decide_continue(self, state: dict[str, Any]) -> bool:
+        """Single source of truth for the continuation decision.
+
+        emotion_score is synthesised in [-5, +5] and can never reach a 30
+        threshold; continuation is driven solely by the persona tone tier
+        (``intense`` / ``overwhelming``), which maps to per-dimension
+        deviation from baseline. ``update()`` persists this decision and the
+        ``Stop`` hook consumes it through ``continuation_request()``.
+        """
         if not state:
             return False
-        score = abs(int(state.get("emotion_score") or 0))
-        if score >= EMOTION_SCORE_STRONG:
-            return True
         tone = self.tone_modifier()
         return any(marker in tone for marker in TONE_STRONG)
 
+    def is_emotion_strong(self) -> bool:
+        return self._decide_continue(self.emotion_state())
+
     def continuation_request(self) -> dict[str, Any]:
-        """The Stop hook reads this: continue only when emotion is strong."""
-        state = self.emotion_state()
-        if not state or not self.is_emotion_strong():
+        """The Stop hook reads this: continue only when the emotion decision
+        persisted by ``update()`` requests it (zero recomputation at Stop)."""
+        payload = _load_continuation(self.continuation_path)
+        if not payload.get("continue"):
             return {}
         return {"continue": True, "reason": "SoulLink/PCLTM emotion state requests continuation"}
 
     def _write_continuation(self, state: dict[str, Any]) -> None:
         try:
+            strong = self._decide_continue(state)
             score = int(state.get("emotion_score") or 0)
-            strong = abs(score) >= EMOTION_SCORE_STRONG
             payload = {
                 "continue": bool(strong),
                 "emotion_score": score,
