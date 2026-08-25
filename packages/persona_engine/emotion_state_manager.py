@@ -791,6 +791,8 @@ class EmotionStateManager:
             default=0.0,
         )
         patience_value = float(current_state.get("patience", self.calculator.baselines["patience"]))
+        # Observable, continuous expression pressure for the public contract.
+        visibility = int(round(max(0.0, min(100.0, 20.0 + max_deviation * 2.0))))
 
         intensity_actions = LEXICON.get("formatter", {}).get("intensity_actions", {
             "mild": "自然改变词汇和温度，不刻意表演。",
@@ -841,8 +843,9 @@ class EmotionStateManager:
 
         parts = [
             f"【状态】{state_text}",
-            f"【强度】{overall_intensity}/{overall_direction}；表达预算：{execution}",
+            f"【强度】{overall_intensity}/{overall_direction}；可见度={visibility}%；表达预算：{execution}",
             f"【执行】{regulation_strategy or '自然表达'}；{response_action}。",
+            "【控制】不改真实STATE；不单独触发sex；不覆盖work或crisis边界。",
             f"【轨迹】{trend}→{phase}；{trend_actions.get(trend, '自然延续')}；{residue_actions.get(phase, '按当前余波延续')}。",
         ]
         if emotion_conflict.get("kind") != "无显著冲突":
@@ -896,7 +899,7 @@ class EmotionStateManager:
             return ""
         return (
             f"【日内心情底噪】{entry.profile}/{entry.intensity}：{entry.hint}"
-            "仅影响语气和事件敏感度；不改变真实情绪，不单独推进亲密，不覆盖任务或危机边界。"
+            "仅影响语气和事件敏感度；不改真实STATE；不单独触发sex；不改变真实情绪，不单独推进亲密，不覆盖任务或危机边界。"
         )
 
     def _preload_sentiment_analyzer_async(self) -> None:

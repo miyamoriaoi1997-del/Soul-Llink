@@ -57,7 +57,7 @@ The dashboard opens at `http://127.0.0.1:8765/`. Core runtime use does not requi
 For a packaged install, download the wheel from the [latest GitHub Release](https://github.com/miyamoriaoi1997-del/Soul-Llink/releases/latest), verify `SHA256SUMS.txt`, then run:
 
 ```bash
-python -m pip install soullink_public-2.3.2-py3-none-any.whl
+python -m pip install soullink_public-2.3.3-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -286,7 +286,7 @@ python -m venv .venv
 # Windows PowerShell
 # .venv\Scripts\Activate.ps1
 
-python -m pip install soullink_public-2.3.2-py3-none-any.whl
+python -m pip install soullink_public-2.3.3-py3-none-any.whl
 soullink init
 soullink doctor
 soullink webui
@@ -675,10 +675,10 @@ run detect, apply, verify, and rollback against an isolated host before producti
 
 ## Release and Packaging
 
-Official `v2.3.2` release assets are:
+Official `v2.3.3` release assets are:
 
-- `soullink_public-2.3.2-py3-none-any.whl`
-- `soullink_public-2.3.2.tar.gz`
+- `soullink_public-2.3.3-py3-none-any.whl`
+- `soullink_public-2.3.3.tar.gz`
 - `SHA256SUMS.txt`
 
 Verify downloads before installation:
@@ -688,7 +688,7 @@ Verify downloads before installation:
 sha256sum -c SHA256SUMS.txt
 
 # Windows PowerShell
-Get-FileHash .\soullink_public-2.3.2-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\soullink_public-2.3.3-py3-none-any.whl -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 ```
 
