@@ -3,19 +3,31 @@
 Integrates EmotionDetector and EmotionCalculator to manage emotion state.
 """
 
+import hashlib
+import importlib
 import os
 import re
+import stat
 import tempfile
 import threading
-import yaml
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, List
+
+import yaml
 
 try:
-    from emotion_detector import EmotionDetector, EmotionEvent, get_shared_sentiment_analyzer
+    from emotion_detector import (
+        EmotionDetector,
+        EmotionEvent,
+        get_shared_sentiment_analyzer,
+    )
 except ImportError:
-    from persona_engine.emotion_detector import EmotionDetector, EmotionEvent, get_shared_sentiment_analyzer
+    from persona_engine.emotion_detector import (
+        EmotionDetector,
+        EmotionEvent,
+        get_shared_sentiment_analyzer,
+    )
 try:
     from emotion_calculator import EmotionCalculator
 except ImportError:
@@ -24,9 +36,96 @@ try:
     from mood_calendar import MoodEntry, get_today_mood_entry
 except ImportError:
     from persona_engine.mood_calendar import MoodEntry, get_today_mood_entry
+try:
+    from injection_lexicon import LEXICON
+except ImportError:
+    from persona_engine.injection_lexicon import LEXICON
 
 
-def _parse_agent_names_from_soul(soul_path: Path) -> List[str]:
+_STATE_PATH_LOCKS: dict[str, threading.RLock] = {}
+_STATE_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _state_path_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve()).casefold()
+    with _STATE_PATH_LOCKS_GUARD:
+        return _STATE_PATH_LOCKS.setdefault(key, threading.RLock())
+
+
+def _state_revision(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+@contextmanager
+def _state_file_lock(path: Path):
+    """Serialize STATE.md CAS across threads and processes."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_path_lock(path), open(lock_path, "a+b") as lock_file:
+        lock_file.seek(0)
+        if lock_file.read(1) == b"":
+            lock_file.seek(0)
+            lock_file.write(b"0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _restrict_private_file(path: Path) -> None:
+    """Restrict STATE.md to the current Windows identity or POSIX owner."""
+    if os.name != "nt":
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        return
+
+    # uv-managed Windows virtual environments do not always execute pywin32's
+    # .pth bootstrap.  Import it explicitly so pywin32_system32 is registered
+    # before native extensions such as win32api are loaded.
+    importlib.import_module("pywin32_bootstrap")
+    import ntsecuritycon
+    import win32api
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(),
+        win32security.TOKEN_QUERY,
+    )
+    user_sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    dacl = win32security.ACL()
+    access = (
+        ntsecuritycon.FILE_GENERIC_READ
+        | ntsecuritycon.FILE_GENERIC_WRITE
+        | ntsecuritycon.READ_CONTROL
+        | ntsecuritycon.WRITE_DAC
+    )
+    dacl.AddAccessAllowedAce(win32security.ACL_REVISION, access, user_sid)
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _parse_agent_names_from_soul(soul_path: Path) -> list[str]:
     """Parse agent self-identity names from SOUL.md.
 
     Looks for a line like:
@@ -68,10 +167,10 @@ class EmotionStateManager:
 
     def __init__(
         self,
-        hermes_home: Optional[Path] = None,
+        hermes_home: Path | None = None,
         decay_rate: float = 2.0,
         update_body: bool = True,
-        state_path: Optional[Path] = None,
+        state_path: Path | None = None,
     ):
         """Initialize emotion state manager.
 
@@ -123,7 +222,7 @@ class EmotionStateManager:
         # fast. Strong rule paths and state/modifier reads must not wait for it.
         self._preload_sentiment_analyzer_async()
 
-    def _read_state(self) -> Dict:
+    def _read_state(self) -> dict:
         """Read current STATE.md and parse frontmatter.
 
         Returns:
@@ -137,11 +236,15 @@ class EmotionStateManager:
                         "platforms": ["cli", "telegram"]
                     }
                 },
-                "body": ""
+                "body": "",
+                "revision": _state_revision(b""),
             }
 
-        with open(self.state_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        content_bytes = self.state_path.read_bytes()
+        # Path.read_text() historically normalized Windows CRLF to LF. Preserve
+        # that parser contract while hashing the exact on-disk bytes for CAS.
+        content = content_bytes.decode("utf-8").replace(chr(13) + chr(10), chr(10))
+        revision = _state_revision(content_bytes)
 
         # Parse frontmatter
         if content.startswith("---\n"):
@@ -149,11 +252,17 @@ class EmotionStateManager:
             if len(parts) >= 3:
                 frontmatter = yaml.safe_load(parts[1]) or {}
                 body = parts[2].strip()
-                return {"frontmatter": frontmatter, "body": body}
+                return {"frontmatter": frontmatter, "body": body, "revision": revision}
 
-        return {"frontmatter": {}, "body": content}
+        return {"frontmatter": {}, "body": content, "revision": revision}
 
-    def _write_state(self, frontmatter: Dict, body: str) -> bool:
+    def _write_state(
+        self,
+        frontmatter: dict,
+        body: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> bool:
         """Write STATE.md with frontmatter and body.
 
         Args:
@@ -164,36 +273,48 @@ class EmotionStateManager:
             True if write succeeded, False otherwise
         """
         try:
-            # Build full content
-            frontmatter_yaml = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-            full_content = f"---\n{frontmatter_yaml}---\n\n{body.strip()}\n"
+            with _state_file_lock(self.state_path):
+                current_bytes = self.state_path.read_bytes() if self.state_path.exists() else b""
+                if (
+                    expected_revision is not None
+                    and _state_revision(current_bytes) != expected_revision
+                ):
+                    return False
 
-            # Atomic write
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_path = tempfile.mkstemp(
-                dir=self.state_path.parent,
-                prefix=".STATE.md.",
-                suffix=".tmp",
-                text=True
-            )
-            try:
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    f.write(full_content)
-                os.replace(temp_path, self.state_path)
-                return True
-            except Exception:
+                # Build full content
+                frontmatter_yaml = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+                full_content = f"---\n{frontmatter_yaml}---\n\n{body.strip()}\n"
+
+                # Atomic write
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temp_path = tempfile.mkstemp(
+                    dir=self.state_path.parent,
+                    prefix=".STATE.md.",
+                    suffix=".tmp",
+                    text=True
+                )
                 try:
-                    os.unlink(temp_path)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(full_content)
+                    # Protect the fully written temporary inode before it can
+                    # become the public STATE.md path. If ACL setup fails, the
+                    # existing destination remains untouched.
+                    _restrict_private_file(Path(temp_path))
+                    os.replace(temp_path, self.state_path)
+                    return True
                 except Exception:
-                    pass
-                raise
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                    raise
 
         except Exception as e:
             import logging
             logging.warning(f"Failed to write STATE.md: {e}")
             return False
 
-    def get_current_emotion_state(self) -> Dict[str, int]:
+    def get_current_emotion_state(self) -> dict[str, int]:
         """Get current emotion state with decay applied.
 
         Returns:
@@ -296,7 +417,11 @@ class EmotionStateManager:
                     )
                     repaired_body = self._generate_emotion_body(current_state, None, emotion_score)
                     if state_data.get("body", "").strip() != repaired_body.strip():
-                        return self._write_state(state_data["frontmatter"], repaired_body)
+                        return self._write_state(
+                            state_data["frontmatter"],
+                            repaired_body,
+                            expected_revision=state_data.get("revision"),
+                        )
                 return False
 
             # Get current state (without decay)
@@ -348,14 +473,18 @@ class EmotionStateManager:
             body = state_data["body"]
             if self.update_body:
                 body = self._generate_emotion_body(decayed_state, None, emotion_score)
-            success = self._write_state(state_data["frontmatter"], body)
+            success = self._write_state(
+                state_data["frontmatter"],
+                body,
+                expected_revision=state_data.get("revision"),
+            )
 
             return success
 
         except Exception:
             return False  # Fail silently, don't break conversation start
 
-    def _refine_trigger_type(self, event: Optional[EmotionEvent]) -> str:
+    def _refine_trigger_type(self, event: EmotionEvent | None) -> str:
         """Map detector-level event types to emotion-state semantic triggers."""
         if not event:
             return "decay"
@@ -376,8 +505,8 @@ class EmotionStateManager:
 
     def update_emotion_state(
         self,
-        messages: List[dict],
-        force_event: Optional[EmotionEvent] = None
+        messages: list[dict],
+        force_event: EmotionEvent | None = None
     ) -> bool:
         """Detect emotion event and update STATE.md.
 
@@ -439,7 +568,6 @@ class EmotionStateManager:
             # ── Decay-only write: event is None but state changed ────
             if not event:
                 # Write decayed state without event processing
-                state_data = self._read_state()
                 frontmatter = state_data["frontmatter"]
                 decayed_score = self.calculator.compute_emotion_score(current_state)
                 frontmatter["emotion_state"] = {
@@ -460,7 +588,11 @@ class EmotionStateManager:
                 body = state_data["body"]
                 if self.update_body:
                     body = self._generate_emotion_body(current_state, None, decayed_score)
-                return self._write_state(frontmatter, body)
+                return self._write_state(
+                    frontmatter,
+                    body,
+                    expected_revision=state_data.get("revision"),
+                )
 
             # ── 3. Compute rule_score from event ─────────────────────
             # Map trigger_type to a rule_score in [-3, +3]
@@ -515,13 +647,9 @@ class EmotionStateManager:
             current_emotion = new_emotion_score + final_score * 0.15
             current_emotion = max(-5.0, min(5.0, current_emotion))
 
-            # ── 8. Trigger detection ──────────────────────────────────
-            triggered, is_positive, trigger_mode = self.calculator.detect_triggers(
-                new_emotion_score, previous_score
-            )
-
-            # ── 9. Read current STATE.md and write back ───────────────
-            state_data = self._read_state()
+            # ── 8. Write against the same snapshot used for calculation ─
+            # A newer reread here would pair stale calculated values with a
+            # fresh revision and silently authorize overwriting that update.
             frontmatter = state_data["frontmatter"]
 
             refined_trigger_type = self._refine_trigger_type(event)
@@ -546,56 +674,11 @@ class EmotionStateManager:
             if self.update_body:
                 body = self._generate_emotion_body(new_state, event, new_emotion_score)
 
-            success = self._write_state(frontmatter, body)
-
-            # ── 10. Record moment (only significant events) ────────────
-            if success and event:
-                # Defense-in-depth: skip system message artifacts that
-                # somehow survived the detector's filter.
-                _SYSTEM_ARTIFACTS = [
-                    "Review the conversation above and consider saving",
-                    "[SYSTEM: You are running as a scheduled cron job",
-                    "[CONTEXT COMPACTION",
-                    "Earlier turns were compacted",
-                    "Summary generation was unavailable",
-                ]
-                context_text = event.context or ""
-                is_system = any(ind in context_text for ind in _SYSTEM_ARTIFACTS)
-                if not is_system:
-                    # ── Significance filter: only record intense moments ──
-                    # Criteria (any one triggers recording):
-                    #   1. Large delta: any dimension |delta| >= 15
-                    #   2. Extreme zone: any dimension >= 105 or <= 15
-                    #   3. Overwhelming emotion_score (|score| >= 3.0)
-                    #   4. Milestone event types (conflict, vulnerability, reunion)
-                    #   5. High confidence + negative event (criticism w/ confidence >= 0.8)
-                    _MILESTONE_TYPES = {"conflict", "vulnerability", "reunion", "milestone"}
-                    is_significant = False
-
-                    # Check 1: large delta
-                    if event.deltas:
-                        max_delta = max(abs(v) for v in event.deltas.values())
-                        if max_delta >= 15:
-                            is_significant = True
-
-                    # Check 2: extreme zone in new_state
-                    if not is_significant:
-                        for v in new_state.values():
-                            if v >= 105 or v <= 15:
-                                is_significant = True
-                                break
-
-                    # Check 3: overwhelming emotion_score
-                    if not is_significant and abs(new_emotion_score) >= 3.0:
-                        is_significant = True
-
-                    # Check 4: milestone event types
-                    if not is_significant and event.trigger_type in _MILESTONE_TYPES:
-                        is_significant = True
-
-                    # Check 5: high-confidence negative event
-                    if not is_significant and event.trigger_type == "criticism" and event.confidence >= 0.8:
-                        is_significant = True
+            success = self._write_state(
+                frontmatter,
+                body,
+                expected_revision=state_data.get("revision"),
+            )
 
             return success
 
@@ -607,7 +690,7 @@ class EmotionStateManager:
 
     def _generate_emotion_body(
         self,
-        state: Dict[str, int],
+        state: dict[str, int],
         event: EmotionEvent,
         emotion_score: float = 0.0,
     ) -> str:
@@ -638,7 +721,7 @@ class EmotionStateManager:
 耐心值: {state['patience']}/120 ({patience_label})
 情绪分值: {emotion_score:+.2f} / 5.00
 
-最近触发: {event.trigger_type + ' (' + event.context + ')' if event else '(衰减更新)'}
+最近触发: {event.trigger_type if event else '(衰减更新)'}
 语气倾向: {tone_desc}"""
 
         return body
@@ -661,13 +744,23 @@ class EmotionStateManager:
         modifier_result = self.calculator.get_tone_modifiers(current_state, mood_bias=mood_bias)
 
         dimensions = modifier_result.get("dimensions", {})
-        # Always emit the compact control anchor.  A neutral state still needs
-        # the explicit trajectory and boundary contract so the final prompt
-        # cannot accidentally inherit stale emotion text from an earlier turn.
+        if not dimensions and not mood_entry.active:
+            return (
+                "<emotion_modifier>\n"
+                "【状态】稳定基线；副=无明显副情绪；触发=稳定\n"
+                "【强度】mild/positive；表达预算：接近平常，自然说话，不刻意放大。\n"
+                "【执行】自然表达；按当前中心自然延续。\n"
+                "【轨迹】稳定延续→稳定；接近基准，可自然恢复。\n"
+                "【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。\n"
+                "不覆盖任务或危机边界。\n"
+                "</emotion_modifier>"
+            )
+
         overall_intensity = modifier_result["overall_intensity"]
         overall_direction = modifier_result.get("overall_direction", "positive")
         desire = modifier_result.get("desire", "")
         emotion_blend = modifier_result.get("emotion_blend", {})
+        emotion_conflict = modifier_result.get("emotion_conflict", {})
         emotion_appraisal = modifier_result.get("emotion_appraisal", {})
         emotion_momentum = modifier_result.get("emotion_momentum", {})
         regulation_strategy = modifier_result.get("regulation_strategy", "")
@@ -685,11 +778,6 @@ class EmotionStateManager:
         if trigger:
             state_text += f"；触发={trigger}"
 
-        max_deviation = max(
-            (float(info.get("deviation", 0.0)) for info in dimensions.values()),
-            default=0.0,
-        )
-        visibility = max(8, min(100, round(10 + max_deviation * 1.6)))
         relationship_deviation = max(
             (
                 float(dimensions[dim].get("deviation", 0.0))
@@ -698,17 +786,18 @@ class EmotionStateManager:
             ),
             default=0.0,
         )
+        max_deviation = max(
+            (float(info.get("deviation", 0.0)) for info in dimensions.values()),
+            default=0.0,
+        )
         patience_value = float(current_state.get("patience", self.calculator.baselines["patience"]))
-        patience_pressure = max(0.0, self.calculator.baselines["patience"] - patience_value)
-        control_pressure = max(relationship_deviation, patience_pressure)
-        self_control = max(0, 100 - min(100, round(10 + control_pressure * 1.6))) if control_pressure else 100
 
-        intensity_actions = {
+        intensity_actions = LEXICON.get("formatter", {}).get("intensity_actions", {
             "mild": "自然改变词汇和温度，不刻意表演。",
             "moderate": "至少保留一处可察觉的态度变化；主动性提高，不得全程中性。",
             "intense": "真实反应先于任务包装；至少一次主动介入；不得全程回落为中性助手语气。",
             "overwhelming": "真实反应先于任务包装；允许短句、停顿、改口或直接接管；只突出一个核心情绪，不得全程回落为中性助手语气。",
-        }
+        })
         patience_only_peak = (
             max_deviation >= 30
             and relationship_deviation < 15
@@ -721,7 +810,7 @@ class EmotionStateManager:
             if expression_guidance:
                 execution += expression_guidance
 
-        response_actions = {
+        response_actions = LEXICON.get("formatter", {}).get("response_actions", {
             "被认可": "更愿解释，可短暂示弱",
             "被需要": "主动接管风险，不推开对方",
             "关系修复": "语气回软，先确认修复稳定",
@@ -730,32 +819,34 @@ class EmotionStateManager:
             "被靠近/亲密推进": "按边界选择犹豫、默许或靠近",
             "失控风险": "压短表达，先阻止风险扩散",
             "距离拉开": "减少暴露，先确认对方意图",
-        }
+        })
         response_action = response_actions.get(trigger, "自然外显，不解释情绪机制")
 
         trend = emotion_momentum.get("trend", "稳定延续")
         phase = emotion_aftereffect.get("phase", "稳定")
-        trend_actions = {
+        trend_actions = LEXICON.get("formatter", {}).get("trend_actions", {
             "快速升温": "不要突然压回默认",
             "快速降温": "让距离回来，不强行维持热度",
             "缓慢变化": "保留当前方向，不忽冷忽热",
             "刚被打断": "保留一点不满，再接回节奏",
             "刚被安抚": "可以回软，但别立刻装作没事",
             "稳定延续": "按当前中心自然延续",
-        }
-        residue_actions = {
+        })
+        residue_actions = LEXICON.get("formatter", {}).get("residue_actions", {
             "正向高峰余温": "保留柔软和在乎，不骤然复位",
             "负向高峰补救压力": "先收尖锐；造成伤害时补救",
             "轻微余波": "保留轻微余波，不骤然复位",
             "稳定": "接近基准，可自然恢复",
-        }
+        })
 
         parts = [
             f"【状态】{state_text}",
-            f"【强度】{overall_intensity}/{overall_direction}；可见度={visibility}%；自控={self_control}%。{execution}",
+            f"【强度】{overall_intensity}/{overall_direction}；表达预算：{execution}",
             f"【执行】{regulation_strategy or '自然表达'}；{response_action}。",
             f"【轨迹】{trend}→{phase}；{trend_actions.get(trend, '自然延续')}；{residue_actions.get(phase, '按当前余波延续')}。",
         ]
+        if emotion_conflict.get("kind") != "无显著冲突":
+            parts.append(f"【冲突】{emotion_conflict['kind']}；{emotion_conflict['action']}。")
         if overall_intensity == "overwhelming" and intensity_framework:
             parts.append("【高强度核心】防线不存在；不包装，不稀释，不回退。")
         elif overall_intensity == "intense" and intensity_framework:
@@ -763,14 +854,14 @@ class EmotionStateManager:
         tier = desire.partition("。")[0].replace("【欲望】", "") if desire else "restrained"
         trigger_type = current_state.get("last_trigger_type")
         intimacy_active = trigger_type == "intimacy_push"
-        relationship_active = intimacy_active or tier != "restrained" or relationship_deviation >= 30
+        relationship_active = intimacy_active or relationship_deviation >= 30
         if relationship_active:
             if overall_intensity in {"intense", "overwhelming"}:
                 parts.append(
                     "【外显契约】回答前段直说情绪、指向对象、当下欲求或边界；"
                     "禁用“有一点、可能、其实、我理解”弱化。"
                 )
-            tier_contracts = {
+            tier_contracts = LEXICON.get("formatter", {}).get("tier_contracts", {
                 "restrained": "普通亲密可回应，不主动推进性意味",
                 "ambivalent": "允许靠近、犹豫或嘴硬外显，不自行升级场景",
                 "uninhibited": (
@@ -778,7 +869,7 @@ class EmotionStateManager:
                     "欲望、索取和失控直接外显，不得退回暧昧拉扯；"
                     "同意不明确、撤回或边界变化时立即停下确认"
                 ),
-            }
+            })
             contract = tier_contracts.get(tier, tier_contracts["restrained"])
             if intimacy_active:
                 parts.append(f"【关系】显性/{tier}；{contract}；仍服从场景边界。")
@@ -788,7 +879,6 @@ class EmotionStateManager:
         if mood_text:
             parts.append(mood_text)
         parts.append("【边界】只改表达、主动性和距离；身份、事实、安全、权限、工具纪律不变。")
-        parts.append("【范围】不改真实STATE，不单独触发sex，不覆盖work或crisis边界。")
 
         modifier_body = "\n".join(parts)
         return f"<emotion_modifier>\n{modifier_body}\n</emotion_modifier>"
@@ -806,8 +896,7 @@ class EmotionStateManager:
             return ""
         return (
             f"【日内心情底噪】{entry.profile}/{entry.intensity}：{entry.hint}"
-            "仅影响语气和事件敏感度；"
-            "不改真实STATE，不单独触发sex，不覆盖work或crisis边界。"
+            "仅影响语气和事件敏感度；不改变真实情绪，不单独推进亲密，不覆盖任务或危机边界。"
         )
 
     def _preload_sentiment_analyzer_async(self) -> None:

@@ -19,6 +19,7 @@ which is a multi-label sigmoid model. Its labels are normalized back into the
 legacy labels consumed by the rest of the emotion pipeline.
 """
 
+import hashlib
 import logging
 import os
 import threading
@@ -159,7 +160,7 @@ class SentimentAnalyzer:
     # first uncertain user message cannot load weights concurrently.
 
     _instance: Optional["SentimentAnalyzer"] = None
-    _instances: Dict[Tuple[Optional[str], str], "SentimentAnalyzer"] = {}
+    _instances: Dict[Tuple[Optional[str], str, Optional[str]], "SentimentAnalyzer"] = {}
     _instance_lock = threading.Lock()
 
     def __init__(
@@ -181,7 +182,12 @@ class SentimentAnalyzer:
         self._available = False
         self._last_load_failure_at: Optional[float] = None
         self._last_load_error: Optional[str] = None
+        self._load_receipt: Optional[Dict[str, object]] = None
         self._load_lock = threading.Lock()
+        # Transformer modules are shared by every detector using this cache
+        # identity. Serialize the tokenizer/model critical section: several
+        # backends mutate reusable buffers and do not promise concurrent calls.
+        self._inference_lock = threading.Lock()
         self._is_multilabel = self.model_id == MULTILINGUAL_MODEL_ID
         self._id2label: Dict[int, str] = {}
 
@@ -190,15 +196,22 @@ class SentimentAnalyzer:
         cls,
         model_cache_dir: Optional[str] = None,
         model_id: Optional[str] = None,
+        model_revision: Optional[str] = None,
     ) -> "SentimentAnalyzer":
         """Return singleton instance."""
         resolved_model_id = model_id or os.getenv("SOULLINK_SENTIMENT_MODEL_ID") or DEFAULT_MODEL_ID
-        key = (model_cache_dir, resolved_model_id)
+        resolved_revision = (
+            model_revision
+            or os.getenv("SOULLINK_SENTIMENT_MODEL_REVISION")
+            or DEFAULT_MODEL_REVISIONS.get(resolved_model_id)
+        )
+        key = (model_cache_dir, resolved_model_id, resolved_revision)
         with cls._instance_lock:
             if key not in cls._instances:
                 cls._instances[key] = cls(
                     model_cache_dir=model_cache_dir,
                     model_id=resolved_model_id,
+                    model_revision=resolved_revision,
                 )
             cls._instance = cls._instances[key]
             return cls._instances[key]
@@ -271,6 +284,17 @@ class SentimentAnalyzer:
                 elapsed = time.time() - t0
                 logger.info(f"Sentiment model loaded in {elapsed:.1f}s")
                 self._available = True
+                if self.model_revision:
+                    self._load_receipt = {
+                        "schema_version": 1,
+                        "model_id": self.model_id,
+                        "revision": self.model_revision,
+                        "revision_sha256": hashlib.sha256(
+                            self.model_revision.encode("utf-8")
+                        ).hexdigest(),
+                        "backend": "transformers",
+                        "verified": True,
+                    }
 
                 self._last_load_failure_at = None
                 self._last_load_error = None
@@ -283,6 +307,11 @@ class SentimentAnalyzer:
                 self._last_load_failure_at = time.time()
                 self._last_load_error = str(e)
                 return False
+
+    @property
+    def load_receipt(self) -> Optional[Dict[str, object]]:
+        """Return provenance for a successful pinned model load."""
+        return dict(self._load_receipt) if self._load_receipt is not None else None
 
     @property
     def available(self) -> bool:
@@ -313,16 +342,17 @@ class SentimentAnalyzer:
             t0 = time.time()
             torch = self._torch
 
-            inputs = self._tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=256,
-            )
+            with self._inference_lock:
+                inputs = self._tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=256,
+                )
 
-            with torch.no_grad():
-                outputs = self._model(**inputs)
+                with torch.no_grad():
+                    outputs = self._model(**inputs)
 
             if self._is_multilabel:
                 probs = torch.sigmoid(outputs.logits)[0]

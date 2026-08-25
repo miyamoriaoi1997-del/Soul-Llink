@@ -13,7 +13,12 @@ Implements:
 import random
 from collections import deque
 from datetime import datetime
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
+
+try:
+    from injection_lexicon import LEXICON
+except ImportError:
+    from persona_engine.injection_lexicon import LEXICON
 
 EmotionDelta = int | float
 
@@ -64,10 +69,12 @@ class EmotionCalculator:
         self,
         baselines: Optional[Dict[str, int]] = None,
         decay_rate: float = 2.0,   # kept for backward compat, not used internally
+        rng: random.Random | None = None,
     ):
         self.baselines = baselines or self.DEFAULT_BASELINES.copy()
         # legacy attribute — kept so existing callers don't break
         self.decay_rate = decay_rate
+        self._rng = rng or random.Random()
 
         # ── Inertia tracking state ───────────────────────────────────
         # direction_history: deque of +1 (positive) or -1 (negative)
@@ -225,13 +232,13 @@ class EmotionCalculator:
 
         if not appraisal_multiplier:
             return {dim: float(delta) for dim, delta in deltas.items()}
-        if any(value > 0 for value in deltas.values()):
-            multiplier = float(appraisal_multiplier.get("positive_event", 1.0))
-        elif any(value < 0 for value in deltas.values()):
-            multiplier = float(appraisal_multiplier.get("negative_event", 1.0))
-        else:
-            multiplier = 1.0
-        return {dim: delta * multiplier for dim, delta in deltas.items()}
+        positive = float(appraisal_multiplier.get("positive_event", 1.0))
+        negative = float(appraisal_multiplier.get("negative_event", 1.0))
+        return {
+            dim: delta * (positive if value > 0 else negative if value < 0 else 1.0)
+            for dim, delta in deltas.items()
+            for value in (float(delta),)
+        }
 
     def _apply_trust_patience_coupling(
         self,
@@ -345,7 +352,7 @@ class EmotionCalculator:
 
         # 3. Probabilistic trigger
         prob = min(1.0, abs(emotion_score) / 5.0)
-        if random.random() < prob:
+        if self._rng.random() < prob:
             return True, emotion_score >= 0, "probabilistic"
 
         return False, False, ""
@@ -490,7 +497,7 @@ class EmotionCalculator:
 
     def _classify_intensity(self, value: int | float, baseline: int) -> Tuple[str, str, int | float]:
         """Classify emotion intensity tier for a single dimension.
-        
+
         Returns:
             (intensity_tier, direction, deviation)
             - intensity_tier: 'mild'/'moderate'/'intense'/'overwhelming'
@@ -499,11 +506,11 @@ class EmotionCalculator:
         """
         deviation = abs(value - baseline)
         direction = "positive" if value >= baseline else "negative"
-        
+
         for threshold, tier in self.INTENSITY_THRESHOLDS:
             if deviation >= threshold:
                 return tier, direction, deviation
-        
+
         return "mild", direction, deviation
 
     # ── Desire control thresholds & instructions ────────────────────
@@ -632,6 +639,22 @@ class EmotionCalculator:
         if patience_dev <= -15:
             return "短句压住烦躁"
         return "自然流露"
+
+    def _compute_emotion_conflict(self, state: Mapping[str, EmotionDelta]) -> Dict[str, str]:
+        """Compile opposing axes into one executable tension, not a checklist."""
+        affection = state.get("affection", self.baselines["affection"]) - self.baselines["affection"]
+        trust = state.get("trust", self.baselines["trust"]) - self.baselines["trust"]
+        possessiveness = state.get("possessiveness", self.baselines["possessiveness"]) - self.baselines["possessiveness"]
+        patience = state.get("patience", self.baselines["patience"]) - self.baselines["patience"]
+        if affection >= 15 and trust <= -15:
+            return {"kind": "靠近与防备冲突", "action": "先承认想靠近，再保留一个短边界或确认"}
+        if trust <= -25 and possessiveness >= 25:
+            return {"kind": "安全感与占有冲突", "action": "先确认关系可靠，再表达介入或边界"}
+        if affection >= 15 and patience <= -15:
+            return {"kind": "在乎与耐心冲突", "action": "先接住对方，再用短句提出直接要求"}
+        if patience >= 15 and trust <= -15:
+            return {"kind": "托住与防备冲突", "action": "可以耐心解释，但不交出最后的判断权"}
+        return {"kind": "无显著冲突", "action": "按主导情绪自然延续"}
 
     def _compute_emotion_appraisal(self, state: Mapping[str, EmotionDelta], blend: Dict[str, str]) -> Dict[str, str]:
         """Classify why the current emotion is activated.
@@ -808,7 +831,7 @@ class EmotionCalculator:
         mood_bias: Mapping[str, float] | None = None,
     ) -> Dict[str, any]:
         """Get tone modification instructions based on emotion state.
-        
+
         Returns dict with:
             - 'dimensions': per-dimension instructions with intensity info
             - 'overall_intensity': the highest intensity tier across all dimensions
@@ -832,12 +855,17 @@ class EmotionCalculator:
             baseline = self.baselines[dim]
             value = effective_state.get(dim, baseline)
             tier, direction, deviation = self._classify_intensity(value, baseline)
-            
+
             # Skip mild with very small deviations (< 5 pts) — not worth mentioning
             if tier == "mild" and deviation < 5:
                 continue
-            
-            instruction = self.TONE_MATRIX[dim][direction][tier]
+
+            instruction = (
+                LEXICON.get("tone_matrix", {})
+                .get(dim, {})
+                .get(direction, {})
+                .get(tier, self.TONE_MATRIX[dim][direction][tier])
+            )
             dimensions[dim] = {
                 "instruction": instruction,
                 "tier": tier,
@@ -846,7 +874,7 @@ class EmotionCalculator:
                 "value": value,
                 "baseline": baseline,
             }
-            
+
             tier_idx = intensity_order.index(tier)
             if tier_idx > max_intensity_idx:
                 max_intensity_idx = tier_idx
@@ -863,6 +891,7 @@ class EmotionCalculator:
         emotion_score = self.compute_emotion_score(state, mood_bias=mood_bias)
         desire_instruction = self._compute_desire_instruction(emotion_score)
         emotion_blend = self._compute_emotion_blend(effective_state)
+        emotion_conflict = self._compute_emotion_conflict(effective_state)
         regulation_strategy = self._compute_regulation_strategy(effective_state, emotion_blend)
         emotion_appraisal = self._compute_emotion_appraisal(effective_state, emotion_blend)
         emotion_momentum = self._compute_emotion_momentum(effective_state, emotion_score)
@@ -880,10 +909,17 @@ class EmotionCalculator:
             "dimensions": dimensions,
             "overall_intensity": overall_intensity,
             "overall_direction": overall_direction,
-            "framework": self.INTENSITY_FRAMEWORKS[(overall_intensity, overall_direction)],
-            "footnote": self.INTENSITY_FOOTNOTES[(overall_intensity, overall_direction)],
+            "framework": LEXICON.get("intensity_frameworks", {}).get(
+                f"{overall_intensity}__{overall_direction}",
+                self.INTENSITY_FRAMEWORKS[(overall_intensity, overall_direction)],
+            ),
+            "footnote": LEXICON.get("intensity_footnotes", {}).get(
+                f"{overall_intensity}__{overall_direction}",
+                self.INTENSITY_FOOTNOTES[(overall_intensity, overall_direction)],
+            ),
             "desire": desire_instruction,
             "emotion_blend": emotion_blend,
+            "emotion_conflict": emotion_conflict,
             "emotion_appraisal": emotion_appraisal,
             "emotion_momentum": emotion_momentum,
             "regulation_strategy": regulation_strategy,

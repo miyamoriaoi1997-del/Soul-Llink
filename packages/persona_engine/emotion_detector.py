@@ -9,7 +9,7 @@ import logging
 import os
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Any
 
 try:
@@ -19,27 +19,25 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_SHARED_ANALYZER: Optional[SentimentAnalyzer] = None
+_SHARED_ANALYZERS: Dict[Optional[str], SentimentAnalyzer] = {}
 _SHARED_ANALYZER_LOCK = threading.Lock()
 
 
 def get_shared_sentiment_analyzer(model_cache_dir: Optional[str] = None) -> SentimentAnalyzer:
-    """Return the process-wide sentiment analyzer singleton without forcing model load."""
-    global _SHARED_ANALYZER
-    if _SHARED_ANALYZER is None:
+    """Return the analyzer for one cache identity without forcing model load."""
+    if model_cache_dir not in _SHARED_ANALYZERS:
         with _SHARED_ANALYZER_LOCK:
-            if _SHARED_ANALYZER is None:
-                _SHARED_ANALYZER = SentimentAnalyzer.get_instance(
+            if model_cache_dir not in _SHARED_ANALYZERS:
+                _SHARED_ANALYZERS[model_cache_dir] = SentimentAnalyzer.get_instance(
                     model_cache_dir=model_cache_dir
                 )
-    return _SHARED_ANALYZER
+    return _SHARED_ANALYZERS[model_cache_dir]
 
 
 def reset_shared_sentiment_analyzer_for_tests() -> None:
     """Reset process-wide analyzer cache. Intended for tests only."""
-    global _SHARED_ANALYZER
     with _SHARED_ANALYZER_LOCK:
-        _SHARED_ANALYZER = None
+        _SHARED_ANALYZERS.clear()
 
 
 @dataclass

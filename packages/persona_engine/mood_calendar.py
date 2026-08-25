@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Mapping
 
+try:
+    from injection_lexicon import LEXICON
+except ImportError:
+    from persona_engine.injection_lexicon import LEXICON
+
 MOOD_DIMENSIONS = ("affection", "trust", "possessiveness", "patience", "sensitivity")
 INTENSITIES = ("mild", "noticeable", "strong")
 
@@ -171,7 +176,7 @@ PROFILES: dict[str, MoodProfile] = {
     ),
 }
 
-_HINTS: dict[str, dict[str, str]] = {
+_HINTS: dict[str, dict[str, str]] = LEXICON.get("hints", {
     "soft": {
         "mild": "今天状态和平时差不多，只是稍微柔软一点。",
         "noticeable": "今天更容易放下防线、靠近用户。表达可以跟着调整，但不要刻意放大。",
@@ -207,7 +212,7 @@ _HINTS: dict[str, dict[str, str]] = {
         "noticeable": "今天更想做事、更不想被打断。表达可以更直接、更收束。",
         "strong": "今天高度集中，情绪表达降到最低。优先解决问题，但不要把用户当普通变量。",
     },
-}
+})
 
 _APPRAISAL_BASE: dict[str, dict[str, float]] = {
     "soft": {"positive_event": 1.06, "negative_event": 0.96, "jealousy_event": 1.02, "work_load_event": 0.98},
